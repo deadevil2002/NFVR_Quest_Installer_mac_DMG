@@ -1,0 +1,35 @@
+--input
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\build\\compose\\tmp\\packageExe\\libs"
+--runtime-image
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\build\\compose\\tmp\\main\\runtime"
+--resource-dir
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\build\\compose\\tmp\\resources"
+--java-options
+"'-Dcompose.application.resources.dir=$APPDIR\\resources'"
+--main-jar
+"NFVR-Quest-Installer-1.0.0-55dde742d8718c2b7c28bcc8468b460.jar"
+--main-class
+"MainKt"
+--icon
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\NFVR_Quest_Installer.ico"
+--java-options
+"'-Dcompose.application.configure.swing.globals=true'"
+--java-options
+"'-Dskiko.library.path=$APPDIR'"
+--resource-dir
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\build\\compose\\tmp\\resources"
+--win-dir-chooser
+--win-shortcut
+--win-menu
+--type
+"exe"
+--dest
+"C:\\Users\\naimi\\Desktop\\NFVR_Quest_Installer_Project\\NFVR_Quest_Installer\\build\\compose\\binaries\\main\\exe"
+--name
+"Near FutureVR - مثبت ألعاب Meta Quest"
+--description
+"برنامج لتثبيت ألعاب Meta Quest عبر USB باستخدام ADB مع دعم نقل ملفات OBB وعرض حالة الجهاز والمساحة المتاحة."
+--app-version
+"1.0.0"
+--vendor
+"Near FutureVR"
