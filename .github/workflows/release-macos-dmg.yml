@@ -1,9 +1,8 @@
 name: Build macOS DMG
 
 on:
-  push:
-    tags:
-      - "nfvr-quest-installer-v*"
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -32,4 +31,7 @@ jobs:
       - name: Upload DMG to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/compose/binaries/main/dmg/*.dmg
+          files: build/compose/binaries/**/*.dmg
+          tag_name: ${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
