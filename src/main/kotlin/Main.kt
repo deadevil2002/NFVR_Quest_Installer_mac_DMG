@@ -70,7 +70,7 @@ private fun safeUiMsg(e: Throwable): String {
     }
 }
 
-private class BundledAdb(private val host: HostOs) {
+class BundledAdb(private val host: HostOs) {
     private var adbPath: File? = null
 
     fun ensureReady(): File {
