@@ -24,7 +24,7 @@ import javax.swing.JFileChooser
 import javax.swing.UIManager
 import kotlin.system.exitProcess
 
-private enum class HostOs { WINDOWS, MAC, LINUX }
+enum class HostOs { WINDOWS, MAC, LINUX }
 
 private data class GameEntry(
     val folder: File,
@@ -33,7 +33,7 @@ private data class GameEntry(
     val requiredBytes: Long
 )
 
-private data class CmdResult(val exit: Int, val out: String, val err: String)
+data class CmdResult(val exit: Int, val out: String, val err: String)
 
 private fun detectOs(): HostOs {
     val os = System.getProperty("os.name").lowercase()
@@ -133,7 +133,7 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
     return CmdResult(p.exitValue(), out.toString(), err.toString())
 }
 
-private class AdbClient(private val bundled: BundledAdb) {
+class AdbClient(private val bundled: BundledAdb) {
     private fun adbBase(): Pair<File, File> {
         val adb = bundled.ensureReady()
         return adb to adb.parentFile
