@@ -4,17 +4,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.res.loadImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
@@ -29,7 +24,7 @@ import javax.swing.JFileChooser
 import javax.swing.UIManager
 import kotlin.system.exitProcess
 
-enum class HostOs { WINDOWS, MAC, LINUX }
+private enum class HostOs { WINDOWS, MAC, LINUX }
 
 private data class GameEntry(
     val folder: File,
@@ -38,7 +33,7 @@ private data class GameEntry(
     val requiredBytes: Long
 )
 
-data class CmdResult(val exit: Int, val out: String, val err: String)
+private data class CmdResult(val exit: Int, val out: String, val err: String)
 
 private fun detectOs(): HostOs {
     val os = System.getProperty("os.name").lowercase()
@@ -75,7 +70,7 @@ private fun safeUiMsg(e: Throwable): String {
     }
 }
 
-class BundledAdb(private val host: HostOs) {
+private class BundledAdb(private val host: HostOs) {
     private var adbPath: File? = null
 
     fun ensureReady(): File {
@@ -138,7 +133,7 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
     return CmdResult(p.exitValue(), out.toString(), err.toString())
 }
 
-class AdbClient(private val bundled: BundledAdb) {
+private class AdbClient(private val bundled: BundledAdb) {
     private fun adbBase(): Pair<File, File> {
         val adb = bundled.ensureReady()
         return adb to adb.parentFile
@@ -244,12 +239,7 @@ fun main() = application {
     val host = detectOs()
     val bundledAdb = remember { BundledAdb(host) }
     val adb = remember { AdbClient(bundledAdb) }
-    val modsManager = remember { ModsManager(adb) }
 
-    // Tab Selection
-    var selectedTab by remember { mutableStateOf(0) }
-
-    // APK Installer State
     var connectionText by remember { mutableStateOf("الاتصال: جاري الفحص...") }
     var deviceText by remember { mutableStateOf("—") }
     var storageText by remember { mutableStateOf("—") }
@@ -270,55 +260,15 @@ fun main() = application {
     var resumeIndex by remember { mutableStateOf(0) }
     var pausedBecauseDisconnected by remember { mutableStateOf(false) }
 
-    // Mods State
-    var selectedGame by remember { mutableStateOf("") }
-    var selectedGameInfo by remember { mutableStateOf<GameInfo?>(null) }
-    var modZipFile by remember { mutableStateOf<File?>(null) }
-    var isInstallingMod by remember { mutableStateOf(false) }
-    var modProgress by remember { mutableStateOf(0f) }
-    var modProgressLabel by remember { mutableStateOf("—") }
-    var modLogText by remember { mutableStateOf("") }
-    var installedGames by remember { mutableStateOf<List<String>>(emptyList()) }
-    var manualPath by remember { mutableStateOf("") }
-    var isManualMode by remember { mutableStateOf(false) }
-
-    // ✅ Autoscroll states
+    // ✅ Autoscroll state
     val logScroll = rememberScrollState()
-    val modLogScroll = rememberScrollState()
-
-    // Load logo
-    var logoBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
-    
-    LaunchedEffect(Unit) {
-        try {
-            val stream = javaClass.getResourceAsStream("/nfvr_logo.png")
-            if (stream != null) {
-                logoBitmap = loadImageBitmap(stream)
-            }
-        } catch (_: Exception) { }
-    }
 
     fun appendLog(line: String) {
         logText += if (logText.isBlank()) line else "\n$line"
     }
 
-    fun appendModLog(line: String) {
-        modLogText += if (modLogText.isBlank()) line else "\n$line"
-    }
-
     fun rebuildQueue() {
         queue = folders.mapNotNull { scanGameFolder(it) }
-    }
-
-    fun chooseModFile(): File? {
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-        val fc = JFileChooser()
-        fc.fileSelectionMode = JFileChooser.FILES_ONLY
-        fc.isAcceptAllFileFilterUsed = false
-        fc.fileFilter = javax.swing.filechooser.FileNameExtensionFilter("ZIP Files", "zip")
-        fc.dialogTitle = "اختر ملف المود (ZIP)"
-        val result = fc.showOpenDialog(null)
-        return if (result == JFileChooser.APPROVE_OPTION) fc.selectedFile else null
     }
 
     suspend fun getAuthorizedSerialOrNull(): String? {
@@ -509,24 +459,9 @@ fun main() = application {
         logScroll.animateScrollTo(logScroll.maxValue)
     }
 
-    LaunchedEffect(modLogText) {
-        modLogScroll.animateScrollTo(modLogScroll.maxValue)
-    }
-
     LaunchedEffect(Unit) {
         while (true) {
             refreshDeviceInfo()
-            
-            // Refresh installed games
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    val serial = getAuthorizedSerialOrNull()
-                    if (serial != null) {
-                        installedGames = modsManager.getInstalledGamePackages(serial)
-                    }
-                } catch (_: Exception) { }
-            }
-            
             delay(2000)
         }
     }
@@ -546,91 +481,6 @@ fun main() = application {
         }
     }
 
-    suspend fun installSelectedMod() {
-        if (modZipFile == null) {
-            appendModLog("❌ لم يتم اختيار ملف مود")
-            return
-        }
-
-        isInstallingMod = true
-        modProgress = 0f
-        modProgressLabel = "بدء تثبيت المود..."
-        appendModLog("==============================================")
-        appendModLog("بدء تثبيت المود: ${modZipFile?.name}")
-        appendModLog("==============================================")
-
-        try {
-            adb.startServer()
-            
-            val serial = getAuthorizedSerialOrNull()
-            if (serial == null) {
-                appendModLog("❌ لا يوجد جهاز متصل أو مصرح به")
-                return
-            }
-
-            modProgressLabel = "فك ضغط ملف المود..."
-            modProgress = 0.1f
-            appendModLog("فك ضغط ملف المود...")
-            
-            val extractResult = modsManager.extractModZip(modZipFile!!)
-            if (!extractResult.success) {
-                appendModLog("❌ فشل فك الضغط: ${extractResult.message}")
-                return
-            }
-            
-            appendModLog("✅ تم فك الضغط بنجاح")
-            appendModLog("الملفات المستخرجة: ${extractResult.extractedFiles.size}")
-            
-            val extractedDir = File(extractResult.message.split(": ").lastOrNull() ?: "")
-            if (!extractedDir.exists()) {
-                appendModLog("❌ لم يتم العثور على مجلد الملفات المستخرجة")
-                return
-            }
-
-            val targetPath = if (isManualMode && manualPath.isNotBlank()) {
-                manualPath.trim()
-            } else {
-                selectedGameInfo?.modPath ?: ""
-            }
-
-            if (targetPath.isBlank()) {
-                appendModLog("❌ لم يتم تحديد مسار التثبيت")
-                return
-            }
-
-            modProgressLabel = "تثبيت المود في النظارة..."
-            modProgress = 0.3f
-
-            val installResult = modsManager.installModToQuest(
-                serial = serial,
-                extractedModDir = extractedDir,
-                targetPath = targetPath
-            ) { progress ->
-                modProgressLabel = progress
-                appendModLog("📋 $progress")
-            }
-
-            if (installResult.success) {
-                modProgress = 1f
-                modProgressLabel = "اكتمل التثبيت"
-                appendModLog("✅ ${installResult.message}")
-                appendModLog("📂 المسار المستهدف: $targetPath")
-                appendModLog("==============================================")
-                appendModLog("تم تثبيت المود بنجاح!")
-                appendModLog("==============================================")
-            } else {
-                appendModLog("❌ فشل التثبيت: ${installResult.message}")
-                modProgressLabel = "فشل التثبيت"
-            }
-
-        } catch (e: Exception) {
-            appendModLog("❌ خطأ غير متوقع: ${e.message}")
-            modProgressLabel = "خطأ"
-        } finally {
-            isInstallingMod = false
-        }
-    }
-
     Window(
         onCloseRequest = { hardExitApp() },
         title = "Near FutureVR - مثبت ألعاب Meta Quest"
@@ -643,54 +493,14 @@ fun main() = application {
                     modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(pageScroll),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Header with Logo
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            if (logoBitmap != null) {
-                                // Simple logo display (we'll show app name if logo fails)
-                                Text(
-                                    "🎮",
-                                    style = MaterialTheme.typography.headlineLarge,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                            }
-                            Column {
-                                Text(
-                                    "Near FutureVR",
-                                    style = MaterialTheme.typography.headlineMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    "مثبت ألعاب ومودات Meta Quest",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
+                    Text(
+                        "Near FutureVR - مثبت ألعاب Meta Quest",
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold
+                    )
 
-                    // Tabs
-                    TabRow(selectedTabIndex = selectedTab) {
-                        Tab(
-                            selected = selectedTab == 0,
-                            onClick = { selectedTab = 0 },
-                            text = { Text("تثبيت الألعاب") },
-                            icon = { Icon(Icons.Default.Settings, contentDescription = null) }
-                        )
-                        Tab(
-                            selected = selectedTab == 1,
-                            onClick = { selectedTab = 1 },
-                            text = { Text("المودات") },
-                            icon = { Icon(Icons.Default.Build, contentDescription = null) }
-                        )
-                    }
-
-                    // Connection Status Card
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(connectionText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -699,273 +509,104 @@ fun main() = application {
                         }
                     }
 
-                    // Content based on selected tab
-                    when (selectedTab) {
-                        0 -> {
-                            // APK Installer Tab
-                            Card(modifier = Modifier.fillMaxWidth()) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Button(
+                                onClick = {
+                                    val f = chooseFolder()
+                                    if (f != null) {
+                                        folders = folders + f
+                                        rebuildQueue()
+                                        appendLog("تمت إضافة مجلد: ${f.absolutePath}")
+                                    }
+                                },
+                                enabled = !isInstalling
+                            ) { Text("إضافة مجلد لعبة") }
+
+                            OutlinedButton(
+                                onClick = {
+                                    folders = emptyList()
+                                    queue = emptyList()
+                                    resumeIndex = 0
+                                    appendLog("تم مسح القائمة")
+                                },
+                                enabled = !isInstalling
+                            ) { Text("مسح القائمة") }
+
+                            Button(
+                                onClick = { CoroutineScope(Dispatchers.IO).launch { installQueue() } },
+                                enabled = !isInstalling && queue.isNotEmpty()
+                            ) { Text("تثبيت الكل") }
+
+                            if (showRestart) {
+                                OutlinedButton(onClick = { restartQuestNow() }) { Text("Restart") }
+                            }
+                        }
+                    }
+
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(statusText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+
+                            LinearProgressIndicator(
+                                progress = { progress },
+                                modifier = Modifier.fillMaxWidth().height(10.dp)
+                            )
+
+                            Text(progressLabel, style = MaterialTheme.typography.bodyMedium)
+
+                            if (!warningText.isNullOrBlank()) {
+                                Box(
+                                    modifier = Modifier.fillMaxWidth()
+                                        .background(Color(0xFFFFF3CD))
+                                        .padding(10.dp)
                                 ) {
-                                    Button(
-                                        onClick = {
-                                            val f = chooseFolder()
-                                            if (f != null) {
-                                                folders = folders + f
-                                                rebuildQueue()
-                                                appendLog("تمت إضافة مجلد: ${f.absolutePath}")
-                                            }
-                                        },
-                                        enabled = !isInstalling
-                                    ) { Text("إضافة مجلد لعبة") }
-
-                                    OutlinedButton(
-                                        onClick = {
-                                            folders = emptyList()
-                                            queue = emptyList()
-                                            resumeIndex = 0
-                                            appendLog("تم مسح القائمة")
-                                        },
-                                        enabled = !isInstalling
-                                    ) { Text("مسح القائمة") }
-
-                                    Button(
-                                        onClick = { CoroutineScope(Dispatchers.IO).launch { installQueue() } },
-                                        enabled = !isInstalling && queue.isNotEmpty()
-                                    ) { Text("تثبيت الكل") }
-
-                                    if (showRestart) {
-                                        OutlinedButton(onClick = { restartQuestNow() }) { Text("Restart") }
-                                    }
-                                }
-                            }
-
-                            Card(modifier = Modifier.fillMaxWidth()) {
-                                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text(statusText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-
-                                    LinearProgressIndicator(
-                                        progress = { progress },
-                                        modifier = Modifier.fillMaxWidth().height(10.dp)
+                                    Text(
+                                        warningText!!,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = Color(0xFF6B4E00)
                                     )
-
-                                    Text(progressLabel, style = MaterialTheme.typography.bodyMedium)
-
-                                    if (!warningText.isNullOrBlank()) {
-                                        Box(
-                                            modifier = Modifier.fillMaxWidth()
-                                                .background(Color(0xFFFFF3CD))
-                                                .padding(10.dp)
-                                        ) {
-                                            Text(
-                                                warningText!!,
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = Color(0xFF6B4E00)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            Card(modifier = Modifier.fillMaxWidth()) {
-                                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text("قائمة الألعاب (بالترتيب)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                                    if (queue.isEmpty()) {
-                                        Text("ما فيه ألعاب مكتشفة.", style = MaterialTheme.typography.bodyMedium)
-                                    } else {
-                                        queue.forEachIndexed { idx, g ->
-                                            val requiredGb = bytesToGb(g.requiredBytes)
-                                            Text(
-                                                "${idx + 1}) ${g.folder.name}  —  المطلوب تقريبًا: ${formatGb(requiredGb)}",
-                                                style = MaterialTheme.typography.bodyMedium
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            Card(modifier = Modifier.fillMaxWidth()) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("سجل تثبيت الألعاب", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                                    Spacer(Modifier.height(8.dp))
-                                    Box(
-                                        modifier = Modifier.fillMaxWidth().height(260.dp)
-                                            .background(Color(0xFFF6F6F6))
-                                            .padding(10.dp)
-                                    ) {
-                                        Text(
-                                            if (logText.isBlank()) "—" else logText,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            textAlign = TextAlign.Start,
-                                            modifier = Modifier.verticalScroll(logScroll)
-                                        )
-                                    }
                                 }
                             }
                         }
+                    }
 
-                        1 -> {
-                            // Mods Tab
-                            Card(modifier = Modifier.fillMaxWidth()) {
-                                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text("نظام المودات", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                                    
-                                    // Game Selection
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        OutlinedButton(
-                                            onClick = { isManualMode = !isManualMode }
-                                        ) {
-                                            Text(if (isManualMode) "اختيار من القائمة" else "مسار يدوي")
-                                        }
-
-                                        if (!isManualMode) {
-                                            var expanded by remember { mutableStateOf(false) }
-                                            Box {
-                                                OutlinedButton(
-                                                    onClick = { expanded = true },
-                                                    modifier = Modifier.fillMaxWidth()
-                                                ) {
-                                                    Text(
-                                                        if (selectedGameInfo != null) selectedGameInfo!!.name 
-                                                        else "اختر لعبة"
-                                                    )
-                                                    Icon(Icons.Default.ArrowDropDown, contentDescription = null)
-                                                }
-                                                
-                                                DropdownMenu(
-                                                    expanded = expanded,
-                                                    onDismissRequest = { expanded = false }
-                                                ) {
-                                                    modsManager.getSupportedGames().forEach { game ->
-                                                        val isInstalled = installedGames.contains(game.packageName)
-                                                        DropdownMenuItem(
-                                                            text = {
-                                                                Column {
-                                                                    Text(game.name)
-                                                                    Text(
-                                                                        if (isInstalled) "✅ مثبت" else "❌ غير مثبت",
-                                                                        style = MaterialTheme.typography.bodySmall,
-                                                                        color = if (isInstalled) Color.Green else Color.Red
-                                                                    )
-                                                                }
-                                                            },
-                                                            onClick = {
-                                                                selectedGame = game.name
-                                                                selectedGameInfo = game
-                                                                expanded = false
-                                                                appendModLog("تم اختيار اللعبة: ${game.name}")
-                                                            },
-                                                            enabled = isInstalled
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            OutlinedTextField(
-                                                value = manualPath,
-                                                onValueChange = { manualPath = it },
-                                                label = { Text("مسار المودات يدوي") },
-                                                placeholder = { Text("/sdcard/ModData/...") },
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
-                                        }
-                                    }
-
-                                    // Selected game info
-                                    if (!isManualMode && selectedGameInfo != null) {
-                                        Box(
-                                            modifier = Modifier.fillMaxWidth()
-                                                .background(Color(0xFFE3F2FD))
-                                                .padding(8.dp)
-                                        ) {
-                                            Column {
-                                                Text("📂 المسار: ${selectedGameInfo!!.modPath}", style = MaterialTheme.typography.bodySmall)
-                                                Text("💡 ملاحظات: ${selectedGameInfo!!.notes}", style = MaterialTheme.typography.bodySmall)
-                                            }
-                                        }
-                                    }
-
-                                    // Mod file selection
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        OutlinedButton(
-                                            onClick = {
-                                                val file = chooseModFile()
-                                                if (file != null) {
-                                                    modZipFile = file
-                                                    appendModLog("تم اختيار ملف المود: ${file.name}")
-                                                }
-                                            },
-                                            enabled = !isInstallingMod
-                                        ) { Text("اختيار مود (ZIP)") }
-
-                                        Button(
-                                            onClick = { 
-                                                CoroutineScope(Dispatchers.IO).launch { 
-                                                    installSelectedMod() 
-                                                }
-                                            },
-                                            enabled = !isInstallingMod && modZipFile != null && 
-                                                     ((isManualMode && manualPath.isNotBlank()) || selectedGameInfo != null)
-                                        ) { Text("تثبيت المود") }
-                                    }
-
-                                    // Selected mod info
-                                    if (modZipFile != null) {
-                                        val (isValid, info) = modsManager.getModZipInfo(modZipFile!!)
-                                        Box(
-                                            modifier = Modifier.fillMaxWidth()
-                                                .background(if (isValid) Color(0xFFE8F5E8) else Color(0xFFFFF0F0))
-                                                .padding(8.dp)
-                                        ) {
-                                            Column {
-                                                Text("📦 ملف المود: ${modZipFile?.name}", style = MaterialTheme.typography.bodySmall)
-                                                Text(if (isValid) "✅ ملف صالح" else "⚠️ ملف قد لا يحتوي على مود", style = MaterialTheme.typography.bodySmall)
-                                                if (info.isNotBlank()) {
-                                                    Text(info, style = MaterialTheme.typography.bodySmall)
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Mod installation progress
-                                    if (isInstallingMod) {
-                                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                            LinearProgressIndicator(
-                                                progress = { modProgress },
-                                                modifier = Modifier.fillMaxWidth().height(8.dp)
-                                            )
-                                            Text(modProgressLabel, style = MaterialTheme.typography.bodySmall)
-                                        }
-                                    }
-
-                                    // Mod log
-                                    Column {
-                                        Text("سجل تثبيت المودات", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                        Spacer(Modifier.height(4.dp))
-                                        Box(
-                                            modifier = Modifier.fillMaxWidth().height(200.dp)
-                                                .background(Color(0xFFF8F9FA))
-                                                .padding(8.dp)
-                                        ) {
-                                            Text(
-                                                if (modLogText.isBlank()) "—" else modLogText,
-                                                style = MaterialTheme.typography.bodySmall,
-                                                textAlign = TextAlign.Start,
-                                                modifier = Modifier.verticalScroll(modLogScroll)
-                                            )
-                                        }
-                                    }
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("قائمة الألعاب (بالترتيب)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            if (queue.isEmpty()) {
+                                Text("ما فيه ألعاب مكتشفة.", style = MaterialTheme.typography.bodyMedium)
+                            } else {
+                                queue.forEachIndexed { idx, g ->
+                                    val requiredGb = bytesToGb(g.requiredBytes)
+                                    Text(
+                                        "${idx + 1}) ${g.folder.name}  —  المطلوب تقريبًا: ${formatGb(requiredGb)}",
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
                                 }
+                            }
+                        }
+                    }
+
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("سجل التنفيذ", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(8.dp))
+                            Box(
+                                modifier = Modifier.fillMaxWidth().height(260.dp)
+                                    .background(Color(0xFFF6F6F6))
+                                    .padding(10.dp)
+                            ) {
+                                Text(
+                                    if (logText.isBlank()) "—" else logText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = TextAlign.Start,
+                                    modifier = Modifier.verticalScroll(logScroll)
+                                )
                             }
                         }
                     }
