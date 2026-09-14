@@ -196,10 +196,16 @@ private val SUPPORTED_GAMES = listOf(
 data class ModInstallResult(
     val success: Boolean,
     val message: String,
-    val extractedFiles: List<String> = emptyList()
+    val extractedFiles: List<String> = emptyList(),
+    val extractedRoot: File? = null
 )
 
 class ModsManager(private val adbClient: AdbClient) {
+    companion object {
+        private const val MAX_ZIP_ENTRIES = 5_000
+        private const val MAX_ENTRY_BYTES = 512L * 1024L * 1024L
+        private const val MAX_TOTAL_EXTRACTED_BYTES = 2L * 1024L * 1024L * 1024L
+    }
     
     fun getSupportedGames(): List<GameInfo> = SUPPORTED_GAMES
     
@@ -232,24 +238,48 @@ class ModsManager(private val adbClient: AdbClient) {
     
     fun extractModZip(zipFile: File): ModInstallResult {
         val extractedFiles = mutableListOf<String>()
-        
+        var tempDir: File? = null
+
         try {
-            val tempDir = Files.createTempDirectory("NFVR_Mod_").toFile()
+            tempDir = Files.createTempDirectory("NFVR_Mod_").toFile()
             tempDir.deleteOnExit()
-            
+            val rootPath = tempDir.canonicalFile.toPath()
+            var entryCount = 0
+            var totalExtracted = 0L
+
             ZipInputStream(zipFile.inputStream().buffered()).use { zipIn ->
                 var entry = zipIn.nextEntry
                 while (entry != null) {
-                    val filePath = File(tempDir, entry.name)
-                    
+                    entryCount++
+                    require(entryCount <= MAX_ZIP_ENTRIES) { "ملف المود يحتوي على عدد ملفات أكبر من الحد المسموح." }
+                    require(entry.name.isNotBlank()) { "اسم ملف غير صالح داخل ZIP." }
+                    require(!entry.name.contains('\u0000')) { "اسم ملف غير صالح داخل ZIP." }
+
+                    val outputPath = rootPath.resolve(entry.name.replace('\\', '/')).normalize()
+                    require(outputPath.startsWith(rootPath)) { "تم رفض مسار غير آمن داخل ملف ZIP." }
+                    val filePath = outputPath.toFile()
+
                     if (entry.isDirectory) {
                         filePath.mkdirs()
                     } else {
                         filePath.parentFile?.mkdirs()
-                        zipIn.copyTo(filePath.outputStream())
+                        var entryBytes = 0L
+                        filePath.outputStream().use { output ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val read = zipIn.read(buffer)
+                                if (read < 0) break
+                                entryBytes += read
+                                totalExtracted += read
+                                require(entryBytes <= MAX_ENTRY_BYTES) { "أحد ملفات المود أكبر من الحد المسموح." }
+                                require(totalExtracted <= MAX_TOTAL_EXTRACTED_BYTES) { "حجم ملفات المود بعد الفك أكبر من الحد المسموح." }
+                                output.write(buffer, 0, read)
+                            }
+                        }
                         extractedFiles.add(filePath.absolutePath)
+                        filePath.deleteOnExit()
                     }
-                    
+
                     zipIn.closeEntry()
                     entry = zipIn.nextEntry
                 }
@@ -258,10 +288,13 @@ class ModsManager(private val adbClient: AdbClient) {
             return ModInstallResult(
                 success = true,
                 message = "تم فك ضغط المود في: ${tempDir.absolutePath}",
-                extractedFiles = extractedFiles
+                extractedFiles = extractedFiles,
+                extractedRoot = tempDir
             )
             
         } catch (e: Exception) {
+            tempDir?.deleteRecursively()
+            DiagnosticLogger.error("فشل فك ضغط ملف مود ${zipFile.name}", e)
             return ModInstallResult(
                 success = false,
                 message = "فشل فك الضغط: ${e.message}"
@@ -277,6 +310,9 @@ class ModsManager(private val adbClient: AdbClient) {
     onBytesProgress: (copiedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> }
 ): ModInstallResult {
     try {
+        if (!AndroidPathValidator.isSafe(targetPath)) {
+            return ModInstallResult(false, "مسار المودات غير صالح أو غير آمن.")
+        }
         onProgress("التحقق من وجود مسار المودات...")
         if (!testPathExists(serial, targetPath)) {
             onProgress("إنشاء مجلد المودات...")
@@ -328,10 +364,15 @@ class ModsManager(private val adbClient: AdbClient) {
         try {
             val entries = mutableListOf<String>()
             var hasValidStructure = false
+            var entryCount = 0
             
             ZipInputStream(zipFile.inputStream().buffered()).use { zipIn ->
                 var entry = zipIn.nextEntry
                 while (entry != null) {
+                    entryCount++
+                    if (entryCount > MAX_ZIP_ENTRIES || entry.name.length > 1_000) {
+                        return Pair(false, "ملف ZIP أكبر من حدود الفحص الآمن.")
+                    }
                     if (!entry.name.startsWith("__MACOSX/")) {
                         entries.add(entry.name)
                         

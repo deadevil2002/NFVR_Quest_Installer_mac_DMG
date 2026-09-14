@@ -31,6 +31,19 @@ dependencies {
     implementation(compose.foundation)
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation("org.json:json:20240303")
+
+    testImplementation(kotlin("test"))
+}
+
+tasks.processResources {
+    filesMatching("app.properties") {
+        expand("version" to project.version.toString())
+    }
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 compose.desktop {
@@ -43,7 +56,7 @@ compose.desktop {
             packageName = "NFVR_Quest_Installer"
             description = "Near FutureVR - مثبت ألعاب Meta Quest"
             vendor = "Near FutureVR"
-            packageVersion = "2.0.0"
+            packageVersion = project.version.toString()
 
             windows {
                 iconFile.set(project.file("NFVR_Quest_Installer.ico"))

@@ -125,9 +125,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("wmic", "cpu", "get", "name")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 output.firstOrNull { it.isNotBlank() && !it.contains("Name") }?.trim() ?: "CPU غير معروف"
             } else {
                 "CPU غير معروف"
@@ -142,9 +140,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("wmic", "path", "win32_VideoController", "get", "name,AdapterRAM")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 
                 val gpuLine = output.firstOrNull { it.isNotBlank() && !it.contains("AdapterRAM") }
                 if (gpuLine != null) {
@@ -169,9 +165,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("wmic", "path", "win32_VideoController", "get", "DriverVersion")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 output.firstOrNull { it.isNotBlank() && !it.contains("DriverVersion") }?.trim() ?: "غير معروف"
             } else {
                 "غير معروف"
@@ -209,9 +203,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("cmd", "/c", "reg", "query", "HKLM\\SOFTWARE\\Khronos\\OpenXR\\1", "/v", "ActiveRuntime")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 val line = output.firstOrNull { it.contains("ActiveRuntime") }
                 
                 if (line != null) {
@@ -220,9 +212,7 @@ object PcvrChecker {
                         parts[1].trim()
                     } else {
                         val command2 = arrayOf("cmd", "/c", "reg", "query", "HKCU\\SOFTWARE\\Khronos\\OpenXR\\1", "/v", "ActiveRuntime")
-                        val process2 = ProcessBuilder(*command2).start()
-                        val reader2 = process2.inputStream.bufferedReader()
-                        val output2 = reader2.useLines { it.toList() }
+                        val output2 = runOwnedCommand(command2.toList())
                         val line2 = output2.firstOrNull { it.contains("ActiveRuntime") }
                         val parts2 = line2?.split("REG_SZ")
                         if (parts2 != null && parts2.size > 1) {
@@ -247,9 +237,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("wmic", "path", "win32_USBController", "get", "Name")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 output.any { it.lowercase().contains("usb") && (it.lowercase().contains("3.0") || it.lowercase().contains("3.1") || it.lowercase().contains("3.2")) }
             } else {
                 false
@@ -264,9 +252,7 @@ object PcvrChecker {
             val osName = System.getProperty("os.name").lowercase()
             if (osName.contains("win")) {
                 val command = arrayOf("netsh", "interface", "show", "interface")
-                val process = ProcessBuilder(*command).start()
-                val reader = process.inputStream.bufferedReader()
-                val output = reader.useLines { it.toList() }
+                val output = runOwnedCommand(command.toList())
                 
                 val ethernetLine = output.firstOrNull { it.lowercase().contains("ethernet") && it.contains("connected") }
                 val wifiLine = output.firstOrNull { it.lowercase().contains("wi-fi") && it.contains("connected") }

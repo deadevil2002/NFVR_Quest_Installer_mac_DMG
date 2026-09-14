@@ -44,6 +44,7 @@ import java.nio.charset.StandardCharsets
 import java.io.StringWriter
 import java.io.PrintWriter
 import kotlin.math.roundToInt
+import java.security.MessageDigest
 
 enum class HostOs { WINDOWS, MAC, LINUX }
 
@@ -87,6 +88,7 @@ private object SupportReporter {
         lastDetails = details.take(80_000)
         lastContext = context?.take(2_000)
         lastAt = System.currentTimeMillis()
+        DiagnosticLogger.error("$title — ${context.orEmpty()}")
     }
 
     fun summary(): String {
@@ -94,7 +96,7 @@ private object SupportReporter {
         return "آخر خطأ: $title"
     }
 
-    fun buildPayload(licenseKey: String?, deviceHash: String?): String {
+    fun buildPayload(licenseKey: String?, deviceHash: String?, diagnostics: String): String {
         val os = "${System.getProperty("os.name")} ${System.getProperty("os.version")}"
         val java = System.getProperty("java.version")
         val app = "NFVR Quest Installer"
@@ -104,12 +106,36 @@ private object SupportReporter {
             "\"os\":" + jsonStr(os) + "," +
             "\"java\":" + jsonStr(java) + "," +
             "\"at\":" + lastAt + "," +
-            "\"license_key\":" + jsonStr(licenseKey) + "," +
+            "\"license_key\":" + jsonStr(licenseIdentifier(licenseKey)) + "," +
             "\"device_hash\":" + jsonStr(deviceHash) + "," +
-            "\"title\":" + jsonStr(lastTitle) + "," +
-            "\"details\":" + jsonStr(lastDetails) + "," +
-            "\"context\":" + jsonStr(lastContext) +
+            "\"title\":" + jsonStr(sanitize(lastTitle)) + "," +
+            "\"details\":" + jsonStr(sanitize(lastDetails)) + "," +
+            "\"context\":" + jsonStr(
+                sanitize(buildString {
+                    appendLine(lastContext.orEmpty())
+                    appendLine("app_version=${AppInfo.version}")
+                    appendLine("os_arch=${System.getProperty("os.arch")}")
+                    append(diagnostics.takeLast(40_000))
+                })
+            ) +
         "}"
+    }
+
+    private fun licenseIdentifier(licenseKey: String?): String? {
+        val value = licenseKey?.trim().orEmpty()
+        if (value.isBlank()) return null
+        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8))
+        return "sha256:" + digest.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    private fun sanitize(value: String?): String? {
+        if (value == null) return null
+        val home = System.getProperty("user.home").orEmpty()
+        val withoutHome = if (home.isBlank()) value else value.replace(home, "[USER_HOME]", ignoreCase = true)
+        return withoutHome
+            .replace(Regex("""(?i)(license[_ -]?key\s*[=:]\s*)\S+"""), "$1[REDACTED]")
+            .replace(Regex("""(?i)(السيريال\s*:\s*)\S+"""), "$1[REDACTED]")
+            .replace(Regex("""(?i)(serial\s*[=:]\s*)\S+"""), "$1[REDACTED]")
     }
 
     fun send(reportUrl: String, jsonBody: String, timeoutMs: Int = 25_000): Pair<Boolean, String> {
@@ -127,13 +153,28 @@ private object SupportReporter {
             val code = conn.responseCode
             val resp = try {
                 val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                stream?.bufferedReader()?.readText().orEmpty()
+                readBounded(stream, 64_000)
             } catch (_: Throwable) { "" }
 
             if (code in 200..299) true to (resp.ifBlank { "OK" })
             else false to ("HTTP $code " + resp.take(700))
         } catch (e: Throwable) {
             false to (e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    private fun readBounded(stream: java.io.InputStream?, maxBytes: Int): String {
+        if (stream == null) return ""
+        stream.use { input ->
+            val output = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (output.size() < maxBytes) {
+                val allowed = minOf(buffer.size, maxBytes - output.size())
+                val read = input.read(buffer, 0, allowed)
+                if (read < 0) break
+                output.write(buffer, 0, read)
+            }
+            return output.toString(StandardCharsets.UTF_8)
         }
     }
 }
@@ -147,7 +188,8 @@ private data class UiLicenseState(
 
 private object LocalLicenseStore {
     private fun file(): File {
-        val dir = File(System.getProperty("user.home"), ".nfvr_quest_installer")
+        // Keep this path stable: existing activated customers depend on this exact file.
+        val dir = UserDataPaths.root
         if (!dir.exists()) dir.mkdirs()
         return File(dir, "license.properties")
     }
@@ -207,7 +249,7 @@ private object LocalLicenseStore {
 // ====== ONLINE LICENSE CONFIG ======
 private const val LICENSE_API_BASE_URL = "https://nfvr-license-api.isaudi-official.workers.dev"
 private const val SUPPORT_REPORT_URL = "${LICENSE_API_BASE_URL}/client/report"
-private const val LICENSE_PRODUCT_CODE = "NFVR_INSTALLER"
+private const val LICENSE_PRODUCT_CODE = "NFVR_QUEST_INSTALLER"
 // ===================================
 
 private fun detectOs(): HostOs {
@@ -258,11 +300,13 @@ private fun safeUiMsg(e: Throwable): String {
 
 class BundledAdb(private val host: HostOs) {
     private var adbPath: File? = null
+    private var tempDir: File? = null
 
     fun ensureReady(): File {
         if (adbPath != null && adbPath!!.exists()) return adbPath!!
 
         val tempDir = Files.createTempDirectory("NFVR_ADB_").toFile()
+        this.tempDir = tempDir
         tempDir.deleteOnExit()
 
         when (host) {
@@ -298,29 +342,56 @@ class BundledAdb(private val host: HostOs) {
         } catch (_: Throwable) {
         }
     }
+
+    fun cleanupOwnedResources() {
+        OwnedProcessRegistry.destroyAll()
+        runCatching { tempDir?.deleteRecursively() }
+        adbPath = null
+        tempDir = null
+    }
+}
+
+private class BoundedTextCollector(private val maxChars: Int = 200_000) {
+    private val value = StringBuilder()
+
+    @Synchronized
+    fun appendLine(line: String) {
+        val remaining = maxChars - value.length
+        if (remaining <= 0) return
+        value.append(line.take((remaining - 1).coerceAtLeast(0))).append('\n')
+    }
+
+    @Synchronized
+    override fun toString(): String = value.toString()
 }
 
 private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long = 120_000): CmdResult {
     val pb = ProcessBuilder(cmd)
     if (workDir != null) pb.directory(workDir)
     val p = pb.start()
+    OwnedProcessRegistry.add(p)
 
-    val out = StringBuilder()
-    val err = StringBuilder()
+    val out = BoundedTextCollector()
+    val err = BoundedTextCollector()
 
     val tOut =
-        Thread { p.inputStream.bufferedReader().useLines { it.forEach { line -> out.appendLine(line) } } }
+        Thread { p.inputStream.bufferedReader().useLines { it.forEach(out::appendLine) } }
     val tErr =
-        Thread { p.errorStream.bufferedReader().useLines { it.forEach { line -> err.appendLine(line) } } }
+        Thread { p.errorStream.bufferedReader().useLines { it.forEach(err::appendLine) } }
     tOut.start(); tErr.start()
 
     val finished = p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     if (!finished) {
         p.destroyForcibly()
+        p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        tOut.join(5_000)
+        tErr.join(5_000)
+        OwnedProcessRegistry.remove(p)
         return CmdResult(124, out.toString(), "Timeout")
     }
     tOut.join(); tErr.join()
 
+    OwnedProcessRegistry.remove(p)
     return CmdResult(p.exitValue(), out.toString(), err.toString())
 }
 
@@ -512,7 +583,8 @@ private fun copyToClipboard(text: String) {
     }
 }
 
-private fun hardExitApp() {
+private fun hardExitApp(cleanup: () -> Unit = {}) {
+    runCatching { cleanup() }
     try {
         java.awt.Window.getWindows().forEach { it.dispose() }
     } catch (_: Throwable) {
@@ -541,6 +613,9 @@ fun main() = application {
     val bundledAdb = remember { BundledAdb(host) }
     val adb = remember { AdbClient(bundledAdb) }
     val modsManager = remember { ModsManager(adb) }
+    LaunchedEffect(Unit) {
+        DiagnosticLogger.info("بدء تشغيل NFVR Quest Installer ${AppInfo.version}")
+    }
 
     var selectedTab by remember { mutableStateOf(0) }
 
@@ -553,7 +628,7 @@ fun main() = application {
     var warningText by remember { mutableStateOf<String?>(null) }
 
     var folders by remember { mutableStateOf(listOf<File>()) }
-    var queue by remember { mutableStateOf(mutableStateListOf<GameEntry>()) }
+    var queue by remember { mutableStateOf<List<GameEntry>>(emptyList()) }
     var gamesLogAutoScroll by remember { mutableStateOf(true) }
     var gameToRemove by remember { mutableStateOf<GameEntry?>(null) }
 
@@ -602,10 +677,14 @@ fun main() = application {
 
     fun appendLog(line: String) {
         logText += if (logText.isBlank()) line else "\n$line"
+        if (logText.length > 100_000) logText = logText.takeLast(100_000)
+        DiagnosticLogger.info(line)
     }
 
     fun appendModLog(line: String) {
         modLogText += if (modLogText.isBlank()) line else "\n$line"
+        if (modLogText.length > 100_000) modLogText = modLogText.takeLast(100_000)
+        DiagnosticLogger.info(line)
     }
 
     fun openUrl(url: String) {
@@ -708,6 +787,7 @@ fun main() = application {
             storageText = "—"
             statusText = if (isInstalling) "الحالة: توقف مؤقت" else "الحالة: تعذر تشغيل ADB"
             warningText = safeUiMsg(e)
+            DiagnosticLogger.error("تعذر تحديث معلومات جهاز Meta Quest", e)
         }
     }
 
@@ -873,7 +953,7 @@ setProgressWithinGame(0f)
                 if (serial != null) adb.reboot(serial)
             } catch (_: Throwable) {
             } finally {
-                hardExitApp()
+                hardExitApp { bundledAdb.cleanupOwnedResources() }
             }
         }
     }
@@ -892,6 +972,7 @@ setProgressWithinGame(0f)
         appendModLog("بدء تثبيت المود: ${modZipFile?.name}")
         appendModLog("==============================================")
 
+        var extractedRoot: File? = null
         try {
             adb.startServer()
 
@@ -914,7 +995,12 @@ setProgressWithinGame(0f)
             appendModLog("تم فك الضغط بنجاح")
             appendModLog("الملفات المستخرجة: ${extractResult.extractedFiles.size}")
 
-            val extractedDir = File(extractResult.message.split(": ").lastOrNull() ?: "")
+            val extractedDir = extractResult.extractedRoot
+            extractedRoot = extractedDir
+            if (extractedDir == null) {
+                appendModLog("لم يتم العثور على مجلد الملفات المستخرجة")
+                return
+            }
             if (!extractedDir.exists()) {
                 appendModLog("لم يتم العثور على مجلد الملفات المستخرجة")
                 return
@@ -928,6 +1014,10 @@ setProgressWithinGame(0f)
 
             if (targetPath.isBlank()) {
                 appendModLog("لم يتم تحديد مسار التثبيت")
+                return
+            }
+            if (!AndroidPathValidator.isSafe(targetPath)) {
+                appendModLog("مسار المودات غير صالح أو غير آمن")
                 return
             }
 
@@ -967,6 +1057,7 @@ setProgressWithinGame(0f)
             appendModLog("خطأ غير متوقع: ${e.message}")
             modProgressLabel = "خطأ"
         } finally {
+            runCatching { extractedRoot?.deleteRecursively() }
             isInstallingMod = false
         }
     }
@@ -993,9 +1084,9 @@ setProgressWithinGame(0f)
     }
 
     Window(
-        onCloseRequest = { hardExitApp() },
+        onCloseRequest = { hardExitApp { bundledAdb.cleanupOwnedResources() } },
         title = "Near FutureVR - مثبت ألعاب Meta Quest",
-        icon = painterResource("icon.png")
+        icon = painterResource("nfvr_logo.png")
     ) {
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -1035,7 +1126,7 @@ setProgressWithinGame(0f)
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 Text(
-                                    "الإصدار: Version 2",
+                                    "الإصدار: ${AppInfo.version}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1078,6 +1169,42 @@ setProgressWithinGame(0f)
                                         Text("الإعدادات", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                         Spacer(Modifier.weight(1f))
                                         OutlinedButton(onClick = { showSettings.value = false }) { Text("إغلاق") }
+                                    }
+
+                                    Divider()
+
+                                    Text("التحديثات", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                    var updateStatus by remember { mutableStateOf<String?>(null) }
+                                    var checkingUpdate by remember { mutableStateOf(false) }
+                                    val updateScope = rememberCoroutineScope()
+                                    Text("الإصدار الحالي: ${AppInfo.version}", style = MaterialTheme.typography.bodySmall)
+                                    Button(
+                                        enabled = !checkingUpdate,
+                                        onClick = {
+                                            checkingUpdate = true
+                                            updateScope.launch(Dispatchers.IO) {
+                                                val message = when (val result = UpdateManager.check()) {
+                                                    UpdateCheckResult.Unavailable -> "خدمة التحديث غير مهيأة حاليًا."
+                                                    UpdateCheckResult.Current -> "لديك أحدث إصدار."
+                                                    is UpdateCheckResult.Available ->
+                                                        if (result.effectiveMandatory) {
+                                                            "يتوفر تحديث مطلوب إلى الإصدار ${result.metadata.latestVersion}. سيتم تفعيل التنزيل بعد اعتماد خدمة التحديث."
+                                                        } else {
+                                                            "يتوفر الإصدار ${result.metadata.latestVersion}. سيتم تفعيل التنزيل بعد اعتماد خدمة التحديث."
+                                                        }
+                                                    is UpdateCheckResult.Error -> result.message
+                                                }
+                                                SwingUtilities.invokeLater {
+                                                    updateStatus = message
+                                                    checkingUpdate = false
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Text(if (checkingUpdate) "جاري الفحص..." else "فحص التحديثات")
+                                    }
+                                    if (!updateStatus.isNullOrBlank()) {
+                                        Text(updateStatus!!, style = MaterialTheme.typography.bodySmall)
                                     }
 
                                     Divider()
@@ -1140,6 +1267,11 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
+    Text(
+        "لن يتم إرسال مفتاح الترخيص الكامل. يتضمن التقرير معلومات النظام وحالة الاتصال وسجلًا تشخيصيًا حديثًا بعد حجب المعرّفات المباشرة.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
 
     Button(
         enabled = canSendReport && !sendingReport,
@@ -1149,15 +1281,17 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
 
             val payloadRaw = SupportReporter.buildPayload(
                 licenseKey = boundKey,
-                deviceHash = fp
+                deviceHash = fp,
+                diagnostics = buildString {
+                    appendLine("connection=$connectionText")
+                    appendLine("device=$deviceText")
+                    appendLine("adb_state=${if (hasAuthorizedDevice) "authorized" else "not_authorized"}")
+                    appendLine("operation=$statusText")
+                    append(DiagnosticLogger.recent())
+                }
             )
-            val payload =
-                if (payloadRaw.toByteArray(StandardCharsets.UTF_8).size > 200_000)
-                    payloadRaw.take(180_000)
-                else payloadRaw
-
             scopeReport.launch(Dispatchers.IO) {
-                val (ok, msg) = SupportReporter.send(SUPPORT_REPORT_URL, payload)
+                val (ok, msg) = SupportReporter.send(SUPPORT_REPORT_URL, payloadRaw)
                 SwingUtilities.invokeLater {
                     sendingReport = false
                     reportStatus = if (ok) "تم إرسال التقرير بنجاح." else "فشل إرسال التقرير: $msg"
