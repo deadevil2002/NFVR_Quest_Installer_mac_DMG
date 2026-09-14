@@ -1,7 +1,9 @@
 import java.io.*
 import java.nio.file.Files
 import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
+import java.util.zip.ZipFile
+import java.security.MessageDigest
+import org.json.JSONObject
 
 data class GameInfo(
     val name: String,
@@ -202,12 +204,266 @@ data class ModInstallResult(
 
 class ModsManager(private val adbClient: AdbClient) {
     companion object {
-        private const val MAX_ZIP_ENTRIES = 5_000
-        private const val MAX_ENTRY_BYTES = 512L * 1024L * 1024L
-        private const val MAX_TOTAL_EXTRACTED_BYTES = 2L * 1024L * 1024L * 1024L
+        private const val MAX_ENTRY_BYTES = ModPackageAnalyzer.MAX_ENTRY_BYTES
     }
     
     fun getSupportedGames(): List<GameInfo> = SUPPORTED_GAMES
+
+    /**
+     * Analyze a package before any extraction or ADB operation.  Kept as a
+     * small facade so existing UI callers can adopt the conservative package
+     * engine without coupling themselves to its implementation.
+     */
+    fun analyzeModPackage(
+        zipFile: File,
+        installedApp: InstalledQuestApp? = null
+    ): ModPackageAnalysis = ModPackageAnalyzer().analyze(zipFile, installedApp)
+
+    suspend fun scanInstalledQuestApps(serial: String): List<InstalledQuestApp> {
+        val listed = adbClient.shell(serial, "pm", "list", "packages", "-3", "-f")
+        if (listed.exit != 0) return emptyList()
+
+        return listed.out.lineSequence()
+            .mapNotNull(::parsePackageListLine)
+            .distinctBy { it.first }
+            .take(250)
+            .map { (packageId, apkPath) ->
+                val details = adbClient.shell(serial, "dumpsys", "package", packageId)
+                val versionName = findPackageValue(details.out, "versionName")
+                val versionCode = Regex("""versionCode=(\d+)""")
+                    .find(details.out)?.groupValues?.getOrNull(1)?.toLongOrNull()
+                val profileName = GameModProfileRegistry.findByPackageId(packageId)?.displayName
+                val label = findBestLabel(details.out) ?: profileName ?: packageId.substringAfterLast('.')
+                InstalledQuestApp(
+                    packageName = packageId,
+                    versionName = versionName,
+                    versionCode = versionCode,
+                    displayName = label,
+                    apkPath = apkPath,
+                    thirdParty = true
+                )
+            }
+            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName ?: it.packageName })
+            .toList()
+    }
+
+    suspend fun executeInstallPlan(
+        serial: String,
+        zipFile: File,
+        plan: ModInstallPlan,
+        onProgress: (ModExecutionProgress) -> Unit = {}
+    ): ModInstallResult {
+        if (!plan.installable || plan.hasBlockingPreconditions || plan.mappings.isEmpty()) {
+            return ModInstallResult(false, "خطة التثبيت غير صالحة أو تحتوي متطلبات غير مستوفاة.")
+        }
+        val reviewedApp = plan.reviewedApp
+            ?: return ModInstallResult(false, "الخطة لا تحتوي حالة التطبيق التي تمت مراجعتها؛ أعد تحليل الحزمة.")
+        val reviewedIdentity = plan.archiveIdentity
+            ?: return ModInstallResult(false, "الخطة لا تحتوي هوية الأرشيف التي تمت مراجعتها؛ أعد تحليل الحزمة.")
+        val currentApp = scanInstalledQuestApps(serial)
+            .firstOrNull { it.packageName == reviewedApp.packageName }
+            ?: return ModInstallResult(false, "التطبيق المستهدف لم يعد مثبتًا؛ أعد تحليل الحزمة.")
+        if (!sameAppState(reviewedApp, currentApp)) {
+            return ModInstallResult(false, "تغيرت حالة التطبيق المستهدف منذ التحليل؛ أعد تحليل الحزمة.")
+        }
+        val freshAnalysis = ModPackageAnalyzer().analyze(zipFile, currentApp)
+        val freshPlan = freshAnalysis.installPlan
+        if (!freshAnalysis.installable || freshPlan.archiveIdentity != reviewedIdentity ||
+            freshPlan.mappings != plan.mappings ||
+            freshPlan.targetPackageId != plan.targetPackageId) {
+            return ModInstallResult(false, "تغير الأرشيف أو خطة التثبيت منذ التحليل؛ أعد التحليل قبل النقل.")
+        }
+        var executionPlan = freshPlan
+        val profile = plan.targetPackageId?.let(GameModProfileRegistry::findByPackageId)
+            ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
+        if (executionPlan.destinationRoot != profile.destination) {
+            return ModInstallResult(false, "وجهة الخطة لا تطابق ملف تعريف اللعبة الموثوق.")
+        }
+
+        val tempRoot = Files.createTempDirectory("NFVR_ModPlan_").toFile()
+        var copiedBytes = 0L
+        var copiedFiles = 0
+        try {
+            onProgress(ModExecutionProgress(ModInstallPhase.EXTRACTING, null, "استخراج الملفات المطلوبة بأمان"))
+            if (!archiveIdentityMatches(zipFile, reviewedIdentity)) {
+                return ModInstallResult(false, "تغير الأرشيف أثناء التثبيت؛ تم إيقاف النقل.")
+            }
+            val extracted = extractPlannedFiles(zipFile, tempRoot, executionPlan)
+            onProgress(ModExecutionProgress(ModInstallPhase.VALIDATING, null, "التحقق من سلامة الملفات والخطة"))
+            validateExtractedFiles(extracted, executionPlan)
+            if (!archiveIdentityMatches(zipFile, reviewedIdentity)) {
+                return ModInstallResult(false, "تغير الأرشيف بعد التحقق؛ تم إيقاف النقل.")
+            }
+            val appBeforeTransfer = scanInstalledQuestApps(serial)
+                .firstOrNull { it.packageName == reviewedApp.packageName }
+            if (appBeforeTransfer == null || !sameAppState(reviewedApp, appBeforeTransfer)) {
+                return ModInstallResult(false, "تغيرت حالة التطبيق قبل النقل؛ أعد تحليل الحزمة.")
+            }
+
+            for (mapping in executionPlan.mappings) {
+                val destination = mapping.destinationPath
+                if (!isApprovedDestination(destination, profile)) {
+                    return ModInstallResult(false, "تم رفض وجهة غير معتمدة: $destination")
+                }
+                val parent = destination.substringBeforeLast('/', profile.destination)
+                val mkdir = createModPath(serial, parent)
+                if (mkdir.exit != 0) return ModInstallResult(false, "فشل تجهيز وجهة المود: ${mkdir.err}")
+
+                val source = extracted.getValue(mapping.sourcePath)
+                onProgress(
+                    ModExecutionProgress(
+                        ModInstallPhase.TRANSFERRING,
+                        executionPlan.progress(copiedBytes, copiedFiles).fraction.coerceAtMost(0.94),
+                        "نقل ${source.name}"
+                    )
+                )
+                val pushed = adbClient.pushWithProgress(serial, source, destination) { current, _ ->
+                    val fraction = executionPlan.progress(copiedBytes + current, copiedFiles).fraction.coerceAtMost(0.94)
+                    onProgress(ModExecutionProgress(ModInstallPhase.TRANSFERRING, fraction, "نقل ${source.name}"))
+                }
+                if (pushed.exit != 0) {
+                    return ModInstallResult(false, "فشل نقل ${source.name}: ${pushed.err.ifBlank { pushed.out }}")
+                }
+                copiedBytes += mapping.sizeBytes
+                copiedFiles++
+            }
+
+            onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, 0.95, "التحقق من الملفات على النظارة"))
+            val verificationErrors = executionPlan.mappings.mapNotNull { mapping ->
+                verifyRemoteFile(serial, mapping)
+            }
+            if (verificationErrors.isNotEmpty()) {
+                return ModInstallResult(false, verificationErrors.joinToString("\n"))
+            }
+
+            onProgress(ModExecutionProgress(ModInstallPhase.COMPLETED, 1.0, "اكتمل التثبيت والتحقق"))
+            ModInstallHistory.record(executionPlan, true, "verified")
+            return ModInstallResult(true, "تم تثبيت المود والتحقق من الملفات بنجاح.")
+        } catch (e: Exception) {
+            ModInstallHistory.record(executionPlan, false, e.message ?: "error")
+            DiagnosticLogger.error("فشل تنفيذ خطة تثبيت المود", e)
+            return ModInstallResult(false, "فشل التثبيت: ${e.message ?: "خطأ غير معروف"}")
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    private fun parsePackageListLine(line: String): Pair<String, String?>? {
+        val value = line.trim().removePrefix("package:")
+        if (value.isBlank()) return null
+        val separator = value.lastIndexOf('=')
+        return if (separator > 0) {
+            val apk = value.substring(0, separator).trim().ifBlank { null }
+            val packageId = value.substring(separator + 1).trim()
+            packageId.takeIf(::isValidPackageId)?.let { it to apk }
+        } else {
+            value.takeIf(::isValidPackageId)?.let { it to null }
+        }
+    }
+
+    private fun isValidPackageId(value: String): Boolean =
+        value.length in 3..200 && value.matches(Regex("""[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+"""))
+
+    private fun findPackageValue(output: String, key: String): String? =
+        Regex("""(?m)^\s*${Regex.escape(key)}=([^\s]+)""")
+            .find(output)?.groupValues?.getOrNull(1)?.takeIf { it != "null" }
+
+    private fun findBestLabel(output: String): String? {
+        val patterns = listOf(
+            Regex("""nonLocalizedLabel=([^,\n}]+)"""),
+            Regex("""labelRes=0x0\s+nonLocalizedLabel=([^,\n}]+)""")
+        )
+        return patterns.firstNotNullOfOrNull { pattern ->
+            pattern.find(output)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() && it != "null" }
+        }
+    }
+
+    private fun extractPlannedFiles(
+        zipFile: File,
+        tempRoot: File,
+        plan: ModInstallPlan
+    ): Map<String, File> {
+        val root = tempRoot.canonicalFile.toPath()
+        val files = linkedMapOf<String, File>()
+        ZipFile(zipFile).use { zip ->
+            for (mapping in plan.mappings) {
+                val entry = zip.getEntry(mapping.sourcePath)
+                    ?: error("الملف ${mapping.sourcePath} غير موجود داخل الحزمة.")
+                require(!entry.isDirectory) { "لا يمكن تثبيت مجلد كملف: ${mapping.sourcePath}" }
+                val outputPath = root.resolve(mapping.sourcePath).normalize()
+                require(outputPath.startsWith(root)) { "تم رفض مسار استخراج غير آمن." }
+                val output = outputPath.toFile()
+                output.parentFile?.mkdirs()
+                var bytes = 0L
+                zip.getInputStream(entry).use { input ->
+                    output.outputStream().use { target ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            bytes += read
+                            require(bytes <= MAX_ENTRY_BYTES) { "ملف مود أكبر من الحد المسموح." }
+                            target.write(buffer, 0, read)
+                        }
+                    }
+                }
+                require(bytes == mapping.sizeBytes) { "حجم الملف المستخرج لا يطابق خطة التثبيت." }
+                files[mapping.sourcePath] = output
+            }
+        }
+        return files
+    }
+
+    private fun validateExtractedFiles(files: Map<String, File>, plan: ModInstallPlan) {
+        for (mapping in plan.mappings) {
+            val file = files.getValue(mapping.sourcePath)
+            require(file.isFile && file.length() == mapping.sizeBytes) { "فشل التحقق من ${mapping.sourcePath}." }
+            mapping.sha256?.let { expected ->
+                require(sha256(file).equals(expected, ignoreCase = true)) {
+                    "بصمة SHA-256 لا تطابق الملف ${mapping.sourcePath}."
+                }
+            }
+        }
+    }
+
+    private fun isApprovedDestination(path: String, profile: GameModProfile): Boolean =
+        AndroidPathValidator.isSafe(path) &&
+            (path == profile.destination || path.startsWith("${profile.destination}/"))
+
+    private suspend fun verifyRemoteFile(serial: String, mapping: ModFileMapping): String? {
+        val exists = adbClient.shell(serial, "test", "-f", mapping.destinationPath)
+        if (exists.exit != 0) return "فشل التحقق: الملف غير موجود في ${mapping.destinationPath}"
+        val size = adbClient.shell(serial, "stat", "-c", "%s", mapping.destinationPath)
+        val actual = size.out.trim().lineSequence().lastOrNull()?.toLongOrNull()
+        return if (actual == mapping.sizeBytes) null
+        else "فشل التحقق من حجم ${mapping.destinationPath}: المتوقع ${mapping.sizeBytes} والفعلي ${actual ?: "غير معروف"}"
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun sameAppState(expected: InstalledQuestApp, actual: InstalledQuestApp): Boolean =
+        expected.packageName == actual.packageName &&
+            expected.versionName == actual.versionName &&
+            expected.versionCode == actual.versionCode
+
+    private fun archiveIdentityMatches(file: File, identity: ModArchiveIdentity): Boolean =
+        runCatching {
+            file.canonicalPath == identity.canonicalPath &&
+                file.length() == identity.sizeBytes &&
+                file.lastModified() == identity.lastModifiedMillis &&
+                sha256(file).equals(identity.sha256, ignoreCase = true)
+        }.getOrDefault(false)
     
     suspend fun getInstalledGamePackages(serial: String): List<String> {
         val result = adbClient.shell(serial, "pm", "list", "packages", "-3")
@@ -236,170 +492,51 @@ class ModsManager(private val adbClient: AdbClient) {
         return gameInfo.modPath
     }
     
-    fun extractModZip(zipFile: File): ModInstallResult {
-        val extractedFiles = mutableListOf<String>()
-        var tempDir: File? = null
+enum class ModInstallPhase {
+    ANALYZING, EXTRACTING, VALIDATING, PREPARING, TRANSFERRING, VERIFYING, COMPLETED, FAILED
+}
 
-        try {
-            tempDir = Files.createTempDirectory("NFVR_Mod_").toFile()
-            tempDir.deleteOnExit()
-            val rootPath = tempDir.canonicalFile.toPath()
-            var entryCount = 0
-            var totalExtracted = 0L
+data class ModExecutionProgress(
+    val phase: ModInstallPhase,
+    val fraction: Double?,
+    val message: String
+)
 
-            ZipInputStream(zipFile.inputStream().buffered()).use { zipIn ->
-                var entry = zipIn.nextEntry
-                while (entry != null) {
-                    entryCount++
-                    require(entryCount <= MAX_ZIP_ENTRIES) { "ملف المود يحتوي على عدد ملفات أكبر من الحد المسموح." }
-                    require(entry.name.isNotBlank()) { "اسم ملف غير صالح داخل ZIP." }
-                    require(!entry.name.contains('\u0000')) { "اسم ملف غير صالح داخل ZIP." }
+private object ModInstallHistory {
+    private const val MAX_HISTORY_BYTES = 500_000L
 
-                    val outputPath = rootPath.resolve(entry.name.replace('\\', '/')).normalize()
-                    require(outputPath.startsWith(rootPath)) { "تم رفض مسار غير آمن داخل ملف ZIP." }
-                    val filePath = outputPath.toFile()
-
-                    if (entry.isDirectory) {
-                        filePath.mkdirs()
-                    } else {
-                        filePath.parentFile?.mkdirs()
-                        var entryBytes = 0L
-                        filePath.outputStream().use { output ->
-                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                            while (true) {
-                                val read = zipIn.read(buffer)
-                                if (read < 0) break
-                                entryBytes += read
-                                totalExtracted += read
-                                require(entryBytes <= MAX_ENTRY_BYTES) { "أحد ملفات المود أكبر من الحد المسموح." }
-                                require(totalExtracted <= MAX_TOTAL_EXTRACTED_BYTES) { "حجم ملفات المود بعد الفك أكبر من الحد المسموح." }
-                                output.write(buffer, 0, read)
-                            }
-                        }
-                        extractedFiles.add(filePath.absolutePath)
-                        filePath.deleteOnExit()
-                    }
-
-                    zipIn.closeEntry()
-                    entry = zipIn.nextEntry
+    fun record(plan: ModInstallPlan, success: Boolean, result: String) {
+        runCatching {
+            val file = File(UserDataPaths.root, "logs/mod-install-history.jsonl")
+            file.parentFile?.mkdirs()
+            if (file.exists() && file.length() >= MAX_HISTORY_BYTES) {
+                File(file.parentFile, "${file.name}.1").also { previous ->
+                    previous.delete()
+                    file.renameTo(previous)
                 }
             }
-            
-            return ModInstallResult(
-                success = true,
-                message = "تم فك ضغط المود في: ${tempDir.absolutePath}",
-                extractedFiles = extractedFiles,
-                extractedRoot = tempDir
-            )
-            
-        } catch (e: Exception) {
-            tempDir?.deleteRecursively()
-            DiagnosticLogger.error("فشل فك ضغط ملف مود ${zipFile.name}", e)
-            return ModInstallResult(
-                success = false,
-                message = "فشل فك الضغط: ${e.message}"
-            )
+            val line = JSONObject()
+                .put("timestamp", java.time.Instant.now().toString())
+                .put("targetPackage", plan.targetPackageId)
+                .put("modType", plan.packageType.name)
+                .put("result", if (success) "success" else "failure")
+                .put("details", result.take(500))
+                .put("appVersion", AppInfo.version)
+                .toString()
+            file.appendText("$line\n")
         }
-    }
-    
-    suspend fun installModToQuest(
-    serial: String,
-    extractedModDir: File,
-    targetPath: String,
-    onProgress: (String) -> Unit = {},
-    onBytesProgress: (copiedBytes: Long, totalBytes: Long) -> Unit = { _, _ -> }
-): ModInstallResult {
-    try {
-        if (!AndroidPathValidator.isSafe(targetPath)) {
-            return ModInstallResult(false, "مسار المودات غير صالح أو غير آمن.")
-        }
-        onProgress("التحقق من وجود مسار المودات...")
-        if (!testPathExists(serial, targetPath)) {
-            onProgress("إنشاء مجلد المودات...")
-            val createResult = createModPath(serial, targetPath)
-            if (createResult.exit != 0) {
-                return ModInstallResult(
-                    success = false,
-                    message = "فشل إنشاء مجلد المودات: ${createResult.err}"
-                )
-            }
-        }
-
-        if (!extractedModDir.exists()) {
-            return ModInstallResult(
-                success = false,
-                message = "مجلد/ملف المود غير موجود"
-            )
-        }
-
-        onProgress("بدء نسخ ملفات المود...")
-        val pushResult = adbClient.pushWithProgress(
-            serial = serial,
-            from = extractedModDir,
-            toDevicePath = targetPath
-        ) { copied, total ->
-            onBytesProgress(copied, total)
-        }
-
-        if (pushResult.exit != 0) {
-            return ModInstallResult(
-                success = false,
-                message = "فشل نسخ ملفات المود: ${pushResult.err.ifBlank { pushResult.out }}"
-            )
-        }
-
-        return ModInstallResult(
-            success = true,
-            message = "تم تثبيت المود بنجاح!"
-        )
-    } catch (e: Exception) {
-        return ModInstallResult(
-            success = false,
-            message = "خطأ غير متوقع: ${e.message}"
-        )
     }
 }
     
     fun getModZipInfo(zipFile: File): Pair<Boolean, String> {
-        try {
-            val entries = mutableListOf<String>()
-            var hasValidStructure = false
-            var entryCount = 0
-            
-            ZipInputStream(zipFile.inputStream().buffered()).use { zipIn ->
-                var entry = zipIn.nextEntry
-                while (entry != null) {
-                    entryCount++
-                    if (entryCount > MAX_ZIP_ENTRIES || entry.name.length > 1_000) {
-                        return Pair(false, "ملف ZIP أكبر من حدود الفحص الآمن.")
-                    }
-                    if (!entry.name.startsWith("__MACOSX/")) {
-                        entries.add(entry.name)
-                        
-                        if (entry.name.endsWith(".so") || 
-                            entry.name.endsWith(".dll") || 
-                            entry.name.endsWith(".json") ||
-                            entry.name.contains("mod.json")) {
-                            hasValidStructure = true
-                        }
-                    }
-                    zipIn.closeEntry()
-                    entry = zipIn.nextEntry
-                }
+        val analysis = ModPackageAnalyzer().analyze(zipFile)
+        val info = buildString {
+            appendLine("${analysis.packageType}: ${analysis.message}")
+            analysis.entries.take(10).forEach { appendLine("  - $it") }
+            if (analysis.entries.size > 10) {
+                appendLine("  ... و ${analysis.entries.size - 10} ملفات أخرى")
             }
-            
-            val info = buildString {
-                appendLine("الملفات الموجودة:")
-                entries.take(10).forEach { appendLine("  - $it") }
-                if (entries.size > 10) {
-                    appendLine("  ... و ${entries.size - 10} ملفات أخرى")
-                }
-            }
-            
-            return Pair(hasValidStructure || entries.isNotEmpty(), info)
-            
-        } catch (e: Exception) {
-            return Pair(false, "فشل قراءة الملف: ${e.message}")
         }
+        return analysis.recognized to info
     }
 }

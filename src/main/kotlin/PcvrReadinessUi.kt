@@ -45,10 +45,12 @@ fun PcvrReadinessTab() {
                 SwingUtilities.invokeLater {
                     checks = newChecks
                     systemInfo = newSystemInfo
-                    message = if (PcvrChecker.isReady(newChecks)) {
-                        "الكمبيوتر جاهز مبدئيًا لتشغيل PCVR."
-                    } else {
-                        "اكتمل الفحص. راجع العناصر التي تحتاج إلى معالجة."
+                    message = when {
+                        PcvrChecker.isReady(newChecks) ->
+                            "الكمبيوتر يطابق الفحوصات المتاحة مبدئيًا لتشغيل PCVR."
+                        newChecks.any { it.status == PcvrCheckStatus.UNKNOWN } ->
+                            "اكتمل الفحص، لكن تعذر التحقق من بعض البيانات؛ لا يمكن تأكيد جاهزية PCVR."
+                        else -> "اكتمل الفحص. راجع العناصر التي تحتاج إلى معالجة."
                     }
                     running = false
                 }

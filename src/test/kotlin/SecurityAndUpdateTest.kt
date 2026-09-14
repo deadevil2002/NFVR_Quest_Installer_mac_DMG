@@ -34,8 +34,8 @@ class SecurityAndUpdateTest {
             it.write("blocked".toByteArray())
             it.closeEntry()
         }
-        val result = ModsManager(AdbClient(BundledAdb(HostOs.LINUX))).extractModZip(zip)
-        assertFalse(result.success)
+         val result = ModPackageAnalyzer().analyze(zip)
+         assertFalse(result.recognized)
         zip.delete()
     }
 
@@ -66,17 +66,16 @@ class SecurityAndUpdateTest {
     }
 
     @Test
-    fun safelyExtractsNormalZipAndExposesCleanupRoot() {
+    fun safelyInspectsNormalZipWithoutExtracting() {
         val zip = File.createTempFile("nfvr-test-", ".zip")
         ZipOutputStream(zip.outputStream()).use {
             it.putNextEntry(ZipEntry("Mods/example/mod.json"))
             it.write("{}".toByteArray())
             it.closeEntry()
         }
-        val result = ModsManager(AdbClient(BundledAdb(HostOs.LINUX))).extractModZip(zip)
-        assertTrue(result.success)
-        assertTrue(result.extractedRoot?.exists() == true)
-        result.extractedRoot?.deleteRecursively()
+        val result = ModPackageAnalyzer().analyze(zip)
+        assertFalse(result.installable)
+        assertTrue(result.message.isNotBlank())
         zip.delete()
     }
 }

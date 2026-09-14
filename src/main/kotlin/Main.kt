@@ -395,7 +395,7 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
     return CmdResult(p.exitValue(), out.toString(), err.toString())
 }
 
-class AdbClient(private val bundled: BundledAdb) {
+open class AdbClient(private val bundled: BundledAdb) {
     private fun adbBase(): Pair<File, File> {
         val adb = bundled.ensureReady()
         return adb to adb.parentFile
@@ -420,7 +420,7 @@ class AdbClient(private val bundled: BundledAdb) {
  * - ما فيه أي إرسال تلقائي: هذا فقط للحساب داخل البرنامج.
  * - يعتمد على push() الحالي (فيه timeout ديناميكي + retry).
  */
-fun pushWithProgress(
+open fun pushWithProgress(
     serial: String,
     from: File,
     toDevicePath: String,
@@ -469,7 +469,7 @@ fun pushWithProgress(
 
     return CmdResult(0, "OK", "")
 }
-    fun shell(serial: String, vararg args: String): CmdResult {
+    open fun shell(serial: String, vararg args: String): CmdResult {
         val (adb, dir) = adbBase()
         return runProcess(listOf(adb.absolutePath, "-s", serial, "shell", *args), workDir = dir)
     }
@@ -642,17 +642,16 @@ fun main() = application {
     var resumeIndex by remember { mutableStateOf(0) }
     var pausedBecauseDisconnected by remember { mutableStateOf(false) }
 
-    var selectedGame by remember { mutableStateOf("") }
-    var selectedGameInfo by remember { mutableStateOf<GameInfo?>(null) }
+    var installedApps by remember { mutableStateOf<List<InstalledQuestApp>>(emptyList()) }
+    var selectedApp by remember { mutableStateOf<InstalledQuestApp?>(null) }
+    var appSearch by remember { mutableStateOf("") }
+    var scanningApps by remember { mutableStateOf(false) }
     var modZipFile by remember { mutableStateOf<File?>(null) }
+    var modAnalysis by remember { mutableStateOf<ModPackageAnalysis?>(null) }
+    var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
-    var modProgress by remember { mutableStateOf(0f) }
-    var modProgressLabel by remember { mutableStateOf("—") }
-    var lastModPctLogged by remember { mutableStateOf(-1) }
+    var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
     var modLogText by remember { mutableStateOf("") }
-    var installedGames by remember { mutableStateOf<List<String>>(emptyList()) }
-    var manualPath by remember { mutableStateOf("") }
-    var isManualMode by remember { mutableStateOf(false) }
 
     // ===== LICENSE UI STATE =====
     var licenseKeyInput by remember { mutableStateOf("") }
@@ -661,7 +660,6 @@ fun main() = application {
     // ============================
 
     val logScroll = rememberScrollState()
-    val modLogScroll = rememberScrollState()
 
     var logoBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
 
@@ -723,6 +721,46 @@ fun main() = application {
         val dfRes = adb.shell(serial, "df", "-k", "/data")
         val pair = parseDfToGb(dfRes.out) ?: return 0.0
         return pair.second
+    }
+
+    suspend fun refreshInstalledApps() {
+        scanningApps = true
+        try {
+            val serial = getAuthorizedSerialOrNull()
+            if (serial == null) {
+                installedApps = emptyList()
+                selectedApp = null
+                return
+            }
+            installedApps = modsManager.scanInstalledQuestApps(serial)
+            selectedApp = selectedApp?.let { selected ->
+                installedApps.firstOrNull { it.packageName == selected.packageName }
+            }
+            appendModLog("تم فحص ${installedApps.size} تطبيقًا مثبتًا من مصادر المستخدم.")
+        } catch (e: Exception) {
+            appendModLog("تعذر فحص التطبيقات المثبتة: ${e.message ?: "خطأ غير معروف"}")
+            DiagnosticLogger.error("فشل فحص تطبيقات Quest المثبتة", e)
+        } finally {
+            scanningApps = false
+        }
+    }
+
+    suspend fun analyzeSelectedMod() {
+        val file = modZipFile ?: return
+        analyzingMod = true
+        modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.ANALYZING, null, "تحليل بنية الحزمة وبياناتها")
+        try {
+            val analysis = modsManager.analyzeModPackage(file, selectedApp)
+            modAnalysis = analysis
+            appendModLog("تحليل الحزمة: ${analysis.packageType} — ${analysis.message}")
+        } catch (e: Exception) {
+            modAnalysis = null
+            appendModLog("فشل تحليل الحزمة: ${e.message ?: "خطأ غير معروف"}")
+            DiagnosticLogger.error("فشل تحليل حزمة مود ${file.name}", e)
+        } finally {
+            analyzingMod = false
+            modExecutionProgress = null
+        }
     }
 
     fun requireDeviceOrWarn(write: (String) -> Unit): Boolean {
@@ -959,111 +997,54 @@ setProgressWithinGame(0f)
     }
 
     suspend fun installSelectedMod() {
-        if (modZipFile == null) {
-            appendModLog("لم يتم اختيار ملف مود")
+        val file = modZipFile
+        val analysis = modAnalysis
+        if (file == null || analysis == null) {
+            appendModLog("اختر الحزمة وحللها قبل التثبيت.")
             return
         }
-
+        if (!analysis.installPlan.installable || analysis.installPlan.hasBlockingPreconditions) {
+            appendModLog("تم إيقاف التثبيت: الخطة غير متوافقة أو غير آمنة.")
+            return
+        }
         isInstallingMod = true
-        modProgress = 0f
-        lastModPctLogged = -1
-        modProgressLabel = "بدء تثبيت المود..."
         appendModLog("==============================================")
-        appendModLog("بدء تثبيت المود: ${modZipFile?.name}")
+        appendModLog("بدء تنفيذ الخطة المعتمدة: ${file.name}")
         appendModLog("==============================================")
-
-        var extractedRoot: File? = null
         try {
             adb.startServer()
-
             val serial = getAuthorizedSerialOrNull()
             if (serial == null) {
                 appendModLog("لا يوجد جهاز متصل أو مصرح به")
                 return
             }
-
-            modProgressLabel = "فك ضغط ملف المود..."
-            modProgress = 0.1f
-            appendModLog("فك ضغط ملف المود...")
-
-            val extractResult = modsManager.extractModZip(modZipFile!!)
-            if (!extractResult.success) {
-                appendModLog("فشل فك الضغط: ${extractResult.message}")
-                return
-            }
-
-            appendModLog("تم فك الضغط بنجاح")
-            appendModLog("الملفات المستخرجة: ${extractResult.extractedFiles.size}")
-
-            val extractedDir = extractResult.extractedRoot
-            extractedRoot = extractedDir
-            if (extractedDir == null) {
-                appendModLog("لم يتم العثور على مجلد الملفات المستخرجة")
-                return
-            }
-            if (!extractedDir.exists()) {
-                appendModLog("لم يتم العثور على مجلد الملفات المستخرجة")
-                return
-            }
-
-            val targetPath = if (isManualMode && manualPath.isNotBlank()) {
-                manualPath.trim()
-            } else {
-                selectedGameInfo?.modPath ?: ""
-            }
-
-            if (targetPath.isBlank()) {
-                appendModLog("لم يتم تحديد مسار التثبيت")
-                return
-            }
-            if (!AndroidPathValidator.isSafe(targetPath)) {
-                appendModLog("مسار المودات غير صالح أو غير آمن")
-                return
-            }
-
-            modProgressLabel = "تثبيت المود في النظارة..."
-            modProgress = 0.3f
-
-            val installResult = modsManager.installModToQuest(
+            val installResult = modsManager.executeInstallPlan(
                 serial = serial,
-                extractedModDir = extractedDir,
-                targetPath = targetPath
-            ) { sentBytes, totalBytes ->
-                val safeTotal = if (totalBytes <= 0L) 1L else totalBytes
-                val ratio = (sentBytes.toDouble() / safeTotal.toDouble()).coerceIn(0.0, 1.0)
-                modProgress = (0.3f + (ratio.toFloat() * 0.7f)).coerceIn(0f, 1f)
-                val pct = (ratio * 100.0).toInt()
-                if (pct != lastModPctLogged) {
-                    lastModPctLogged = pct
-                    modProgressLabel = "نسخ الملفات... $pct%"
-                    appendModLog(modProgressLabel)
+                zipFile = file,
+                plan = analysis.installPlan
+            ) { update ->
+                SwingUtilities.invokeLater {
+                    modExecutionProgress = update
                 }
             }
-
             if (installResult.success) {
-                modProgress = 1f
-                modProgressLabel = "اكتمل التثبيت"
                 appendModLog(installResult.message)
-                appendModLog("المسار المستهدف: $targetPath")
                 appendModLog("==============================================")
-                appendModLog("تم تثبيت المود بنجاح")
+                appendModLog("تم تثبيت المود والتحقق من الملفات بنجاح")
                 appendModLog("==============================================")
             } else {
                 appendModLog("فشل التثبيت: ${installResult.message}")
-                modProgressLabel = "فشل التثبيت"
+                    modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.FAILED, null, installResult.message)
             }
-
         } catch (e: Exception) {
             appendModLog("خطأ غير متوقع: ${e.message}")
-            modProgressLabel = "خطأ"
+            modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.FAILED, null, "تعذر إكمال التثبيت")
         } finally {
-            runCatching { extractedRoot?.deleteRecursively() }
             isInstallingMod = false
         }
     }
 
     LaunchedEffect(logText) { logScroll.animateScrollTo(logScroll.maxValue) }
-    LaunchedEffect(modLogText) { modLogScroll.animateScrollTo(modLogScroll.maxValue) }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -1073,7 +1054,7 @@ setProgressWithinGame(0f)
                 try {
                     val serial = getAuthorizedSerialOrNull()
                     if (serial != null) {
-                        installedGames = modsManager.getInstalledGamePackages(serial)
+                        refreshInstalledApps()
                     }
                 } catch (_: Exception) {
                 }
@@ -1090,7 +1071,7 @@ setProgressWithinGame(0f)
     ) {
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-            MaterialTheme {
+            NfvrTheme {
                 val pageScroll = rememberScrollState()
                 val fingerprint = remember { LicenseManager.fingerprint() }
                 val licenseState = remember { mutableStateOf(LocalLicenseStore.load(fingerprint)) }
@@ -1619,196 +1600,44 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             }
 
                             1 -> {
-                                Card(modifier = Modifier.fillMaxWidth()) {
-                                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Text("نظام المودات", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            OutlinedButton(
-                                                onClick = {
-                                                    if (!requireDeviceOrWarn(::appendModLog)) return@OutlinedButton
-                                                    isManualMode = !isManualMode
-                                                },
-                                                enabled = hasAuthorizedDevice && !isInstallingMod
-                                            ) {
-                                                Text(if (isManualMode) "اختيار من القائمة" else "مسار يدوي")
-                                            }
-
-                                            if (!isManualMode) {
-                                                var expanded by remember { mutableStateOf(false) }
-                                                Box {
-                                                    OutlinedButton(
-                                                        onClick = {
-                                                            if (!requireDeviceOrWarn(::appendModLog)) return@OutlinedButton
-                                                            expanded = true
-                                                        },
-                                                        enabled = hasAuthorizedDevice && !isInstallingMod,
-                                                        modifier = Modifier.fillMaxWidth()
-                                                    ) {
-                                                        Text(if (selectedGameInfo != null) selectedGameInfo!!.name else "اختر لعبة")
-                                                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
-                                                    }
-
-                                                    DropdownMenu(
-                                                        expanded = expanded,
-                                                        onDismissRequest = { expanded = false }
-                                                    ) {
-                                                        modsManager.getSupportedGames().forEach { game ->
-                                                            val isInstalled = installedGames.contains(game.packageName)
-                                                            DropdownMenuItem(
-                                                                text = {
-                                                                    Column {
-                                                                        Text(game.name)
-                                                                        Text(
-                                                                            if (isInstalled) "مثبت" else "غير مثبت",
-                                                                            style = MaterialTheme.typography.bodySmall,
-                                                                            color = if (isInstalled) Color(0xFF1B5E20) else Color(0xFFB71C1C)
-                                                                        )
-                                                                    }
-                                                                },
-                                                                onClick = {
-                                                                    selectedGame = game.name
-                                                                    selectedGameInfo = game
-                                                                    expanded = false
-                                                                    appendModLog("تم اختيار اللعبة: ${game.name}")
-                                                                },
-                                                                enabled = isInstalled
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                OutlinedTextField(
-                                                    value = manualPath,
-                                                    onValueChange = { manualPath = it },
-                                                    label = { Text("مسار المودات يدوي") },
-                                                    placeholder = { Text("/sdcard/ModData/...") },
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                            }
+                                ModsWorkflowUi(
+                                    connected = hasAuthorizedDevice,
+                                    installedApps = installedApps,
+                                    scanning = scanningApps,
+                                    searchFilter = appSearch,
+                                    onSearchFilterChange = { appSearch = it },
+                                    selectedApp = selectedApp,
+                                    onRefresh = {
+                                        CoroutineScope(Dispatchers.IO).launch { refreshInstalledApps() }
+                                    },
+                                    onSelectApp = { app ->
+                                        selectedApp = app
+                                        modAnalysis = null
+                                        modExecutionProgress = null
+                                    },
+                                    selectedZipFilename = modZipFile?.name,
+                                    onChooseFile = {
+                                        val file = chooseModFile()
+                                        if (file != null) {
+                                            modZipFile = file
+                                            modAnalysis = null
+                                            modExecutionProgress = null
+                                            appendModLog("تم اختيار ملف المود: ${file.name}")
                                         }
-
-                                        if (!isManualMode && selectedGameInfo != null) {
-                                            Box(
-                                                modifier = Modifier.fillMaxWidth()
-                                                    .background(Color(0xFFE3F2FD))
-                                                    .padding(8.dp)
-                                            ) {
-                                                Column {
-                                                    Text("المسار: ${selectedGameInfo!!.modPath}", style = MaterialTheme.typography.bodySmall)
-                                                    Text("ملاحظات: ${selectedGameInfo!!.notes}", style = MaterialTheme.typography.bodySmall)
-                                                }
-                                            }
-                                        }
-
-                                        // Beat Saber على Quest له خطوة تفعيل مودنق خاصة (Patch) قبل رفع المودات/الأغاني.
-                                        if (!isManualMode && selectedGameInfo?.packageName == "com.beatgames.beatsaber") {
-                                            Spacer(Modifier.height(8.dp))
-                                            Box(
-                                                modifier = Modifier.fillMaxWidth()
-                                                    .background(Color(0xFFFFF3E0))
-                                                    .padding(10.dp)
-                                            ) {
-                                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                    Text("بيت سيبر (Quest) — طريقة خاصة", fontWeight = FontWeight.Bold)
-                                                    Text(
-                                                        "قبل ما ترفع مودات/أغاني، لازم تسوي Patch للعبة مرة وحدة باستخدام طريقة BSMG (ModsBeforeFriday). بعد ما يخلص، تقدر تستخدم هالصفحة لرفع ملفات المودات/الأغاني لمسار اللعبة.",
-                                                        style = MaterialTheme.typography.bodySmall
-                                                    )
-                                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                        Text("الخطوات المختصرة:", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
-                                                        Text("1) شغّل بيت سيبر مرة وحدة ثم اقفلها.", style = MaterialTheme.typography.bodySmall)
-                                                        Text("2) افتح أداة ModsBeforeFriday من المتصفح وثبّت المودنق (لا تفصل السلك لين يخلص).", style = MaterialTheme.typography.bodySmall)
-                                                        Text("3) بعدها ارجع هنا وارفع المود ZIP أو أغانيك لمسار اللعبة.", style = MaterialTheme.typography.bodySmall)
-                                                    }
-                                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                        OutlinedButton(onClick = { openUrl("https://mbf.bsquest.xyz/") }) {
-                                                            Text("فتح ModsBeforeFriday")
-                                                        }
-                                                        OutlinedButton(onClick = { openUrl("https://bsmg.wiki/quest-modding.html") }) {
-                                                            Text("فتح دليل BSMG")
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            OutlinedButton(
-                                                onClick = {
-                                                    if (!requireDeviceOrWarn(::appendModLog)) return@OutlinedButton
-                                                    val file = chooseModFile()
-                                                    if (file != null) {
-                                                        modZipFile = file
-                                                        appendModLog("تم اختيار ملف المود: ${file.name}")
-                                                    }
-                                                },
-                                                enabled = hasAuthorizedDevice && !isInstallingMod
-                                            ) { Text("اختيار مود (ZIP)") }
-
-                                            Button(
-                                                onClick = {
-                                                    if (!requireDeviceOrWarn(::appendModLog)) return@Button
-                                                    CoroutineScope(Dispatchers.IO).launch { installSelectedMod() }
-                                                },
-                                                enabled = hasAuthorizedDevice &&
-                                                        !isInstallingMod &&
-                                                        modZipFile != null &&
-                                                        ((isManualMode && manualPath.isNotBlank()) || selectedGameInfo != null)
-                                            ) { Text("تثبيت المود") }
-                                        }
-
-                                        if (modZipFile != null) {
-                                            val (isValid, info) = modsManager.getModZipInfo(modZipFile!!)
-                                            Box(
-                                                modifier = Modifier.fillMaxWidth()
-                                                    .background(if (isValid) Color(0xFFE8F5E8) else Color(0xFFFFF0F0))
-                                                    .padding(8.dp)
-                                            ) {
-                                                Column {
-                                                    Text("ملف المود: ${modZipFile?.name}", style = MaterialTheme.typography.bodySmall)
-                                                    Text(if (isValid) "ملف صالح" else "ملف قد لا يحتوي على مود", style = MaterialTheme.typography.bodySmall)
-                                                    if (info.isNotBlank()) Text(info, style = MaterialTheme.typography.bodySmall)
-                                                }
-                                            }
-                                        }
-
-                                        if (isInstallingMod) {
-                                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                LinearProgressIndicator(
-                                                    progress = { modProgress },
-                                                    modifier = Modifier.fillMaxWidth().height(8.dp)
-                                                )
-                                                Text(modProgressLabel, style = MaterialTheme.typography.bodySmall)
-                                            }
-                                        }
-
-                                        Column {
-                                            Text("سجل تثبيت المودات", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                            Spacer(Modifier.height(4.dp))
-                                            Box(
-                                                modifier = Modifier.fillMaxWidth().height(200.dp)
-                                                    .background(Color(0xFFF8F9FA))
-                                                    .padding(8.dp)
-                                            ) {
-                                                Text(
-                                                    if (modLogText.isBlank()) "—" else modLogText,
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    textAlign = TextAlign.Start,
-                                                    modifier = Modifier.verticalScroll(modLogScroll)
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
+                                    },
+                                    analyzing = analyzingMod,
+                                    analysis = modAnalysis,
+                                    onAnalyze = {
+                                        CoroutineScope(Dispatchers.IO).launch { analyzeSelectedMod() }
+                                    },
+                                    installing = isInstallingMod,
+                                    executionProgress = modExecutionProgress,
+                                    onInstall = {
+                                        CoroutineScope(Dispatchers.IO).launch { installSelectedMod() }
+                                    },
+                                    logText = modLogText,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
                             }
                             2 -> {
                                 PcvrReadinessTab()
