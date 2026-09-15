@@ -39,6 +39,54 @@ class NfvrStabilizationTest {
             InstallProgressState(true, "OBB", 1, 2)
         ))
         assertNull(InstallProgressState(false, "restart", 1, 2).percent)
+        assertEquals("جاهز", formatInstallProgress(InstallProgressState(false, null, 0, null)))
+        val active = formatInstallProgress(
+            InstallProgressState(
+                measurable = true,
+                currentItem = "OBB",
+                completed = 1,
+                total = 2,
+                gameName = "Demo Game",
+                phase = GameInstallPhase.TRANSFERRING_OBB,
+                percentOverride = 37
+            )
+        )
+        assertTrue(active.contains("Demo Game"))
+        assertTrue(active.contains("1 / 2"))
+        assertTrue(active.contains("TRANSFERRING_OBB"))
+        assertTrue(active.endsWith("37%"))
+    }
+
+    @Test
+    fun chooserGateSerializesAndCanBeReleasedAfterCancellation() {
+        val gate = DesktopChooserGate()
+        assertTrue(gate.tryAcquire())
+        assertTrue(gate.isOpen())
+        assertTrue(!gate.tryAcquire())
+        gate.release()
+        assertTrue(!gate.isOpen())
+        assertTrue(gate.tryAcquire())
+        gate.release()
+    }
+
+    @Test
+    fun queuedScanCallbackCannotClearNewerSelection() {
+        val selected = InstalledQuestApp(
+            packageName = "com.example.newselection",
+            versionName = "1.0",
+            versionCode = 1,
+            displayName = "New Selection",
+            apkPath = "/data/app/new.apk",
+            thirdParty = true
+        )
+        assertEquals(
+            selected,
+            resolveScanSelection(
+                capturedPackageName = null,
+                currentPackageName = selected.packageName,
+                apps = listOf(selected)
+            )
+        )
     }
 
     @Test

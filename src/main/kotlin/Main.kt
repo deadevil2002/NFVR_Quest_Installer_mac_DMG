@@ -32,14 +32,13 @@ import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.awt.Desktop
+import java.awt.FileDialog
+import java.awt.Frame
 import java.net.URI
 import javax.swing.SwingUtilities
 import java.nio.file.Files
 import java.text.DecimalFormat
-import javax.swing.JFileChooser
 import javax.swing.JOptionPane
-import javax.swing.UIManager
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 import java.net.HttpURLConnection
@@ -571,56 +570,137 @@ private fun scanGameFolder(folder: File): GameEntry? {
     )
 }
 
-private val chooserInUse = AtomicBoolean(false)
-
 /**
- * JFileChooser is a Swing focus owner.  Creating and showing it from a
- * coroutine (or with a null owner) races Compose's native window on Windows.
- * Keep the complete chooser lifecycle on the EDT, serialize it, and use the
- * currently visible application window as its owner.
+ * Opens the native AWT desktop chooser synchronously from a user action.
+ *
+ * FileDialog has no reliable Windows "select directory" mode.  For a game
+ * directory request we therefore use a controlled native strategy: the user
+ * selects any regular file inside the game folder (normally its APK), and we
+ * return that file's parent.  This avoids Swing ownership/focus races and
+ * cannot accidentally return a path which is not a directory.  The game
+ * preflight still validates the resulting folder and APK.
  */
 private fun showOwnedChooser(
+    owner: Frame,
     title: String,
-    mode: Int,
+    mode: DesktopChooserMode,
     initialDirectory: File? = null,
-    zipOnly: Boolean = false
-): File? {
-    if (!chooserInUse.compareAndSet(false, true)) return null
-    var selected: File? = null
-    val show = {
-        try {
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-            val chooser = JFileChooser().apply {
-                fileSelectionMode = mode
-                isAcceptAllFileFilterUsed = false
-                dialogTitle = title
-                initialDirectory?.takeIf { it.isDirectory }?.let { currentDirectory = it }
-                if (zipOnly) {
-                    fileFilter = javax.swing.filechooser.FileNameExtensionFilter("ZIP Files", "zip")
+    zipOnly: Boolean = false,
+    gate: DesktopChooserGate = desktopChooserGate
+): DesktopChooserResult {
+    if (!gate.tryAcquire()) {
+        DiagnosticLogger.info("chooser busy: title=$title mode=$mode")
+        return DesktopChooserResult.Busy
+    }
+
+    fun restoreOwnerFocusAfterNativeTeardown() {
+        java.awt.EventQueue.invokeLater {
+            runCatching {
+                if (owner.isDisplayable) {
+                    // One deferred request only. Forcing toFront/focus while
+                    // Windows is still tearing down the modal peer can race
+                    // Compose's focus tree and trigger ActiveParent failures.
+                    owner.requestFocus()
                 }
+            }.onFailure {
+                DiagnosticLogger.error("chooser focus restore failed", it)
             }
-            val visibleWindows = java.awt.Window.getWindows()
-                .filter { it.isShowing && it.isFocusableWindow }
-            val owner = visibleWindows.firstOrNull { it.isActive } ?: visibleWindows.firstOrNull()
-            if (chooser.showOpenDialog(owner) == JFileChooser.APPROVE_OPTION) {
-                selected = chooser.selectedFile
-            }
-        } finally {
-            chooserInUse.set(false)
         }
     }
+
+    fun openOnEdt(): DesktopChooserResult {
+        check(java.awt.EventQueue.isDispatchThread()) { "chooser lifecycle must run on EDT" }
+        var dialog: FileDialog? = null
+        return try {
+            DiagnosticLogger.info(
+                "chooser open: title=$title mode=$mode initial=${initialDirectory?.absolutePath ?: "<default>"}"
+            )
+            dialog = FileDialog(owner, title, FileDialog.LOAD).apply {
+                isMultipleMode = false
+                initialDirectory?.takeIf { it.isDirectory }?.let {
+                    directory = it.absolutePath
+                }
+                filenameFilter = java.io.FilenameFilter { directory, name ->
+                    val candidate = File(directory, name)
+                    candidate.isFile && (!zipOnly || name.lowercase().endsWith(".zip"))
+                }
+            }
+            dialog.isVisible = true
+            val selectedName = dialog.file
+            val selectedDirectory = dialog.directory
+            if (selectedName.isNullOrBlank() || selectedDirectory.isNullOrBlank()) {
+                DiagnosticLogger.info("chooser cancel: title=$title mode=$mode")
+                return DesktopChooserResult.Cancelled
+            }
+
+            val selected = File(selectedDirectory, selectedName).absoluteFile
+            val result = when {
+                !selected.isFile || !selected.canRead() ->
+                    DesktopChooserResult.Failed(
+                        "تعذر قراءة العنصر المحدد. اختر ملفًا صالحًا ثم أعد المحاولة.",
+                        "not-readable:${selected.absolutePath}"
+                    )
+                zipOnly && !selected.name.lowercase().endsWith(".zip") ->
+                    DesktopChooserResult.Failed(
+                        "اختر ملف ZIP صالحًا.",
+                        "not-zip:${selected.name}"
+                    )
+                mode == DesktopChooserMode.DIRECTORY ->
+                    DesktopChooserResult.Selected(selected.parentFile.absoluteFile)
+                else -> DesktopChooserResult.Selected(selected)
+            }
+            when (result) {
+                is DesktopChooserResult.Selected ->
+                    DiagnosticLogger.info("chooser result: ${result.file.absolutePath}")
+                is DesktopChooserResult.Failed ->
+                    DiagnosticLogger.error("chooser result error: ${result.technicalMessage}")
+                else -> Unit
+            }
+            result
+        } catch (error: Throwable) {
+            DiagnosticLogger.error("chooser error: title=$title mode=$mode", error)
+            DesktopChooserResult.Failed(
+                "تعذر فتح نافذة اختيار الملفات. حاول مرة أخرى.",
+                "${error::class.java.name}: ${error.message.orEmpty()}"
+            )
+        } finally {
+            runCatching { dialog?.dispose() }
+                .onFailure { DiagnosticLogger.error("chooser dispose failed", it) }
+            restoreOwnerFocusAfterNativeTeardown()
+        }
+    }
+
     return try {
-        if (SwingUtilities.isEventDispatchThread()) show()
-        else SwingUtilities.invokeAndWait(show)
-        selected
-    } catch (_: Throwable) {
-        chooserInUse.set(false)
-        null
+        if (SwingUtilities.isEventDispatchThread()) {
+            openOnEdt()
+        } else {
+            var result: DesktopChooserResult? = null
+            SwingUtilities.invokeAndWait { result = openOnEdt() }
+            result ?: DesktopChooserResult.Failed(
+                "تعذر إكمال نافذة الاختيار. حاول مرة أخرى.",
+                "EDT returned no chooser result"
+            )
+        }
+    } catch (error: Throwable) {
+        DiagnosticLogger.error("chooser dispatch error: title=$title mode=$mode", error)
+        DesktopChooserResult.Failed(
+            "تعذر فتح نافذة الاختيار. حاول مرة أخرى.",
+            "${error::class.java.name}: ${error.message.orEmpty()}"
+        )
+    } finally {
+        gate.release()
     }
 }
 
-private fun chooseFolder(initialDirectory: File? = null): File? =
-    showOwnedChooser("اختر مجلد اللعبة", JFileChooser.DIRECTORIES_ONLY, initialDirectory)
+private val desktopChooserGate = DesktopChooserGate()
+
+private fun chooseFolder(owner: Frame, initialDirectory: File? = null): DesktopChooserResult =
+    showOwnedChooser(
+        owner = owner,
+        title = "اختر مجلد اللعبة (اختر أي ملف داخله)",
+        mode = DesktopChooserMode.DIRECTORY,
+        initialDirectory = initialDirectory
+    )
 
 private fun copyToClipboard(text: String) {
     runCatching {
@@ -820,10 +900,11 @@ fun main() {
         queue = scanned
     }
 
-    fun chooseModFile(initialDirectory: File? = null): File? {
+    fun chooseModFile(owner: Frame, initialDirectory: File? = null): DesktopChooserResult {
         return showOwnedChooser(
+            owner = owner,
             title = "اختر ملف المود (ZIP)",
-            mode = JFileChooser.FILES_ONLY,
+            mode = DesktopChooserMode.FILES,
             initialDirectory = initialDirectory,
             zipOnly = true
         )
@@ -869,7 +950,11 @@ fun main() {
                                 previousSnapshot,
                                 (update.apps + previousSnapshot).distinctBy { it.packageName }
                             )
-                            selectedApp = stableSelectedPackage(selectedPackageName, installedApps)
+                            selectedApp = resolveScanSelection(
+                                capturedPackageName = selectedPackageName,
+                                currentPackageName = selectedApp?.packageName,
+                                apps = installedApps
+                            )
                         }
                     }
                 }
@@ -884,7 +969,11 @@ fun main() {
                 val currentPackages = scanned.mapTo(mutableSetOf()) { it.packageName }
                 val retainedPrevious = previousSnapshot.filter { it.packageName in currentPackages }
                 installedApps = mergeInstalledAppSnapshot(retainedPrevious, scanned)
-                selectedApp = stableSelectedPackage(selectedPackageName, installedApps)
+                selectedApp = resolveScanSelection(
+                    capturedPackageName = selectedPackageName,
+                    currentPackageName = selectedApp?.packageName,
+                    apps = installedApps
+                )
                 appScanProgress = InstalledAppsScanProgress(
                     apps = installedApps,
                     processed = scanned.size,
@@ -912,10 +1001,11 @@ fun main() {
         }
     }
 
-    fun cancelInstalledAppsScan() {
+    fun cancelInstalledAppsScan(invalidatePendingCallbacks: Boolean = false) {
         // Keep the visible scanning state until the interruptible ADB process
         // has actually terminated and the scan coroutine reaches its catch/
         // finally block. This prevents reporting cancellation prematurely.
+        if (invalidatePendingCallbacks) appScanGeneration += 1L
         appScanJob?.cancel()
     }
 
@@ -925,6 +1015,11 @@ fun main() {
         appScanJob = job
         job.invokeOnCompletion {
             uiScope.launch(Dispatchers.Main.immediate) {
+                if (it is CancellationException) {
+                    appScanProgress = (appScanProgress
+                        ?: InstalledAppsScanProgress(installedApps, 0, null))
+                        .copy(apps = installedApps, cancelled = true)
+                }
                 if (appScanJob === job) appScanJob = null
             }
         }
@@ -1077,7 +1172,13 @@ fun main() {
         warningText = null
         progress = 0f
         progressLabel = "بدء التثبيت..."
-        progressInfo = InstallProgressState(false, "بدء التثبيت", 0, queue.size)
+        progressInfo = InstallProgressState(
+            measurable = false,
+            currentItem = "الفحص المسبق",
+            completed = 0,
+            total = queue.size,
+            phase = GameInstallPhase.PREFLIGHT
+        )
         appendLog("==============================================")
         appendLog("بدء التثبيت — عدد الألعاب: ${queue.size}")
         appendLog("==============================================")
@@ -1112,16 +1213,33 @@ fun main() {
                     resumeIndex = i
                     return
                 }
+                installPhase = transitionInstallPhase(
+                    installPhase,
+                    InstallPhaseTransition.BEGIN_PREFLIGHT
+                )
                 val base = (i.toFloat() / queue.size.toFloat()).coerceIn(0f, 1f)
-val step = (1f / queue.size.toFloat()).coerceIn(0f, 1f)
-fun setProgressWithinGame(p: Float) {
-    val v = (base + step * p.coerceIn(0f, 1f)).coerceIn(0f, 1f)
-    uiScope.launch {
-        progress = v
-        progressInfo = InstallProgressState(false, entry.apk.name, i, queue.size)
-    }
-}
-setProgressWithinGame(0f)
+                val step = (1f / queue.size.toFloat()).coerceIn(0f, 1f)
+                fun setProgressWithinGame(
+                    p: Float,
+                    item: String = entry.apk.name,
+                    measurable: Boolean = true
+                ) {
+                    val v = (base + step * p.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+                    val phaseSnapshot = installPhase
+                    uiScope.launch {
+                        progress = v
+                        progressInfo = InstallProgressState(
+                            measurable = measurable,
+                            currentItem = item,
+                            completed = i + 1,
+                            total = queue.size,
+                            gameName = entry.folder.name,
+                            phase = phaseSnapshot,
+                            percentOverride = if (measurable) (v * 100f).roundToInt() else null
+                        )
+                    }
+                }
+                setProgressWithinGame(0f, measurable = false)
 
                 installPhase = transitionInstallPhase(
                     installPhase,
@@ -1150,6 +1268,14 @@ setProgressWithinGame(0f)
                 )
                 progressLabel = "تثبيت APK: ${entry.apk.name}"
                 statusText = "الحالة: جاري تثبيت ${i + 1} / ${queue.size}"
+                progressInfo = InstallProgressState(
+                    measurable = false,
+                    currentItem = entry.apk.name,
+                    completed = i + 1,
+                    total = queue.size,
+                    gameName = entry.folder.name,
+                    phase = GameInstallPhase.INSTALLING_APK
+                )
 
                 appendLog("----------------------------------------------")
                 appendLog("لعبة: ${entry.folder.name}")
@@ -1193,15 +1319,10 @@ setProgressWithinGame(0f)
                             // تحديث نسبة حقيقية حسب حجم ملفات OBB
                             val overall = (copiedObbBytes + copied).coerceAtMost(totalObbBytes)
                             val frac = overall.toFloat() / totalObbBytes.toFloat()
-                            uiScope.launch {
-                                progressInfo = InstallProgressState(
-                                    measurable = true,
-                                    currentItem = "OBB: ${dir.name}",
-                                    completed = overall.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                    total = totalObbBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                                )
-                            }
-                            setProgressWithinGame(0.25f + 0.70f * frac)
+                            setProgressWithinGame(
+                                p = 0.25f + 0.70f * frac,
+                                item = "OBB: ${dir.name}"
+                            )
                             }
                         }
 
@@ -1249,7 +1370,14 @@ setProgressWithinGame(0f)
                 i++
                 resumeIndex = i
                 progress = (i.toFloat() / queue.size.toFloat()).coerceAtMost(0.95f)
-                progressInfo = InstallProgressState(true, entry.folder.name, i, queue.size)
+                progressInfo = InstallProgressState(
+                    measurable = true,
+                    currentItem = entry.folder.name,
+                    completed = i,
+                    total = queue.size,
+                    phase = installPhase,
+                    percentOverride = (progress * 100f).roundToInt()
+                )
             }
 
             installPhase = transitionInstallPhase(
@@ -1257,6 +1385,14 @@ setProgressWithinGame(0f)
                 InstallPhaseTransition.BEGIN_VERIFICATION
             )
             progress = 0.98f
+            progressInfo = InstallProgressState(
+                measurable = true,
+                currentItem = "التحقق من الملفات",
+                completed = queue.size,
+                total = queue.size,
+                phase = GameInstallPhase.VERIFYING,
+                percentOverride = 98
+            )
             progressLabel = "التحقق من التثبيت والملفات..."
             val verifySerial = getAuthorizedSerialOrNull()
             if (verifySerial == null) {
@@ -1323,7 +1459,14 @@ setProgressWithinGame(0f)
             )
             progress = 1f
             progressLabel = "اكتمل التثبيت"
-            progressInfo = InstallProgressState(true, "اكتمل التثبيت", queue.size, queue.size)
+            progressInfo = InstallProgressState(
+                measurable = true,
+                currentItem = "اكتمل التثبيت",
+                completed = queue.size,
+                total = queue.size,
+                phase = GameInstallPhase.COMPLETED,
+                percentOverride = 100
+            )
             statusText = "الحالة: تم بنجاح"
             appendLog("==============================================")
             appendLog("اكتمل التثبيت بنجاح")
@@ -1359,7 +1502,13 @@ setProgressWithinGame(0f)
                 installPhase = GameInstallPhase.RESTARTING
                 statusText = "الحالة: جاري إعادة تشغيل النظارة..."
                 progressLabel = "انتظار عودة اتصال ADB..."
-                progressInfo = InstallProgressState(false, "إعادة تشغيل النظارة", 0, null)
+                progressInfo = InstallProgressState(
+                    measurable = false,
+                    currentItem = "إعادة تشغيل النظارة",
+                    completed = 0,
+                    total = null,
+                    phase = GameInstallPhase.RESTARTING
+                )
                 val result = withContext(Dispatchers.IO) { adb.reboot(serial) }
                 appendLog("ADB reboot", result.out, result.err)
                 if (result.exit != 0) {
@@ -1376,6 +1525,7 @@ setProgressWithinGame(0f)
                         statusText = "الحالة: عادت النظارة بعد إعادة التشغيل"
                         progressLabel = "جاهز"
                         installPhase = GameInstallPhase.IDLE
+                        progressInfo = InstallProgressState(false, null, 0, null)
                         return@launch
                     }
                 }
@@ -1471,6 +1621,10 @@ setProgressWithinGame(0f)
         title = "Near FutureVR - مثبت ألعاب Meta Quest",
         icon = painterResource("nfvr_logo.png")
     ) {
+    // WindowScope.window is the actual Compose native window.  Passing this
+    // owner explicitly prevents chooser focus from being stolen by an
+    // unrelated AWT/Swing window.
+    val chooserOwner = window
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
             NfvrTheme {
@@ -1947,11 +2101,13 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Button(
                                                 onClick = {
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
-                                                    val f = chooseFolder(
+                                                     val chooserResult = chooseFolder(
+                                                         chooserOwner,
                                                         savedPaths.lastGameFolder?.let(::File)
                                                             ?: folders.lastOrNull()?.parentFile
                                                     )
-                                                    if (f != null) {
+                                                     if (chooserResult is DesktopChooserResult.Selected) {
+                                                         val f = chooserResult.file
                                                         folders = folders + f
                                                         uiScope.launch {
                                                             withContext(Dispatchers.IO) {
@@ -1960,6 +2116,11 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                             rebuildQueueOnIo()
                                                         }
                                                         appendLog("تمت إضافة مجلد: ${f.absolutePath}")
+                                                     } else if (chooserResult is DesktopChooserResult.Failed) {
+                                                         warningText = chooserResult.userMessage
+                                                         appendLog("فشل اختيار مجلد اللعبة: ${chooserResult.technicalMessage}")
+                                                     } else if (chooserResult is DesktopChooserResult.Busy) {
+                                                         warningText = "نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة."
                                                     }
                                                 },
                                                 enabled = hasAuthorizedDevice && !isInstalling
@@ -1994,9 +2155,15 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             modifier = Modifier.fillMaxWidth(),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            val indeterminate = !progressInfo.measurable ||
-                                                installPhase == GameInstallPhase.RESTARTING ||
-                                                installPhase == GameInstallPhase.INSTALLING_APK
+                                            // IDLE/paused/failed states stay still.  The
+                                            // indeterminate animation is reserved for
+                                            // genuinely active work with no measurable
+                                            // byte count (preflight, APK install, restart).
+                                            val indeterminate = isInstalling && (
+                                                installPhase == GameInstallPhase.PREFLIGHT ||
+                                                    installPhase == GameInstallPhase.INSTALLING_APK ||
+                                                    installPhase == GameInstallPhase.RESTARTING
+                                                )
                                             if (indeterminate) {
                                                 LinearProgressIndicator(
                                                     modifier = Modifier.weight(1f).height(10.dp),
@@ -2188,6 +2355,9 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onCancelScan = {
                                         cancelInstalledAppsScan()
                                     },
+                                     onCancelActiveScanOnSelection = {
+                                         cancelInstalledAppsScan(invalidatePendingCallbacks = true)
+                                     },
                                     scanProgress = appScanProgress,
                                     showAllApps = showAllQuestApps,
                                     onShowAllAppsChange = { value ->
@@ -2201,22 +2371,46 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         modAnalysis = null
                                         modExecutionProgress = null
                                     },
+                                     onChangeSelectedApp = {
+                                         // Keep the cached Quest app snapshot and search query while
+                                         // reopening the picker.  The selected target is no longer
+                                         // valid for the reviewed package, but the package itself
+                                         // can be reused for the next game.
+                                         selectedApp = null
+                                         modAnalysis = null
+                                         modExecutionProgress = null
+                                     },
+                                     onClearSelectedApp = {
+                                         // "مسح" starts the mod workflow over, without forcing a
+                                         // rescan or losing the cached app list/search query.
+                                         selectedApp = null
+                                         modZipFile = null
+                                         modAnalysis = null
+                                         modExecutionProgress = null
+                                     },
                                     selectedZipFilename = modZipFile?.name,
                                     onChooseFile = {
-                                         val file = chooseModFile(lastModArchiveDirectory)
-                                        if (file != null) {
-                                            modZipFile = file
-                                             lastModArchiveDirectory = file.parentFile
-                                             file.parentFile?.let { directory ->
-                                                 uiScope.launch {
-                                                     withContext(Dispatchers.IO) {
-                                                         NfvrPathPreferences.saveModArchiveDirectory(directory)
+                                         when (val chooserResult = chooseModFile(chooserOwner, lastModArchiveDirectory)) {
+                                             is DesktopChooserResult.Selected -> {
+                                                 val file = chooserResult.file
+                                                 modZipFile = file
+                                                 lastModArchiveDirectory = file.parentFile
+                                                 file.parentFile?.let { directory ->
+                                                     uiScope.launch {
+                                                         withContext(Dispatchers.IO) {
+                                                             NfvrPathPreferences.saveModArchiveDirectory(directory)
+                                                         }
                                                      }
                                                  }
+                                                 modAnalysis = null
+                                                 modExecutionProgress = null
+                                                 appendModLog("تم اختيار ملف المود: ${file.name}")
                                              }
-                                            modAnalysis = null
-                                            modExecutionProgress = null
-                                            appendModLog("تم اختيار ملف المود: ${file.name}")
+                                             is DesktopChooserResult.Failed ->
+                                                 appendModLog(chooserResult.userMessage)
+                                             DesktopChooserResult.Busy ->
+                                                 appendModLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
+                                             DesktopChooserResult.Cancelled -> Unit
                                         }
                                     },
                                     analyzing = analyzingMod,
@@ -2229,6 +2423,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onInstall = {
                                         uiScope.launch { installSelectedMod() }
                                     },
+                                     onOpenExternalUrl = ::openUrl,
                                     logText = modLogText,
                                      modifier = Modifier.fillMaxWidth().weight(1f)
                                 )

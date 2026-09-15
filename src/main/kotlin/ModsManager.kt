@@ -537,7 +537,8 @@ enum class ModInstallPhase {
 data class ModExecutionProgress(
     val phase: ModInstallPhase,
     val fraction: Double?,
-    val message: String
+    val message: String,
+    val kind: ModProgressKind = ModProgressKind.INSTALL
 )
 
 private object ModInstallHistory {

@@ -38,6 +38,88 @@ enum class ModInstallStrategy {
     NONE
 }
 
+/**
+ * A package can be installable by NFVR, or intentionally handed to a
+ * browser-based service.  Keeping this separate from installability prevents
+ * an external workflow from being presented as a broken install plan.
+ */
+enum class ModWorkflowKind {
+    DIRECT_INSTALL,
+    SUPPORTED_EXTERNAL_WORKFLOW,
+    UNSUPPORTED
+}
+
+enum class ModProgressKind {
+    SCAN,
+    ANALYZE,
+    INSTALL,
+    EXTERNAL
+}
+
+data class ModExternalWorkflow(
+    val sourceUrl: String?,
+    val actionUrl: String,
+    val guidance: String,
+    val browserOnly: Boolean = true
+)
+
+const val GORILLA_TAG_VIRTUAL_STUMP_PACKAGE_ID = "GORILLA_TAG_VIRTUAL_STUMP"
+const val GORILLA_TAG_MOD_IO_URL = "https://mod.io/g/gorilla-tag"
+
+/**
+ * Only mod.io HTTPS pages are allowed to cross the browser boundary.  This
+ * deliberately does not infer a game's slug or accept arbitrary redirect
+ * URLs.
+ */
+fun validatedHttpsModIoUrl(raw: String?): String? {
+    val value = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    return runCatching {
+        val uri = java.net.URI(value)
+        val host = uri.host?.lowercase() ?: return@runCatching null
+        if (uri.scheme?.lowercase() != "https" ||
+            (host != "mod.io" && !host.endsWith(".mod.io")) ||
+            uri.userInfo != null ||
+            uri.fragment != null
+        ) null else uri.toASCIIString()
+    }.getOrNull()
+}
+
+fun isValidatedHttpsModIoUrl(raw: String?): Boolean = validatedHttpsModIoUrl(raw) != null
+
+fun validateModIoUrl(raw: String?): String? = validatedHttpsModIoUrl(raw)
+
+fun isValidModIoUrl(raw: String?): Boolean = isValidatedHttpsModIoUrl(raw)
+
+fun classifyModWorkflow(
+    packageType: ModPackageType,
+    externalWorkflow: ModExternalWorkflow? = null
+): ModWorkflowKind = when {
+    externalWorkflow != null || packageType == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ->
+        ModWorkflowKind.SUPPORTED_EXTERNAL_WORKFLOW
+    packageType == ModPackageType.UNKNOWN -> ModWorkflowKind.UNSUPPORTED
+    else -> ModWorkflowKind.DIRECT_INSTALL
+}
+
+fun isSupportedExternalWorkflow(packageType: ModPackageType): Boolean =
+    classifyModWorkflow(packageType) == ModWorkflowKind.SUPPORTED_EXTERNAL_WORKFLOW
+
+/**
+ * Warnings can be emitted by both schema and payload validation.  Use the
+ * stable code as the identity so a user sees one actionable explanation.
+ */
+fun deduplicateModWarnings(warnings: List<ModInstallPrecondition>): List<ModInstallPrecondition> {
+    val seen = mutableSetOf<String>()
+    return warnings.filter { warning ->
+        val key = warning.code.trim().ifBlank { warning.message.trim() }
+        seen.add(key)
+    }
+}
+
+fun shouldCollapseInstalledAppList(
+    selectedApp: InstalledQuestApp?,
+    changeRequested: Boolean
+): Boolean = selectedApp != null && !changeRequested
+
 data class ModCompatibility(
     val compatible: Boolean,
     val reasons: List<String> = emptyList()
@@ -123,7 +205,8 @@ data class ModPackageAnalysis(
     val compatibility: ModCompatibility,
     val installPlan: ModInstallPlan,
     val metadata: Map<String, Any?> = emptyMap(),
-    val entries: List<String> = emptyList()
+    val entries: List<String> = emptyList(),
+    val externalWorkflow: ModExternalWorkflow? = null
 ) {
     val installable: Boolean
         get() = installPlan.installable
@@ -131,6 +214,18 @@ data class ModPackageAnalysis(
     /** Alias useful to callers that prefer the shorter term. */
     val plan: ModInstallPlan
         get() = installPlan
+
+    val workflow: ModWorkflowKind
+        get() = classifyModWorkflow(packageType, externalWorkflow)
+
+    val isExternalWorkflow: Boolean
+        get() = workflow == ModWorkflowKind.SUPPORTED_EXTERNAL_WORKFLOW
+
+    val externalSourceUrl: String?
+        get() = externalWorkflow?.sourceUrl
+
+    val externalActionUrl: String?
+        get() = externalWorkflow?.actionUrl
 }
 
 data class GameModProfile(

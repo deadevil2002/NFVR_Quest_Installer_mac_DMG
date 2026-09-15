@@ -316,12 +316,22 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         json: JSONObject
     ): ModPackageAnalysis {
+        val sourceUrl = virtualStumpSourceUrl(json)
+        val externalWorkflow = ModExternalWorkflow(
+            sourceUrl = sourceUrl,
+            actionUrl = sourceUrl ?: GORILLA_TAG_MOD_IO_URL,
+            guidance = if (sourceUrl != null) {
+                "افتح صفحة mod.io الموثوقة في المتصفح لإدارة محتوى Gorilla Tag. لا ينفذ NFVR تثبيتًا مباشرًا لهذا النوع."
+            } else {
+                "افتح صفحة Gorilla Tag على mod.io في المتصفح وابحث عن المحتوى المطلوب. لا يخمّن NFVR رابطًا أو وجهة تثبيت."
+            }
+        )
         val plan = ModInstallPlan(
             packageType = ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
             strategy = ModInstallStrategy.MOD_IO_MANAGED,
             archiveIdentity = archive.identity,
             preconditions = listOf(
-                blocked(
+                satisfied(
                     "MOD_IO_MANAGED",
                     "Gorilla Tag Virtual Stump content is managed by Gorilla Tag/mod.io; NFVR has no safe direct destination."
                 )
@@ -332,8 +342,20 @@ class ModPackageAnalyzer(
             "Recognized Gorilla Tag Virtual Stump map/gamemode package; it is not directly installable by NFVR.",
             plan,
             archive,
-            json.toMap()
+            json.toMap() + mapOf(
+                "externalWorkflow" to "SUPPORTED_EXTERNAL_WORKFLOW",
+                "modIoUrl" to sourceUrl
+            ),
+            externalWorkflow = externalWorkflow
         )
+    }
+
+    private fun virtualStumpSourceUrl(json: JSONObject): String? {
+        val keys = listOf("modIoUrl", "modioUrl", "modio_url", "modio", "mod.io", "sourceUrl", "website", "url")
+        return keys.asSequence()
+            .mapNotNull { key -> json.optString(key, "").trim().ifBlank { null } }
+            .mapNotNull(::validatedHttpsModIoUrl)
+            .firstOrNull()
     }
 
     private fun analyzeGeneric(archive: ArchiveMetadata): ModPackageAnalysis {
@@ -590,8 +612,10 @@ class ModPackageAnalyzer(
     )
 
     private fun isVirtualStump(json: JSONObject): Boolean =
-        listOf("pcFileName", "androidFileName", "customMapSupportVersion", "initialScenes", "availableGameModes")
-            .all(json::has)
+        json.optString("packageId", "").equals(GORILLA_TAG_VIRTUAL_STUMP_PACKAGE_ID, true) ||
+            json.optString("packageType", "").equals(GORILLA_TAG_VIRTUAL_STUMP_PACKAGE_ID, true) ||
+            listOf("pcFileName", "androidFileName", "customMapSupportVersion", "initialScenes", "availableGameModes")
+                .all(json::has)
 
     private fun hasPatchingRequirement(json: JSONObject): Boolean =
         listOf("patcher", "patching", "apkPatching", "requiresPatching")
@@ -708,15 +732,21 @@ class ModPackageAnalyzer(
         message: String,
         plan: ModInstallPlan,
         archive: ArchiveMetadata,
-        metadata: Map<String, Any?> = emptyMap()
+        metadata: Map<String, Any?> = emptyMap(),
+        externalWorkflow: ModExternalWorkflow? = null
     ): ModPackageAnalysis = ModPackageAnalysis(
         packageType = type,
         recognized = type != ModPackageType.UNKNOWN,
         message = message,
-        compatibility = ModCompatibility(plan.installable, plan.preconditions.filterNot { it.satisfied }.map { it.message }),
+        compatibility = if (externalWorkflow != null) {
+            ModCompatibility(true)
+        } else {
+            ModCompatibility(plan.installable, plan.preconditions.filterNot { it.satisfied }.map { it.message })
+        },
         installPlan = plan,
         metadata = metadata,
-        entries = archive.entries
+        entries = archive.entries,
+        externalWorkflow = externalWorkflow
     )
 
     private fun blockingMessage(plan: ModInstallPlan): String =

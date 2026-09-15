@@ -82,25 +82,81 @@ data class InstallProgressState(
     val measurable: Boolean,
     val currentItem: String?,
     val completed: Int,
-    val total: Int?
+    val total: Int?,
+    /**
+     * Queue/install context is deliberately part of the game progress model.
+     * Mod execution has its own progress model and must never overwrite this.
+     */
+    val gameName: String? = null,
+    val phase: GameInstallPhase? = null,
+    val percentOverride: Int? = null
 ) {
     val percent: Int?
-        get() = if (measurable && total != null && total > 0) {
+        get() = if (percentOverride != null && measurable) {
+            percentOverride.coerceIn(0, 100)
+        } else if (measurable && total != null && total > 0) {
             (completed.toDouble() / total * 100.0).toInt().coerceIn(0, 100)
         } else null
 }
 
 fun formatInstallProgress(state: InstallProgressState): String = buildString {
-    state.currentItem?.takeIf { it.isNotBlank() }?.let { append(it) }
+    state.gameName?.takeIf { it.isNotBlank() }?.let { append(it) }
+    state.currentItem?.takeIf { it.isNotBlank() }?.let {
+        if (isNotEmpty()) append(" — ")
+        append(it)
+    }
     if (state.total != null && state.total > 0) {
         if (isNotEmpty()) append(" — ")
         append("${state.completed.coerceIn(0, state.total)} / ${state.total}")
+    }
+    state.phase?.let {
+        if (isNotEmpty()) append(" — ")
+        append(it.name)
     }
     state.percent?.let {
         if (isNotEmpty()) append(" — ")
         append("$it%")
     }
-    if (isEmpty()) append("جارٍ التنفيذ")
+    if (isEmpty()) append("جاهز")
+}
+
+/**
+ * A chooser is a user-initiated, modal desktop operation.  Keeping the gate
+ * as a tiny pure state holder makes the "one chooser at a time" rule
+ * deterministic without coupling it to Swing or Compose.
+ */
+class DesktopChooserGate {
+    private var open = false
+
+    @Synchronized
+    fun tryAcquire(): Boolean {
+        if (open) return false
+        open = true
+        return true
+    }
+
+    @Synchronized
+    fun release() {
+        open = false
+    }
+
+    @Synchronized
+    fun isOpen(): Boolean = open
+}
+
+enum class DesktopChooserMode {
+    FILES,
+    DIRECTORY
+}
+
+sealed interface DesktopChooserResult {
+    data class Selected(val file: File) : DesktopChooserResult
+    data object Cancelled : DesktopChooserResult
+    data object Busy : DesktopChooserResult
+    data class Failed(
+        val userMessage: String,
+        val technicalMessage: String
+    ) : DesktopChooserResult
 }
 
 /**
@@ -255,6 +311,13 @@ fun stableSelectedPackage(
     apps: List<InstalledQuestApp>
 ): InstalledQuestApp? =
     selectedPackageName?.let { packageId -> apps.firstOrNull { it.packageName == packageId } }
+
+fun resolveScanSelection(
+    capturedPackageName: String?,
+    currentPackageName: String?,
+    apps: List<InstalledQuestApp>
+): InstalledQuestApp? =
+    stableSelectedPackage(currentPackageName ?: capturedPackageName, apps)
 
 fun parseAdbDeviceRows(devicesOutput: String): List<AdbDeviceRow> {
     val lines = devicesOutput.lines().map(String::trim)
