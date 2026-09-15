@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.loadImageBitmap
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -36,7 +37,9 @@ import javax.swing.SwingUtilities
 import java.nio.file.Files
 import java.text.DecimalFormat
 import javax.swing.JFileChooser
+import javax.swing.JOptionPane
 import javax.swing.UIManager
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 import java.net.HttpURLConnection
@@ -382,19 +385,31 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
         Thread { p.errorStream.bufferedReader().useLines { it.forEach(err::appendLine) } }
     tOut.start(); tErr.start()
 
-    val finished = p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-    if (!finished) {
+    return try {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (p.isAlive && System.nanoTime() < deadline) {
+            p.waitFor(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        if (p.isAlive) {
+            p.destroyForcibly()
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            tOut.join(5_000)
+            tErr.join(5_000)
+            CmdResult(124, out.toString(), "Timeout")
+        } else {
+            tOut.join()
+            tErr.join()
+            CmdResult(p.exitValue(), out.toString(), err.toString())
+        }
+    } catch (interrupted: InterruptedException) {
         p.destroyForcibly()
-        p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-        tOut.join(5_000)
-        tErr.join(5_000)
+        runCatching { p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) }
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } finally {
+        if (p.isAlive) p.destroyForcibly()
         OwnedProcessRegistry.remove(p)
-        return CmdResult(124, out.toString(), "Timeout")
     }
-    tOut.join(); tErr.join()
-
-    OwnedProcessRegistry.remove(p)
-    return CmdResult(p.exitValue(), out.toString(), err.toString())
 }
 
 open class AdbClient(private val bundled: BundledAdb) {
@@ -556,16 +571,56 @@ private fun scanGameFolder(folder: File): GameEntry? {
     )
 }
 
-private fun chooseFolder(initialDirectory: File? = null): File? {
-    UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-    val fc = JFileChooser()
-    fc.fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
-    fc.isAcceptAllFileFilterUsed = false
-    fc.dialogTitle = "اختر مجلد اللعبة"
-    initialDirectory?.takeIf { it.isDirectory }?.let { fc.currentDirectory = it }
-    val result = fc.showOpenDialog(null)
-    return if (result == JFileChooser.APPROVE_OPTION) fc.selectedFile else null
+private val chooserInUse = AtomicBoolean(false)
+
+/**
+ * JFileChooser is a Swing focus owner.  Creating and showing it from a
+ * coroutine (or with a null owner) races Compose's native window on Windows.
+ * Keep the complete chooser lifecycle on the EDT, serialize it, and use the
+ * currently visible application window as its owner.
+ */
+private fun showOwnedChooser(
+    title: String,
+    mode: Int,
+    initialDirectory: File? = null,
+    zipOnly: Boolean = false
+): File? {
+    if (!chooserInUse.compareAndSet(false, true)) return null
+    var selected: File? = null
+    val show = {
+        try {
+            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
+            val chooser = JFileChooser().apply {
+                fileSelectionMode = mode
+                isAcceptAllFileFilterUsed = false
+                dialogTitle = title
+                initialDirectory?.takeIf { it.isDirectory }?.let { currentDirectory = it }
+                if (zipOnly) {
+                    fileFilter = javax.swing.filechooser.FileNameExtensionFilter("ZIP Files", "zip")
+                }
+            }
+            val visibleWindows = java.awt.Window.getWindows()
+                .filter { it.isShowing && it.isFocusableWindow }
+            val owner = visibleWindows.firstOrNull { it.isActive } ?: visibleWindows.firstOrNull()
+            if (chooser.showOpenDialog(owner) == JFileChooser.APPROVE_OPTION) {
+                selected = chooser.selectedFile
+            }
+        } finally {
+            chooserInUse.set(false)
+        }
+    }
+    return try {
+        if (SwingUtilities.isEventDispatchThread()) show()
+        else SwingUtilities.invokeAndWait(show)
+        selected
+    } catch (_: Throwable) {
+        chooserInUse.set(false)
+        null
+    }
 }
+
+private fun chooseFolder(initialDirectory: File? = null): File? =
+    showOwnedChooser("اختر مجلد اللعبة", JFileChooser.DIRECTORIES_ONLY, initialDirectory)
 
 private fun copyToClipboard(text: String) {
     runCatching {
@@ -598,8 +653,35 @@ private fun runOnUi(block: () -> Unit) {
     }
 }
 
+private const val SECOND_INSTANCE_MESSAGE = "NFVR Quest Installer يعمل بالفعل."
 
-fun main() = application {
+private fun showSecondInstanceMessage() {
+    val show: () -> Unit = {
+        runCatching {
+            JOptionPane.showMessageDialog(
+                null,
+                SECOND_INSTANCE_MESSAGE,
+                "NFVR Quest Installer",
+                JOptionPane.INFORMATION_MESSAGE
+            )
+        }
+        Unit
+    }
+    if (SwingUtilities.isEventDispatchThread()) show() else runCatching {
+        SwingUtilities.invokeAndWait(show)
+    }
+}
+
+fun main() {
+    // Acquire before Compose creates any native windows. The lock is held by
+    // the application closure and is released on normal composition disposal.
+    val instanceLock = NfvrSingleInstanceLock.forCurrentUser()
+    if (instanceLock == null) {
+        showSecondInstanceMessage()
+        return
+    }
+    try {
+        application {
     val host = detectOs()
     val bundledAdb = remember { BundledAdb(host) }
     val adb = remember { AdbClient(bundledAdb) }
@@ -614,6 +696,9 @@ fun main() = application {
     var hasAuthorizedDevice by remember { mutableStateOf(false) }
     var deviceText by remember { mutableStateOf("—") }
     var storageText by remember { mutableStateOf("—") }
+    var osText by remember { mutableStateOf("—") }
+    var batteryText by remember { mutableStateOf("—") }
+    var deviceGuidance by remember { mutableStateOf(DeviceGuidanceState.NO_DEVICE) }
 
     var statusText by remember { mutableStateOf("الحالة: جاهز") }
     var warningText by remember { mutableStateOf<String?>(null) }
@@ -627,6 +712,7 @@ fun main() = application {
     var isInstalling by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
     var progressLabel by remember { mutableStateOf("—") }
+    var progressInfo by remember { mutableStateOf(InstallProgressState(false, null, 0, null)) }
     var installPhase by remember { mutableStateOf(GameInstallPhase.IDLE) }
 
     var logText by remember { mutableStateOf("") }
@@ -639,6 +725,10 @@ fun main() = application {
     var selectedApp by remember { mutableStateOf<InstalledQuestApp?>(null) }
     var appSearch by remember { mutableStateOf("") }
     var scanningApps by remember { mutableStateOf(false) }
+    var appScanProgress by remember { mutableStateOf<InstalledAppsScanProgress?>(null) }
+    var showAllQuestApps by remember { mutableStateOf(false) }
+    var connectedDeviceSerial by remember { mutableStateOf<String?>(null) }
+    var appScanJob by remember { mutableStateOf<Job?>(null) }
     var modZipFile by remember { mutableStateOf<File?>(null) }
     var lastModArchiveDirectory by remember { mutableStateOf<File?>(null) }
     var modAnalysis by remember { mutableStateOf<ModPackageAnalysis?>(null) }
@@ -649,6 +739,7 @@ fun main() = application {
     val activityHistory = remember { BoundedActivityHistory() }
     val uiScope = rememberCoroutineScope()
     val appScanMutex = remember { Mutex() }
+    var appScanGeneration by remember { mutableStateOf(0L) }
     val installMutex = remember { Mutex() }
     var activityEvents by remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
 
@@ -717,15 +808,12 @@ fun main() = application {
     }
 
     fun chooseModFile(initialDirectory: File? = null): File? {
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-        val fc = JFileChooser()
-        fc.fileSelectionMode = JFileChooser.FILES_ONLY
-        fc.isAcceptAllFileFilterUsed = false
-        fc.fileFilter = javax.swing.filechooser.FileNameExtensionFilter("ZIP Files", "zip")
-        fc.dialogTitle = "اختر ملف المود (ZIP)"
-        initialDirectory?.takeIf { it.isDirectory }?.let { fc.currentDirectory = it }
-        val result = fc.showOpenDialog(null)
-        return if (result == JFileChooser.APPROVE_OPTION) fc.selectedFile else null
+        return showOwnedChooser(
+            title = "اختر ملف المود (ZIP)",
+            mode = JFileChooser.FILES_ONLY,
+            initialDirectory = initialDirectory,
+            zipOnly = true
+        )
     }
 
     suspend fun getAuthorizedSerialOrNull(): String? {
@@ -741,27 +829,91 @@ fun main() = application {
 
     suspend fun refreshInstalledApps() {
         if (!appScanMutex.tryLock()) return
+        val generation = appScanGeneration + 1L
+        appScanGeneration = generation
+        val previousSnapshot = installedApps
+        val selectedPackageName = selectedApp?.packageName
         scanningApps = true
         try {
             val serial = getAuthorizedSerialOrNull()
             if (serial == null) {
-                installedApps = emptyList()
-                selectedApp = null
+                // A transient disconnect is not evidence that the snapshot
+                // changed. Keep both rows and package-id selection visible.
                 return
             }
-            installedApps = withContext(Dispatchers.IO) {
-                modsManager.scanInstalledQuestApps(serial)
+            var scanFailure: String? = null
+            val scanned = withContext(Dispatchers.IO) {
+                modsManager.scanInstalledQuestApps(
+                    serial = serial,
+                    showAll = showAllQuestApps
+                ) { update ->
+                    update.error?.let { scanFailure = it }
+                    uiScope.launch(Dispatchers.Main.immediate) {
+                        if (generation != appScanGeneration) return@launch
+                        appScanProgress = update
+                        if (update.apps.isNotEmpty()) {
+                            installedApps = mergeInstalledAppSnapshot(
+                                previousSnapshot,
+                                (update.apps + previousSnapshot).distinctBy { it.packageName }
+                            )
+                            selectedApp = stableSelectedPackage(selectedPackageName, installedApps)
+                        }
+                    }
+                }
             }
-            selectedApp = selectedApp?.let { selected ->
-                installedApps.firstOrNull { it.packageName == selected.packageName }
+            if (generation == appScanGeneration) {
+                if (scanFailure != null) {
+                    appScanProgress = (appScanProgress
+                        ?: InstalledAppsScanProgress(previousSnapshot, 0, null))
+                        .copy(error = scanFailure)
+                    return
+                }
+                val currentPackages = scanned.mapTo(mutableSetOf()) { it.packageName }
+                val retainedPrevious = previousSnapshot.filter { it.packageName in currentPackages }
+                installedApps = mergeInstalledAppSnapshot(retainedPrevious, scanned)
+                selectedApp = stableSelectedPackage(selectedPackageName, installedApps)
+                appScanProgress = InstalledAppsScanProgress(
+                    apps = installedApps,
+                    processed = scanned.size,
+                    total = scanned.size,
+                    completed = true
+                )
+                appendModLog("تم فحص ${installedApps.size} تطبيقًا مثبتًا من مصادر المستخدم.")
             }
-            appendModLog("تم فحص ${installedApps.size} تطبيقًا مثبتًا من مصادر المستخدم.")
+        } catch (e: CancellationException) {
+            if (generation == appScanGeneration) {
+                appScanProgress = (appScanProgress
+                    ?: InstalledAppsScanProgress(previousSnapshot, 0, null))
+                    .copy(cancelled = true)
+            }
+            throw e
         } catch (e: Exception) {
             appendModLog("تعذر فحص التطبيقات المثبتة: ${e.message ?: "خطأ غير معروف"}")
+            appScanProgress = (appScanProgress
+                ?: InstalledAppsScanProgress(previousSnapshot, 0, null))
+                .copy(error = e.message ?: "خطأ غير معروف")
             DiagnosticLogger.error("فشل فحص تطبيقات Quest المثبتة", e)
         } finally {
             scanningApps = false
             appScanMutex.unlock()
+        }
+    }
+
+    fun cancelInstalledAppsScan() {
+        // Keep the visible scanning state until the interruptible ADB process
+        // has actually terminated and the scan coroutine reaches its catch/
+        // finally block. This prevents reporting cancellation prematurely.
+        appScanJob?.cancel()
+    }
+
+    fun startInstalledAppsScan() {
+        if (appScanJob?.isActive == true) return
+        val job = uiScope.launch { runCatching { refreshInstalledApps() } }
+        appScanJob = job
+        job.invokeOnCompletion {
+            uiScope.launch(Dispatchers.Main.immediate) {
+                if (appScanJob === job) appScanJob = null
+            }
         }
     }
 
@@ -801,9 +953,13 @@ fun main() = application {
             val rows = selection.rows
             if (rows.isEmpty()) {
                 hasAuthorizedDevice = false
+                deviceGuidance = DeviceGuidanceState.NO_DEVICE
+                connectedDeviceSerial = null
                 connectionText = "الاتصال: لا يوجد جهاز متصل"
                 deviceText = "—"
                 storageText = "—"
+                osText = "—"
+                batteryText = "—"
                 pausedBecauseDisconnected = isInstalling
                 if (isInstalling) {
                     installPhase = GameInstallPhase.PAUSED
@@ -815,9 +971,13 @@ fun main() = application {
             val serial = selection.selectedSerial
             if (serial == null) {
                 hasAuthorizedDevice = false
+                deviceGuidance = deviceGuidanceState(rows, false)
+                connectedDeviceSerial = null
                 connectionText = "الاتصال: جهاز ADB يحتاج إجراء"
                 deviceText = rows.joinToString("، ") { "${it.serial}: ${it.state.name.lowercase()}" }
                 storageText = "—"
+                osText = "—"
+                batteryText = "—"
                 statusText =
                     if (isInstalling) {
                         installPhase = GameInstallPhase.PAUSED
@@ -828,23 +988,42 @@ fun main() = application {
             }
 
             hasAuthorizedDevice = true
+            deviceGuidance = DeviceGuidanceState.AUTHORIZED
+            connectedDeviceSerial = serial
             warningText = null
 
-            connectionText = "الاتصال: تم العثور على جهاز"
+            connectionText = "الاتصال: مصرح وجاهز"
             val modelRes = withContext(Dispatchers.IO) {
                 adb.shell(serial, "getprop", "ro.product.model")
             }
             val model = modelRes.out.trim().ifBlank { "Meta Quest" }
+            val osRes = withContext(Dispatchers.IO) {
+                adb.shell(serial, "getprop", "ro.build.version.release")
+            }
+            val osVersion = safeQuestOsVersion(osRes.out)
 
             val dfRes = withContext(Dispatchers.IO) {
                 adb.shell(serial, "df", "-k", "/data")
             }
             val storage = parseDfToGb(dfRes.out)
+            val batteryRes = withContext(Dispatchers.IO) {
+                adb.shell(serial, "dumpsys", "battery")
+            }
+            val battery = parseQuestBatteryDump(batteryRes.out)
 
-            deviceText = "الجهاز: $model  |  السيريال: $serial"
+            deviceText = "الجهاز: ${model.take(80)}  |  السيريال: ${serial.take(120)}  |  الحالة: مصرح"
             storageText = storage?.let { (totalGb, freeGb) ->
                 "المساحة: المتاح ${formatGb(freeGb)} من ${formatGb(totalGb)}"
             } ?: "المساحة: تعذر قراءتها بأمان"
+            osText = "Android / Quest OS: ${osVersion ?: "غير متاح"}"
+            batteryText = battery.percentage?.let { percentage ->
+                val state = when (battery.charging) {
+                    true -> "يشحن${battery.source?.let { " عبر $it" }.orEmpty()}"
+                    false -> "غير موصول بالشحن"
+                    null -> "حالة الشحن غير متاحة"
+                }
+                "البطارية: $percentage% — $state"
+            } ?: "البطارية: غير متاحة"
 
             if (pausedBecauseDisconnected && isInstalling) {
                 pausedBecauseDisconnected = false
@@ -854,9 +1033,13 @@ fun main() = application {
             }
         } catch (e: Throwable) {
             hasAuthorizedDevice = false
+            deviceGuidance = DeviceGuidanceState.NO_DEVICE
+            connectedDeviceSerial = null
             connectionText = "الاتصال: ADB غير جاهز"
             deviceText = "—"
             storageText = "—"
+            osText = "—"
+            batteryText = "—"
             statusText = if (isInstalling) "الحالة: توقف مؤقت" else "الحالة: تعذر تشغيل ADB"
             warningText = "${safeUiMsg(e)}\n\n${translateAdbFailure(e.message.orEmpty())}"
             DiagnosticLogger.error("تعذر تحديث معلومات جهاز Meta Quest", e)
@@ -881,6 +1064,7 @@ fun main() = application {
         warningText = null
         progress = 0f
         progressLabel = "بدء التثبيت..."
+        progressInfo = InstallProgressState(false, "بدء التثبيت", 0, queue.size)
         appendLog("==============================================")
         appendLog("بدء التثبيت — عدد الألعاب: ${queue.size}")
         appendLog("==============================================")
@@ -919,7 +1103,10 @@ fun main() = application {
 val step = (1f / queue.size.toFloat()).coerceIn(0f, 1f)
 fun setProgressWithinGame(p: Float) {
     val v = (base + step * p.coerceIn(0f, 1f)).coerceIn(0f, 1f)
-    uiScope.launch { progress = v }
+    uiScope.launch {
+        progress = v
+        progressInfo = InstallProgressState(false, entry.apk.name, i, queue.size)
+    }
 }
 setProgressWithinGame(0f)
 
@@ -993,6 +1180,14 @@ setProgressWithinGame(0f)
                             // تحديث نسبة حقيقية حسب حجم ملفات OBB
                             val overall = (copiedObbBytes + copied).coerceAtMost(totalObbBytes)
                             val frac = overall.toFloat() / totalObbBytes.toFloat()
+                            uiScope.launch {
+                                progressInfo = InstallProgressState(
+                                    measurable = true,
+                                    currentItem = "OBB: ${dir.name}",
+                                    completed = overall.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                                    total = totalObbBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                                )
+                            }
                             setProgressWithinGame(0.25f + 0.70f * frac)
                             }
                         }
@@ -1041,6 +1236,7 @@ setProgressWithinGame(0f)
                 i++
                 resumeIndex = i
                 progress = (i.toFloat() / queue.size.toFloat()).coerceAtMost(0.95f)
+                progressInfo = InstallProgressState(true, entry.folder.name, i, queue.size)
             }
 
             installPhase = transitionInstallPhase(
@@ -1114,6 +1310,7 @@ setProgressWithinGame(0f)
             )
             progress = 1f
             progressLabel = "اكتمل التثبيت"
+            progressInfo = InstallProgressState(true, "اكتمل التثبيت", queue.size, queue.size)
             statusText = "الحالة: تم بنجاح"
             appendLog("==============================================")
             appendLog("اكتمل التثبيت بنجاح")
@@ -1149,6 +1346,7 @@ setProgressWithinGame(0f)
                 installPhase = GameInstallPhase.RESTARTING
                 statusText = "الحالة: جاري إعادة تشغيل النظارة..."
                 progressLabel = "انتظار عودة اتصال ADB..."
+                progressInfo = InstallProgressState(false, "إعادة تشغيل النظارة", 0, null)
                 val result = withContext(Dispatchers.IO) { adb.reboot(serial) }
                 appendLog("ADB reboot", result.out, result.err)
                 if (result.exit != 0) {
@@ -1239,15 +1437,24 @@ setProgressWithinGame(0f)
     }
 
     LaunchedEffect(Unit) {
+        var lastScannedSerial: String? = null
         while (isActive) {
             refreshDeviceInfo()
-            runCatching { refreshInstalledApps() }
+            val serial = connectedDeviceSerial
+            if (serial == null) {
+                lastScannedSerial = null
+            } else if (serial != lastScannedSerial) {
+                lastScannedSerial = serial
+                startInstalledAppsScan()
+            }
             delay(2000)
         }
     }
 
     Window(
-        onCloseRequest = { hardExitApp { bundledAdb.cleanupOwnedResources() } },
+        onCloseRequest = {
+            hardExitApp { bundledAdb.cleanupOwnedResources() }
+        },
         title = "Near FutureVR - مثبت ألعاب Meta Quest",
         icon = painterResource("nfvr_logo.png")
     ) {
@@ -1314,32 +1521,32 @@ setProgressWithinGame(0f)
                             Text(connectionText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             Text(deviceText, style = MaterialTheme.typography.bodyMedium)
                             Text(storageText, style = MaterialTheme.typography.bodyMedium)
-                            Text(
-                                "إعداد Quest: أنشئ حساب مطور Meta، فعّل Developer Mode من تطبيق Meta Horizon، " +
-                                    "استخدم كابل USB بيانات، ثم اختر Always allow from this computer ووافق على USB Debugging داخل النظارة.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(
-                                    onClick = {
-                                        openUrl("https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/")
-                                    }
-                                ) { Text("فتح دليل التفعيل") }
-                                OutlinedButton(
-                                    onClick = {
-                                        openUrl("https://developer.oculus.com/manage/organizations/create/")
-                                    }
-                                ) { Text("فتح صفحة Meta للمطورين") }
-                                OutlinedButton(
-                                            onClick = { uiScope.launch { refreshDeviceInfo() } }
-                                ) { Text("إعادة فحص الاتصال") }
+                            if (deviceGuidance == DeviceGuidanceState.AUTHORIZED) {
+                                Text(osText, style = MaterialTheme.typography.bodySmall)
+                                Text(batteryText, style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                val guidance = when (deviceGuidance) {
+                                    DeviceGuidanceState.NO_DEVICE ->
+                                        "لا يوجد جهاز. استخدم كابل USB بيانات وافتح قفل النظارة ثم أعد الفحص."
+                                    DeviceGuidanceState.UNAUTHORIZED ->
+                                        "الجهاز غير مصرح. وافق على USB Debugging داخل النظارة واختر Always allow."
+                                    DeviceGuidanceState.OFFLINE ->
+                                        "الجهاز غير متصل. افتح قفل النظارة وافصل السلك ثم أعد توصيله."
+                                    DeviceGuidanceState.AUTHORIZED -> ""
+                                }
+                                Text(guidance, style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            openUrl("https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/")
+                                        }
+                                    ) { Text("فتح دليل USB") }
+                                    OutlinedButton(
+                                        onClick = { uiScope.launch { refreshDeviceInfo() } }
+                                    ) { Text("إعادة فحص الاتصال") }
+                                }
                             }
-                            Text(
-                                "البريد الإلكتروني لحساب Meta غير متاح للتطبيق؛ لا نجمع أو نستخرج بيانات خاصة.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
                         }
                     }
 
@@ -1352,9 +1559,11 @@ setProgressWithinGame(0f)
                             resizable = false
                         ) {
                             Card(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                                val settingsScroll = rememberScrollState()
+                                var revealLicenseKey by remember { mutableStateOf(false) }
                                 Column(
-                                    modifier = Modifier.padding(16.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    modifier = Modifier.padding(16.dp).verticalScroll(settingsScroll),
+                                    verticalArrangement = Arrangement.spacedBy(9.dp)
                                 ) {
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -1365,6 +1574,14 @@ setProgressWithinGame(0f)
                                         OutlinedButton(onClick = { showSettings.value = false }) { Text("إغلاق") }
                                     }
 
+                                    Divider()
+
+                                    Text("عام", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        "وضع داكن عالي التباين • اتجاه RTL • بيانات التطبيق محفوظة في مجلد مستخدم Windows.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                     Divider()
 
                                     Text("التحديثات", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -1408,24 +1625,42 @@ setProgressWithinGame(0f)
                                     val fp = licenseState.value.fingerprint
                                     val boundKey = licenseState.value.boundLicenseKey
 
-                                    Box(
-                                        modifier = Modifier.fillMaxWidth()
-                                            .background(if (licenseState.value.isActivated) Color(0xFFE8F5E8) else Color(0xFFFFF0F0))
-                                            .padding(12.dp)
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        shape = MaterialTheme.shapes.small
                                     ) {
                                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Text(
+                                                "الحالة: ${if (licenseState.value.isActivated) "مفعل" else "غير مفعل"}",
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.padding(start = 12.dp, top = 10.dp, end = 12.dp)
+                                            )
                                             SelectionContainer {
-                                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                    Text(
-                                                        "الحالة: ${if (licenseState.value.isActivated) "مفعل" else "غير مفعل"}",
-                                                        fontWeight = FontWeight.SemiBold
-                                                    )
-                                                    Text("بصمة الجهاز: $fp", style = MaterialTheme.typography.bodySmall)
-                                                    Text("المفتاح المرتبط: ${boundKey ?: "—"}", style = MaterialTheme.typography.bodySmall)
+                                                Text("بصمة الجهاز: $fp", style = MaterialTheme.typography.bodySmall,
+                                                    modifier = Modifier.padding(horizontal = 12.dp))
+                                            }
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    "المفتاح المرتبط: ${
+                                                        if (revealLicenseKey) (boundKey ?: "—") else maskLicenseKey(boundKey)
+                                                    }",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                TextButton(onClick = { revealLicenseKey = !revealLicenseKey }) {
+                                                    Text(if (revealLicenseKey) "إخفاء" else "إظهار")
                                                 }
                                             }
 
-                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
                                                 OutlinedButton(onClick = {
                                                     copyToClipboard(fp)
                                                     activationUiMsg = "تم نسخ البصمة"
@@ -1450,6 +1685,7 @@ setProgressWithinGame(0f)
 Spacer(Modifier.height(14.dp))
 
 // دعم: إرسال تقرير خطأ يدويًا (بزر فقط)
+Text("التشخيص والدعم", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 val canSendReport = SupportReporter.hasReport()
 var reportStatus by remember { mutableStateOf<String?>(null) }
 var sendingReport by remember { mutableStateOf(false) }
@@ -1509,7 +1745,8 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             onValueChange = { licenseKeyInput = it },
                                             label = { Text("مفتاح الترخيص") },
                                             modifier = Modifier.fillMaxWidth(),
-                                            enabled = !isActivating
+                                            enabled = !isActivating,
+                                            visualTransformation = PasswordVisualTransformation()
                                         )
 
                                         Button(
@@ -1588,6 +1825,13 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
                                     }
+                                    Divider()
+                                    Text("حول", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        "NFVR Quest Installer — Near FutureVR\nالإصدار ${AppInfo.version}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             }
                         }
@@ -1607,7 +1851,8 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onValueChange = { licenseKeyInput = it },
                                     label = { Text("مفتاح الترخيص") },
                                     modifier = Modifier.fillMaxWidth(),
-                                    enabled = !isActivating
+                                    enabled = !isActivating,
+                                    visualTransformation = PasswordVisualTransformation()
                                 )
 
                                 Button(
@@ -1736,7 +1981,8 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             modifier = Modifier.fillMaxWidth(),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            val indeterminate = installPhase == GameInstallPhase.RESTARTING ||
+                                            val indeterminate = !progressInfo.measurable ||
+                                                installPhase == GameInstallPhase.RESTARTING ||
                                                 installPhase == GameInstallPhase.INSTALLING_APK
                                             if (indeterminate) {
                                                 LinearProgressIndicator(
@@ -1756,7 +2002,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             }
                                             Spacer(Modifier.width(10.dp))
                                             Text(
-                                                text = if (indeterminate) "جارٍ التنفيذ" else "${(progress * 100f).toInt()}%",
+                                                text = formatInstallProgress(progressInfo),
                                                 style = MaterialTheme.typography.bodyMedium,
                                                 fontWeight = FontWeight.SemiBold
                                             )
@@ -1924,7 +2170,18 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onSearchFilterChange = { appSearch = it },
                                     selectedApp = selectedApp,
                                     onRefresh = {
-                                        uiScope.launch { refreshInstalledApps() }
+                                        startInstalledAppsScan()
+                                    },
+                                    onCancelScan = {
+                                        cancelInstalledAppsScan()
+                                    },
+                                    scanProgress = appScanProgress,
+                                    showAllApps = showAllQuestApps,
+                                    onShowAllAppsChange = { value ->
+                                        if (value != showAllQuestApps) {
+                                            showAllQuestApps = value
+                                            startInstalledAppsScan()
+                                        }
                                     },
                                     onSelectApp = { app ->
                                         selectedApp = app
@@ -1973,5 +2230,9 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 }
             }
         }
+    }
+        }
+    } finally {
+        instanceLock.close()
     }
 }

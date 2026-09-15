@@ -61,9 +61,11 @@ fun PcvrReadinessTab() {
                     systemInfo = newSystemInfo
                     message = when {
                         PcvrChecker.isReady(newChecks) ->
-                            "الكمبيوتر يطابق الفحوصات المتاحة مبدئيًا لتشغيل PCVR."
+                            if (newChecks.any { it.status == PcvrCheckStatus.UNKNOWN })
+                                "لا يوجد فشل معروف؛ بعض القياسات غير معروفة وتحتاج تحققًا يدويًا."
+                            else "الكمبيوتر يطابق الفحوصات المتاحة مبدئيًا لتشغيل PCVR."
                         newChecks.any { it.status == PcvrCheckStatus.UNKNOWN } ->
-                            "اكتمل الفحص، لكن تعذر التحقق من بعض البيانات؛ لا يمكن تأكيد جاهزية PCVR."
+                            "اكتمل الفحص، لكن تعذر التحقق من بعض البيانات."
                         else -> "اكتمل الفحص. راجع العناصر التي تحتاج إلى معالجة."
                     }
                     running = false
@@ -108,11 +110,17 @@ fun PcvrReadinessTab() {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            Text(
+                                "المتطلبات الرسمية من Meta: $META_PCVR_REQUIREMENTS_URL",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
                         }
                         if (checks.isNotEmpty()) {
                             StatusBadge(
                                 label = when {
                                     checks.any { it.status == PcvrCheckStatus.FAIL } -> "يحتاج إجراء"
+                                    PcvrChecker.isReady(checks) -> "جاهز مبدئيًا"
                                     checks.any { it.status == PcvrCheckStatus.UNKNOWN } -> "غير مكتمل"
                                     checks.any { it.status == PcvrCheckStatus.WARN } -> "تحذيرات"
                                     else -> "جاهز مبدئيًا"
@@ -226,6 +234,7 @@ private fun StatusBadge(label: String, color: Color) {
 private fun overallColor(checks: List<PcvrCheckResult>): Color =
     when {
         checks.any { it.status == PcvrCheckStatus.FAIL } -> Color(0xFFFF7777)
+        PcvrChecker.isReady(checks) -> Color(0xFF72D39A)
         checks.any { it.status == PcvrCheckStatus.WARN } -> Color(0xFFFFC857)
         checks.any { it.status == PcvrCheckStatus.UNKNOWN } -> Color(0xFFB8C4D0)
         else -> Color(0xFF72D39A)
@@ -254,8 +263,16 @@ private fun SystemSummary(info: PcvrSystemInfo) {
                 verticalArrangement = Arrangement.spacedBy(7.dp)
             ) {
                 InfoPill("النظام", info.windowsVersion)
-                InfoPill("المعالج", "${info.cpuCores} نواة • ${info.cpuName}")
-                InfoPill("الذاكرة", "${"%.1f".format(info.totalRamGb)} GB")
+                InfoPill(
+                    "المعالج",
+                    "${if (info.cpuCores > 0) "${info.cpuCores} نواة" else "الأنوية غير معروفة"} • " +
+                        "${if (info.cpuLogicalProcessors > 0) "${info.cpuLogicalProcessors} منطقية" else "المنطقية غير معروفة"} • " +
+                        info.cpuName
+                )
+                InfoPill(
+                    "الذاكرة",
+                    if (info.totalRamGb > 0.0) "${"%.1f".format(info.totalRamGb)} GB" else "غير معروفة"
+                )
                 InfoPill("البطاقة", info.gpuName)
                 if (info.gpuVramKnown) InfoPill("ذاكرة الرسوميات", "${"%.1f".format(info.gpuVramGb)} GB")
                 InfoPill("Quest Link", if (info.questLinkInstalled) "مثبّت" else "غير مثبّت")
@@ -345,6 +362,20 @@ private fun CheckResultCard(check: PcvrCheckResult) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary
                     )
+                }
+                if (check.detected.isNotBlank() || check.minimum.isNotBlank()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "المكتشف: ${check.detected.ifBlank { "غير معروف" }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            "الحد الأدنى: ${check.minimum.ifBlank { "غير معروف" }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
                 Text(
                     "التوصية: ${check.solution}",

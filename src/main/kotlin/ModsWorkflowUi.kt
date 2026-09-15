@@ -32,6 +32,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -58,6 +59,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.platform.LocalLayoutDirection
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun ModsWorkflowUi(
@@ -68,6 +72,10 @@ fun ModsWorkflowUi(
     onSearchFilterChange: (String) -> Unit,
     selectedApp: InstalledQuestApp?,
     onRefresh: () -> Unit,
+    onCancelScan: () -> Unit = {},
+    scanProgress: InstalledAppsScanProgress? = null,
+    showAllApps: Boolean = false,
+    onShowAllAppsChange: (Boolean) -> Unit = {},
     onSelectApp: (InstalledQuestApp) -> Unit,
     selectedZipFilename: String?,
     onChooseFile: () -> Unit,
@@ -94,16 +102,23 @@ fun ModsWorkflowUi(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 28.dp, vertical = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp)
             ) {
-                item { Header(connected, scanning, onRefresh) }
+                item { Header(connected, scanning, onRefresh, onCancelScan) }
+                if (scanning || scanProgress != null) {
+                    item { ScanStatus(scanProgress, scanning) }
+                }
                 item { WorkflowRail(connected, selectedApp != null, !selectedZipFilename.isNullOrBlank(), analysis != null, installing || executionProgress?.phase == ModsManager.ModInstallPhase.COMPLETED) }
                 item { StepTitle("01", "اختر اللعبة من النظارة", "قائمة الألعاب المثبتة من Quest — بدون إدخال مسارات يدوية") }
                 item {
                     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                             SearchBox(searchFilter, onSearchFilterChange)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(checked = showAllApps, onCheckedChange = onShowAllAppsChange)
+                                Text("إظهار تطبيقات النظام والخدمات الداخلية", style = MaterialTheme.typography.labelMedium)
+                            }
                             when {
-                                scanning -> LoadingApps()
-                                !connected -> EmptyState("النظارة غير متصلة", "اشبك Quest ووافق على USB Debugging، ثم حدّث الاتصال.", Icons.Default.Info)
+                                !connected && filteredApps.isEmpty() -> EmptyState("النظارة غير متصلة", "اشبك Quest ووافق على USB Debugging، ثم حدّث الاتصال.", Icons.Default.Info)
+                                scanning && filteredApps.isEmpty() -> LoadingApps()
                                 filteredApps.isEmpty() -> EmptyState("لا توجد ألعاب مطابقة", "جرّب كلمة بحث أخرى أو حدّث قائمة التطبيقات.", Icons.Default.Search)
                                 else -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     filteredApps.forEach { app ->
@@ -173,7 +188,12 @@ fun ModsWorkflowUi(
     }
 }
 
-@Composable private fun Header(connected: Boolean, scanning: Boolean, refresh: () -> Unit) {
+@Composable private fun Header(
+    connected: Boolean,
+    scanning: Boolean,
+    refresh: () -> Unit,
+    cancelScan: () -> Unit
+) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         Column(Modifier.weight(1f)) {
             Text("NFVR / QUEST INSTALLER", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
@@ -181,7 +201,46 @@ fun ModsWorkflowUi(
             Text(if (connected) "النظارة جاهزة للعمل. اختر لعبة للبدء." else "اتصل بنظارة Quest لفتح سير العمل.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         StatusPill(if (connected) "متصل" else "غير متصل", connected)
+        if (scanning) {
+            OutlinedButton(onClick = cancelScan) { Text("إلغاء الفحص") }
+        }
         IconButton(onClick = refresh, enabled = !scanning) { Icon(Icons.Default.Refresh, "تحديث") }
+    }
+}
+
+@Composable private fun ScanStatus(progress: InstalledAppsScanProgress?, scanning: Boolean) {
+    val value = progress
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                when {
+                    value?.cancelled == true -> "تم إلغاء فحص التطبيقات — تم الاحتفاظ بالنتائج الجزئية"
+                    scanning -> "جارٍ فحص التطبيقات المثبتة…"
+                    value?.error != null -> "تعذر تحديث فحص التطبيقات"
+                    else -> "اكتمل فحص التطبيقات"
+                },
+                style = MaterialTheme.typography.titleSmall
+            )
+            if (value != null) {
+                val total = value.total
+                val count = value.apps.size
+                Text(
+                    if (total == null) "تمت معالجة ${value.processed} تطبيقًا — النتائج الجزئية: $count"
+                    else "${value.processed} / $total — النتائج الحالية: $count" +
+                        (value.percent?.let { " — $it%" } ?: ""),
+                    style = MaterialTheme.typography.labelMedium
+                )
+                Text(
+                    "آخر تحديث: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(value.lastUpdatedMillis))}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (scanning) LinearProgressIndicator(
+                    progress = { (value.percent?.toFloat()?.div(100f) ?: 0f).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
     }
 }
 

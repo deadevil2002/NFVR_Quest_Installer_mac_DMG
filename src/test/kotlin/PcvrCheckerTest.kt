@@ -158,6 +158,101 @@ class PcvrCheckerTest {
     }
 
     @Test
+    fun nvidiaSmiMemoryAndDriverAreParsedInPreferenceToCimShape() {
+        val gpus = parseNvidiaSmiOutput(
+            listOf(
+                "NVIDIA GeForce RTX 4090 Laptop GPU, 16384, 551.86",
+                "NVIDIA GeForce RTX 4060 Laptop GPU, 8192 MiB, 552.12"
+            )
+        )
+
+        assertEquals(2, gpus.size)
+        assertEquals(16L * 1024L * 1024L * 1024L, gpus[0].adapterRamBytes)
+        assertEquals("551.86", gpus[0].driverVersion)
+        assertEquals(8L * 1024L * 1024L * 1024L, gpus[1].adapterRamBytes)
+    }
+
+    @Test
+    fun cpuRegistryOutputParserAcceptsRegExeFormatting() {
+        assertEquals(
+            "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
+            parseCpuRegistryProcessorName(
+                listOf(
+                    "HKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                    "    ProcessorNameString    REG_SZ    AMD Ryzen 7 7840HS w/ Radeon 780M Graphics"
+                )
+            )
+        )
+        assertNull(parseCpuRegistryOutput(listOf("ERROR: access denied")))
+    }
+
+    @Test
+    fun requirementsExposeDetectedAndMinimumValuesWithoutBlockingOnUnknown() {
+        val info = PcvrSystemInfo(
+            windowsVersion = "Windows 11 build 22631",
+            is64Bit = true,
+            totalRamGb = 32.0,
+            cpuName = "CPU",
+            cpuCores = 8,
+            gpuName = "NVIDIA GeForce RTX 4090 Laptop GPU",
+            gpuVramGb = 16.0,
+            gpuDriverVersion = "551.86",
+            questLinkInstalled = true,
+            steamInstalled = true,
+            steamvrInstalled = true,
+            openXrRuntime = "runtime.json",
+            usb3Available = true,
+            networkType = "Ethernet",
+            gpuVramKnown = true
+        )
+        val checks = PcvrChecker.evaluateRequirements(info)
+
+        assertTrue(checks.all { it.minimum.isNotBlank() })
+        assertTrue(checks.first { it.title == "ذاكرة الوصول العشوائي (RAM)" }
+            .detected.contains("32.0"))
+        assertTrue(PcvrChecker.isReady(listOf(
+            PcvrCheckResult("known", PcvrCheckStatus.PASS, "", ""),
+            PcvrCheckResult("optional probe", PcvrCheckStatus.UNKNOWN, "", "")
+        )))
+    }
+
+    @Test
+    fun gpuCompatibilityDoesNotBlanketPassGtxExceptions() {
+        fun resultFor(name: String, vramGb: Double) = PcvrChecker.evaluateGpu(
+            PcvrSystemInfo(
+                windowsVersion = "Windows 11",
+                is64Bit = true,
+                totalRamGb = 16.0,
+                cpuName = "CPU",
+                cpuCores = 8,
+                gpuName = name,
+                gpuVramGb = vramGb,
+                gpuDriverVersion = "driver",
+                questLinkInstalled = true,
+                steamInstalled = true,
+                steamvrInstalled = true,
+                openXrRuntime = "runtime.json",
+                usb3Available = true,
+                networkType = "Ethernet",
+                gpuVramKnown = true
+            )
+        )
+
+        assertEquals(
+            PcvrCheckStatus.PASS,
+            resultFor("NVIDIA GeForce RTX 4090 Laptop GPU", 16.0).status
+        )
+        assertEquals(
+            PcvrCheckStatus.WARN,
+            resultFor("NVIDIA GeForce GTX 1650", 4.0).status
+        )
+        assertEquals(
+            PcvrCheckStatus.WARN,
+            resultFor("NVIDIA GeForce GT 1030", 2.0).status
+        )
+    }
+
+    @Test
     fun commandFailureShapeDoesNotPretendToContainProbeData() {
         val failure = PcvrChecker.PcvrCommandResult(
             stdout = emptyList(),

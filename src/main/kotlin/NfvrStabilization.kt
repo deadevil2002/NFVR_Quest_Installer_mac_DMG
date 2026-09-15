@@ -1,4 +1,8 @@
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
 import java.time.Instant
 import java.util.zip.ZipFile
 
@@ -14,6 +18,143 @@ enum class AdbDeviceState {
     UNKNOWN
 }
 
+data class QuestBatteryInfo(
+    val percentage: Int?,
+    val charging: Boolean?,
+    val source: String?
+)
+
+/**
+ * Parses the small, stable portion of `dumpsys battery`.  Input is bounded so
+ * an unexpectedly verbose shell response can never become a UI payload.
+ */
+fun parseQuestBatteryDump(raw: String, maxChars: Int = 16_384): QuestBatteryInfo {
+    val text = raw.take(maxChars)
+    fun value(name: String): String? =
+        Regex("""(?im)^\s*$name\s*:\s*(.+?)\s*$""").find(text)?.groupValues?.getOrNull(1)?.trim()
+    val level = value("level")?.toIntOrNull()?.coerceIn(0, 100)
+    val status = value("status")?.lowercase()
+    val ac = value("AC powered")?.equals("true", ignoreCase = true) == true
+    val usb = value("USB powered")?.equals("true", ignoreCase = true) == true
+    val wireless = value("Wireless powered")?.equals("true", ignoreCase = true) == true
+    val charging = when {
+        status == "charging" || ac || usb || wireless -> true
+        status == "discharging" || status == "not charging" || status == "full" -> false
+        else -> null
+    }
+    val source = when {
+        ac -> "AC"
+        usb -> "USB"
+        wireless -> "لاسلكي"
+        else -> null
+    }
+    return QuestBatteryInfo(level, charging, source)
+}
+
+fun safeQuestOsVersion(raw: String, maxChars: Int = 4_096): String? {
+    val candidate = raw.take(maxChars).lineSequence()
+        .map { it.trim() }
+        .firstOrNull { it.isNotBlank() && it.length <= 160 }
+        ?.replace(Regex("""[\r\n\t]"""), " ")
+        ?.trim()
+    return candidate?.takeIf { it.matches(Regex("""[A-Za-z0-9 ._:/()\-+]+""")) }
+}
+
+enum class DeviceGuidanceState { AUTHORIZED, UNAUTHORIZED, OFFLINE, NO_DEVICE }
+
+fun deviceGuidanceState(rows: List<AdbDeviceRow>, authorized: Boolean): DeviceGuidanceState =
+    when {
+        authorized -> DeviceGuidanceState.AUTHORIZED
+        rows.isEmpty() -> DeviceGuidanceState.NO_DEVICE
+        rows.any { it.state == AdbDeviceState.UNAUTHORIZED } -> DeviceGuidanceState.UNAUTHORIZED
+        rows.any { it.state == AdbDeviceState.OFFLINE } -> DeviceGuidanceState.OFFLINE
+        else -> DeviceGuidanceState.UNAUTHORIZED
+    }
+
+fun maskLicenseKey(key: String?): String {
+    val value = key?.trim().orEmpty()
+    if (value.isBlank()) return "—"
+    if (value.length <= 8) return "•".repeat(value.length)
+    return value.take(4) + "•".repeat((value.length - 8).coerceAtLeast(4)) + value.takeLast(4)
+}
+
+data class InstallProgressState(
+    val measurable: Boolean,
+    val currentItem: String?,
+    val completed: Int,
+    val total: Int?
+) {
+    val percent: Int?
+        get() = if (measurable && total != null && total > 0) {
+            (completed.toDouble() / total * 100.0).toInt().coerceIn(0, 100)
+        } else null
+}
+
+fun formatInstallProgress(state: InstallProgressState): String = buildString {
+    state.currentItem?.takeIf { it.isNotBlank() }?.let { append(it) }
+    if (state.total != null && state.total > 0) {
+        if (isNotEmpty()) append(" — ")
+        append("${state.completed.coerceIn(0, state.total)} / ${state.total}")
+    }
+    state.percent?.let {
+        if (isNotEmpty()) append(" — ")
+        append("$it%")
+    }
+    if (isEmpty()) append("جارٍ التنفيذ")
+}
+
+/**
+ * OS file locking is per-user/session by virtue of living under user.home.
+ * The channel remains open for the lifetime of the returned guard.
+ */
+class NfvrSingleInstanceLock private constructor(
+    private val channel: FileChannel,
+    private val lock: FileLock,
+    val file: File
+) : AutoCloseable {
+    @Volatile private var closed = false
+
+    override fun close() {
+        if (closed) return
+        synchronized(this) {
+            if (closed) return
+            closed = true
+            runCatching { lock.release() }
+            runCatching { channel.close() }
+        }
+    }
+
+    companion object {
+        fun tryAcquire(file: File): NfvrSingleInstanceLock? {
+            file.parentFile?.mkdirs()
+            val channel = try {
+                RandomAccessFile(file, "rw").channel
+            } catch (_: Throwable) {
+                return null
+            }
+            return try {
+                val fileLock = try {
+                    channel.tryLock()
+                } catch (_: OverlappingFileLockException) {
+                    null
+                }
+                if (fileLock == null) {
+                    channel.close()
+                    null
+                } else {
+                    NfvrSingleInstanceLock(channel, fileLock, file)
+                }
+            } catch (_: Throwable) {
+                runCatching { channel.close() }
+                null
+            }
+        }
+
+        fun forCurrentUser(): NfvrSingleInstanceLock? =
+            tryAcquire(File(UserDataPaths.root, "nfvr-instance.lock"))
+    }
+}
+
 data class AdbDeviceRow(
     val serial: String,
     val state: AdbDeviceState,
@@ -25,6 +166,95 @@ data class AdbSelection(
     val selectedSerial: String?,
     val message: String
 )
+
+/**
+ * A scan is intentionally represented as a stream of immutable snapshots.
+ * `total` is nullable because ADB may not have supplied the package list yet;
+ * callers must not manufacture a percentage until it is known.
+ */
+data class InstalledAppsScanProgress(
+    val apps: List<InstalledQuestApp>,
+    val processed: Int,
+    val total: Int?,
+    val lastUpdatedMillis: Long = System.currentTimeMillis(),
+    val completed: Boolean = false,
+    val cancelled: Boolean = false,
+    val error: String? = null
+) {
+    val percent: Int?
+        get() = total?.takeIf { it > 0 }?.let {
+            ((processed.toDouble() / it.toDouble()) * 100.0).toInt().coerceIn(0, 100)
+        }
+}
+
+/**
+ * `pm list packages -3` already excludes most platform packages, but Meta's
+ * store/runtime and a few OEM services can still be reported as third party.
+ * Keep this list deliberately conservative: an unknown-source application is
+ * retained unless it is clearly an internal platform/runtime package.
+ */
+fun isQuestInternalPackage(packageName: String): Boolean {
+    val value = packageName.trim().lowercase()
+    if (value.isBlank()) return false
+    val exact = setOf(
+        "android",
+        "com.android.systemui",
+        "com.android.permissioncontroller",
+        "com.android.providers.settings",
+        "com.facebook.appmanager",
+        "com.facebook.services",
+        "com.facebook.system",
+        "com.oculus.accountscenter",
+        "com.oculus.horizon",
+        "com.oculus.shellenv",
+        "com.oculus.store",
+        "com.oculus.vrshell",
+        "com.meta.quest.services"
+    )
+    if (value in exact) return true
+    val internalPrefixes = listOf(
+        "android.",
+        "com.android.",
+        "com.google.android.",
+        "com.oculus.systemux.",
+        "com.oculus.shellenv.",
+        "com.oculus.vrshell.",
+        "com.qualcomm."
+    )
+    return internalPrefixes.any(value::startsWith)
+}
+
+fun shouldIncludeQuestPackage(packageName: String, showAll: Boolean = false): Boolean =
+    showAll || !isQuestInternalPackage(packageName)
+
+fun mergeInstalledAppSnapshot(
+    previous: List<InstalledQuestApp>,
+    incoming: List<InstalledQuestApp>
+): List<InstalledQuestApp> {
+    val oldByPackage = previous.associateBy { it.packageName }
+    val stableIncoming = incoming.map { candidate ->
+        val old = oldByPackage[candidate.packageName]
+        if (old != null &&
+            old.versionName == candidate.versionName &&
+            old.versionCode == candidate.versionCode &&
+            old.displayName == candidate.displayName &&
+            old.apkPath == candidate.apkPath &&
+            old.thirdParty == candidate.thirdParty
+        ) old else candidate
+    }
+    val byPackage = stableIncoming.associateBy { it.packageName }
+    // Existing rows retain their established order. New packages use the
+    // scanner's deterministic order and are appended without reshuffling the
+    // selection under the user's pointer.
+    return previous.mapNotNull { byPackage[it.packageName] } +
+        stableIncoming.filter { it.packageName !in oldByPackage }
+}
+
+fun stableSelectedPackage(
+    selectedPackageName: String?,
+    apps: List<InstalledQuestApp>
+): InstalledQuestApp? =
+    selectedPackageName?.let { packageId -> apps.firstOrNull { it.packageName == packageId } }
 
 fun parseAdbDeviceRows(devicesOutput: String): List<AdbDeviceRow> {
     val lines = devicesOutput.lines().map(String::trim)

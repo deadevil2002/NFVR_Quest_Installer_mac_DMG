@@ -4,8 +4,55 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import java.io.File
 
 class NfvrStabilizationTest {
+    @Test
+    fun parsesBoundedBatteryAndSafeOsValues() {
+        val battery = parseQuestBatteryDump(
+            "level: 87\nstatus: 2\nAC powered: false\nUSB powered: true\nWireless powered: false\n" +
+                "noise=".repeat(20_000)
+        )
+        assertEquals(87, battery.percentage)
+        assertEquals(true, battery.charging)
+        assertEquals("USB", battery.source)
+        assertEquals("Quest OS 64.0", safeQuestOsVersion("Quest OS 64.0\nsecret\n"))
+        assertNull(safeQuestOsVersion("<script>"))
+    }
+
+    @Test
+    fun authorizedDeviceNeedsNoSetupGuidanceAndLicenseIsMasked() {
+        assertEquals(DeviceGuidanceState.AUTHORIZED, deviceGuidanceState(
+            listOf(AdbDeviceRow("q", AdbDeviceState.DEVICE)), true
+        ))
+        assertEquals(DeviceGuidanceState.NO_DEVICE, deviceGuidanceState(emptyList(), false))
+        assertTrue(maskLicenseKey("ABCD-12345678-WXYZ").startsWith("ABCD"))
+        assertTrue(maskLicenseKey("ABCD-12345678-WXYZ").endsWith("WXYZ"))
+        assertTrue(!maskLicenseKey("ABCD-12345678-WXYZ").contains("12345678"))
+    }
+
+    @Test
+    fun installFormatterNeverInventsPercentForIndeterminateWork() {
+        val apk = formatInstallProgress(InstallProgressState(false, "APK", 0, 2))
+        assertTrue(apk.contains("APK") && apk.contains("0 / 2") && !apk.contains("%"))
+        assertEquals("OBB — 1 / 2 — 50%", formatInstallProgress(
+            InstallProgressState(true, "OBB", 1, 2)
+        ))
+        assertNull(InstallProgressState(false, "restart", 1, 2).percent)
+    }
+
+    @Test
+    fun secondLockIsRejectedAndReleaseAllowsAnotherTestOwner() {
+        val file = File.createTempFile("nfvr-lock-", ".lock")
+        val first = NfvrSingleInstanceLock.tryAcquire(file)
+        assertTrue(first != null)
+        assertNull(NfvrSingleInstanceLock.tryAcquire(file))
+        first!!.close()
+        val second = NfvrSingleInstanceLock.tryAcquire(file)
+        assertTrue(second != null)
+        second!!.close()
+        file.delete()
+    }
     @Test
     fun parsesEveryAdbStateWithoutChoosingTheFirstRow() {
         val result = selectAdbDevice(
@@ -89,5 +136,44 @@ class NfvrStabilizationTest {
             ).valid
         )
         apk.delete()
+    }
+
+    @Test
+    fun normalQuestFilterKeepsUnknownSourcesAndHidesInternalPackages() {
+        assertTrue(!shouldIncludeQuestPackage("com.oculus.store"))
+        assertTrue(!shouldIncludeQuestPackage("com.meta.quest.services"))
+        assertTrue(!shouldIncludeQuestPackage("com.oculus.accountscenter"))
+        assertTrue(shouldIncludeQuestPackage("com.oculus.legitimategame"))
+        assertTrue(shouldIncludeQuestPackage("com.example.service"))
+        assertTrue(shouldIncludeQuestPackage("com.indie.unknownsource"))
+        assertTrue(shouldIncludeQuestPackage("com.oculus.store", showAll = true))
+    }
+
+    @Test
+    fun appSnapshotKeepsStableObjectsOrderAndSelectionByPackageId() {
+        val old = InstalledQuestApp(
+            packageName = "com.example.old",
+            versionName = "1",
+            displayName = "Old"
+        )
+        val incomingOld = old.copy()
+        val incomingNew = InstalledQuestApp(
+            packageName = "com.example.new",
+            versionName = "1",
+            displayName = "New"
+        )
+        val merged = mergeInstalledAppSnapshot(
+            listOf(old),
+            listOf(incomingNew, incomingOld)
+        )
+        assertTrue(merged[0] === old)
+        assertEquals(listOf("com.example.old", "com.example.new"), merged.map { it.packageName })
+        assertTrue(stableSelectedPackage("com.example.old", merged) === old)
+    }
+
+    @Test
+    fun scanProgressDoesNotExposePercentBeforeTotalIsKnown() {
+        assertNull(InstalledAppsScanProgress(emptyList(), 2, null).percent)
+        assertEquals(50, InstalledAppsScanProgress(emptyList(), 2, 4).percent)
     }
 }

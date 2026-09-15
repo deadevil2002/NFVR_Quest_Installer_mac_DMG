@@ -18,12 +18,18 @@ enum class PcvrCheckStatus {
     PASS, WARN, FAIL, UNKNOWN
 }
 
+const val META_PCVR_REQUIREMENTS_URL = "https://www.meta.com/help/quest/140991407990979/"
+
 data class PcvrCheckResult(
     val title: String,
     val status: PcvrCheckStatus,
     val explanation: String,
     val solution: String,
-    val details: String = ""
+    val details: String = "",
+    /** The value detected by the probe, kept separate from the human explanation. */
+    val detected: String = "",
+    /** The minimum/recommended value used when evaluating this component. */
+    val minimum: String = ""
 )
 
 /*
@@ -74,6 +80,56 @@ data class PcvrGpuData(
     val adapterRamBytes: Long? = null,
     val driverVersion: String? = null
 )
+
+/**
+ * Parse the stable, read-only CSV shape emitted by nvidia-smi.  The parser is
+ * intentionally independent of Windows and of ProcessBuilder so it can be
+ * tested with captured output.  nvidia-smi reports memory in MiB for this
+ * query; a unit suffix is also accepted for older/local wrappers.
+ */
+fun parseNvidiaSmiOutput(lines: List<String>): List<PcvrGpuData> {
+    return lines.mapNotNull { raw ->
+        val line = raw.removePrefix("\uFEFF").trim()
+        if (line.isBlank() || line.startsWith("name,", true)) return@mapNotNull null
+        val fields = line.split(',')
+        if (fields.size < 3) return@mapNotNull null
+        val name = fields[0].trim().trim('"').takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val memory = parseNvidiaSmiMemoryBytes(fields[1].trim()) ?: return@mapNotNull null
+        val driver = fields.drop(2).joinToString(",").trim().trim('"').ifBlank { null }
+        PcvrGpuData(name, memory, driver)
+    }
+}
+
+fun parseNvidiaSmi(lines: List<String>): List<PcvrGpuData> = parseNvidiaSmiOutput(lines)
+
+private fun parseNvidiaSmiMemoryBytes(value: String): Long? {
+    val text = value.trim().replace(",", "")
+    val number = Regex("""\d+(?:\.\d+)?""").find(text)?.value?.toDoubleOrNull() ?: return null
+    val multiplier = when {
+        text.contains("gib", true) -> BYTES_PER_GIB
+        text.contains("gb", true) -> 1_000_000_000.0
+        text.contains("kib", true) -> 1024.0
+        else -> BYTES_PER_MIB
+    }
+    return (number * multiplier).toLong().takeIf { it > 0L }
+}
+
+private const val BYTES_PER_MIB = 1024.0 * 1024.0
+private const val BYTES_PER_GIB = 1024.0 * 1024.0 * 1024.0
+
+/** Extract ProcessorNameString from reg.exe output without depending on Windows APIs. */
+fun parseCpuRegistryProcessorName(lines: List<String>): String? {
+    val valuePattern = Regex(
+        """^\s*ProcessorNameString\s+(?:REG_\w+)\s+(.+?)\s*$""",
+        RegexOption.IGNORE_CASE
+    )
+    return lines.asSequence()
+        .mapNotNull { valuePattern.find(it)?.groupValues?.getOrNull(1)?.trim() }
+        .firstOrNull { it.isNotBlank() }
+}
+
+/** Alias with a protocol-oriented name useful to callers and tests. */
+fun parseCpuRegistryOutput(lines: List<String>): String? = parseCpuRegistryProcessorName(lines)
 
 /**
  * The probe deliberately has no platform types.  This makes its parser useful
@@ -224,6 +280,7 @@ private fun gpuModelScore(name: String): Int {
 object PcvrChecker {
     private const val UNKNOWN = "غير معروف"
     private const val POWERSHELL_TIMEOUT_MS = 20_000L
+    private const val NVIDIA_SMI_TIMEOUT_MS = 4_000L
     private const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
 
     suspend fun runQuickChecks(): Pair<List<PcvrCheckResult>, PcvrSystemInfo> =
@@ -234,14 +291,18 @@ object PcvrChecker {
 
     private fun runChecks(advanced: Boolean): Pair<List<PcvrCheckResult>, PcvrSystemInfo> {
         val info = gatherSystemInfo(advanced)
-        val results = mutableListOf(
+        val results = evaluateRequirements(info).toMutableList()
+        if (advanced) results += checkNetwork(info)
+        return results.map { withRequirements(it, info) } to info
+    }
+
+    /** Evaluate a supplied snapshot without probing the host again. */
+    fun evaluateRequirements(info: PcvrSystemInfo): List<PcvrCheckResult> =
+        listOf(
             checkWindowsVersion(info), checkRam(info), checkCpu(info), checkGpu(info),
             checkQuestLink(info), checkSteam(info), checkSteamvr(info), checkOpenXr(info),
             checkUsb3(info), checkSystemDrive(info)
-        )
-        if (advanced) results += checkNetwork(info)
-        return results to info
-    }
+        ).map { withRequirements(it, info) }
 
     private fun gatherSystemInfo(advanced: Boolean = false): PcvrSystemInfo {
         val windows = System.getProperty("os.name", "").contains("win", ignoreCase = true)
@@ -277,15 +338,27 @@ object PcvrChecker {
         val usb = data.usbControllers
         val usb3 = usb?.let { Regex("(?i)usb\\s*[3.]|xhci|superspeed").containsMatchIn(it) } ?: false
         val openXr = data.openXrRuntime ?: UNKNOWN
-        val gpuAdapters = data.gpus.ifEmpty {
-            listOfNotNull(data.gpuName?.let {
-                PcvrGpuData(it, data.gpuVramBytes, data.gpuDriver)
-            })
+        /*
+         * nvidia-smi is a read-only, bounded query and its memory value is
+         * reported by the NVIDIA driver rather than the frequently truncated
+         * Win32_VideoController.AdapterRAM field.  Use it as the complete
+         * NVIDIA adapter list whenever it returns valid rows.
+         */
+        val nvidiaSmiGpus = if (windows) queryNvidiaSmi() else emptyList()
+        val gpuAdapters = nvidiaSmiGpus.ifEmpty {
+            data.gpus.ifEmpty {
+                listOfNotNull(data.gpuName?.let {
+                    PcvrGpuData(it, data.gpuVramBytes, data.gpuDriver)
+                })
+            }
         }
         val selectedGpu = selectPcvrGpu(gpuAdapters)
         val selectedGpuRam = selectedGpu?.adapterRamBytes ?: data.gpuVramBytes
         val selectedGpuDriver = selectedGpu?.driverVersion ?: data.gpuDriver
-        val gpuVramKnown = selectedGpuRam?.let(::isReliableGpuVram) == true
+        val gpuVramKnown = selectedGpuRam?.let(::isReliableGpuVram) == true &&
+            (nvidiaSmiGpus.isNotEmpty() || !isSuspiciousModernGpuVram(
+                selectedGpu?.name.orEmpty(), selectedGpuRam
+            ))
         val freeGb = data.driveFreeBytes?.toDouble()?.div(BYTES_PER_GB) ?: 0.0
         val drivePercent = if (data.driveFreeBytes != null && data.driveSizeBytes != null &&
             data.driveSizeBytes > 0L
@@ -295,7 +368,7 @@ object PcvrChecker {
                 .joinToString(" ").ifBlank { UNKNOWN },
             is64Bit = data.osArchitecture?.contains("64", true) == true,
             totalRamGb = data.totalRamBytes?.toDouble()?.div(BYTES_PER_GB) ?: 0.0,
-            cpuName = data.cpuName ?: UNKNOWN, cpuCores = data.cpuCores ?: 0,
+            cpuName = data.cpuName ?: UNKNOWN, cpuCores = data.cpuCores?.takeIf { it > 0 } ?: 0,
             gpuName = selectedGpu?.name ?: UNKNOWN,
             gpuVramGb = if (gpuVramKnown) selectedGpuRam!!.toDouble().div(BYTES_PER_GB) else 0.0,
             gpuDriverVersion = selectedGpuDriver ?: UNKNOWN,
@@ -305,7 +378,7 @@ object PcvrChecker {
             openXrRuntime = openXr, usb3Available = usb3, networkType = networkType,
             wifiType = if (networkType == "Wi-Fi") networkDescription else "",
             windowsBuild = data.osBuild.orEmpty(), windowsArchitecture = data.osArchitecture.orEmpty(),
-            cpuLogicalProcessors = data.cpuLogicalProcessors ?: 0,
+            cpuLogicalProcessors = data.cpuLogicalProcessors?.takeIf { it > 0 } ?: 0,
             cpuArchitecture = data.cpuArchitecture?.let(::cpuArchitectureName).orEmpty(),
             availableRamGb = data.availableRamKb?.toDouble()?.div(1024.0 * 1024.0) ?: 0.0,
             systemDriveFreeGb = freeGb, systemDriveFreePercent = drivePercent,
@@ -325,6 +398,28 @@ object PcvrChecker {
         // 0xffffffff is its overflow/sentinel value.  Do not reject genuine
         // 8/12/16GB values supplied by a provider that exposes UInt64.
         bytes > 0L && bytes <= 256L * 1024L * 1024L * 1024L && bytes != 0xFFFF_FFFFL
+
+    private fun isSuspiciousModernGpuVram(name: String, bytes: Long): Boolean {
+        if (bytes > 4L * 1024L * 1024L * 1024L) return false
+        val n = name.lowercase(Locale.ROOT)
+        return (n.contains("nvidia") && Regex("""\b(?:rtx|geforce)\s*(?:30|40|50)\d{2}""").containsMatchIn(n)) ||
+            (n.contains("radeon") && Regex("""\brx\s*(?:5|6|7)\d{3}""").containsMatchIn(n))
+    }
+
+    private fun queryNvidiaSmi(): List<PcvrGpuData> {
+        val result = runCatching {
+            runPcvrCommand(
+                listOf(
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total,driver_version",
+                    "--format=csv,noheader,nounits"
+                ),
+                NVIDIA_SMI_TIMEOUT_MS
+            )
+        }.getOrNull() ?: return emptyList()
+        if (result.timedOut || result.exitCode != 0) return emptyList()
+        return parseNvidiaSmiOutput(result.stdout)
+    }
 
     /**
      * A command result intentionally keeps stdout, stderr, exit status and
@@ -456,7 +551,17 @@ object PcvrChecker {
         val store = root?.let { runCatching { Files.getFileStore(it) }.getOrNull() }
         val logical = Runtime.getRuntime().availableProcessors().takeIf { it > 0 }
         val arch = System.getProperty("os.arch").orEmpty().ifBlank { null }
-        val cpuName = System.getenv("PROCESSOR_IDENTIFIER")?.trim()?.ifBlank { null }
+        /*
+         * PROCESSOR_IDENTIFIER is often generic on branded laptops.  The
+         * registry value is a read-only Windows fallback and contains the
+         * actual model string when CIM is unavailable.
+         */
+        val registryCpuName = registryValue(
+            "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            "ProcessorNameString"
+        )
+        val cpuName = registryCpuName?.trim()?.ifBlank { null }
+            ?: System.getenv("PROCESSOR_IDENTIFIER")?.trim()?.ifBlank { null }
 
         val questCandidates = listOfNotNull(
             System.getenv("ProgramFiles")?.let { Path.of(it, "Oculus") },
@@ -675,11 +780,11 @@ object PcvrChecker {
         info.totalRamGb <= 0.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.UNKNOWN,
             "تعذر قراءة الذاكرة الفعلية من Windows.", "تحقق من حجم الذاكرة من إعدادات Windows ثم أعد الفحص.")
         info.totalRamGb >= 16.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.PASS,
-            ramExplanation(info), "16GB أو أكثر مناسبة مبدئيًا لمعظم ألعاب PCVR.")
-        info.totalRamGb >= 12.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.WARN,
-            ramExplanation(info), "يُنصح بترقية الذاكرة إلى 16GB.")
+            ramExplanation(info), "تتجاوز الحد الأدنى 8GB وتناسب معظم ألعاب PCVR.")
+        info.totalRamGb >= 8.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.WARN,
+            ramExplanation(info), "تستوفي الحد الأدنى 8GB؛ يوصى بـ 16GB للألعاب الثقيلة.")
         else -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.FAIL,
-            ramExplanation(info), "PCVR يحتاج عادةً إلى 16GB على الأقل.")
+            ramExplanation(info), "الحد الأدنى لـ Meta Quest Link هو 8GB.")
     }
 
     private fun ramExplanation(info: PcvrSystemInfo): String =
@@ -715,15 +820,28 @@ object PcvrChecker {
         isIntegratedGpuName(info.gpuName) ->
             result("كارت الشاشة (GPU)", PcvrCheckStatus.FAIL, "${gpuExplanation(info)} (مدمج)",
                 "PCVR يتطلب عادةً كارت شاشة منفصل.")
+        info.gpuVramKnown && isSuspiciousModernGpuVram(
+            info.gpuName, (info.gpuVramGb * BYTES_PER_GB).toLong()
+        ) -> result("كارت الشاشة (GPU)", PcvrCheckStatus.WARN,
+            "${info.gpuName} (قيمة CIM/AdapterRAM متناقضة: ${"%.1f".format(Locale.US, info.gpuVramGb)} GB).",
+            "تعذر الوثوق بـ AdapterRAM؛ تحقق من VRAM عبر تعريف NVIDIA أو nvidia-smi.")
         !info.gpuVramKnown -> result("كارت الشاشة (GPU)", PcvrCheckStatus.WARN,
             "${info.gpuName} (تعذر الوثوق بقيمة AdapterRAM؛ قد تكون VRAM أكبر من 4GB).",
             "تحقق من VRAM في تعريف NVIDIA/AMD/Intel أو أداة الشركة؛ لم يتم اعتبارها فشلًا.")
-        info.gpuVramGb < 4.0 -> result("كارت الشاشة (GPU)", PcvrCheckStatus.FAIL,
-            gpuExplanation(info), "يُنصح بذاكرة رسومية فعلية 6GB أو أكثر.")
-        info.gpuVramGb < 6.0 -> result("كارت الشاشة (GPU)", PcvrCheckStatus.WARN,
-            gpuExplanation(info), "قد تحتاج الألعاب الثقيلة إلى خفض إعدادات الرسوميات.")
-        else -> result("كارت الشاشة (GPU)", PcvrCheckStatus.PASS, gpuExplanation(info),
-            "ذاكرة الرسوميات المقروءة مناسبة مبدئيًا.")
+        isKnownSupportedGpuFamily(info.gpuName) ->
+            result("كارت الشاشة (GPU)", PcvrCheckStatus.PASS, gpuExplanation(info),
+                "ينتمي المحول إلى عائلة مدعومة لـ Meta Quest Link؛ راجع قائمة Meta الحالية للطراز الدقيق.")
+        else -> result("كارت الشاشة (GPU)", PcvrCheckStatus.WARN, gpuExplanation(info),
+            "لا تكفي سعة VRAM وحدها للحكم؛ تحقق من توافق الطراز في قائمة Meta Quest Link الحالية.")
+    }
+
+    private fun isKnownSupportedGpuFamily(name: String): Boolean {
+        val n = name.lowercase(Locale.ROOT)
+        // The acceptance evidence and Meta guidance explicitly establish the
+        // RTX 4000 series as compatible. Other families contain model-specific
+        // exceptions, so keep them WARN unless a maintained compatibility
+        // table positively identifies the exact model.
+        return Regex("""\brtx\s*4\d{3}""").containsMatchIn(n)
     }
 
     private fun isRemoteGpuName(name: String): Boolean {
@@ -831,6 +949,49 @@ object PcvrChecker {
     private fun linkText(mbps: Double) =
         if (mbps > 0.0) "${"%.0f".format(Locale.US, mbps)} Mbps" else "سرعة غير معروفة"
 
+    /**
+     * Keep the probe's detected value and the requirement visible as separate
+     * fields.  This prevents a localized explanation from being mistaken for
+     * a measured value and gives the UI/report one consistent data model.
+     */
+    private fun withRequirements(
+        check: PcvrCheckResult,
+        info: PcvrSystemInfo
+    ): PcvrCheckResult {
+        val values = when (check.title) {
+            "نظام التشغيل" ->
+                (info.windowsVersion to "Windows 10/11 64-bit")
+            "ذاكرة الوصول العشوائي (RAM)" ->
+                ("${"%.1f".format(Locale.US, info.totalRamGb)} GB" to "8 GB minimum (16 GB recommended)")
+            "المعالج (CPU)" ->
+                (cpuExplanation(info) to "4 physical cores; x64/ARM64")
+            "كارت الشاشة (GPU)" ->
+                (gpuExplanation(info) to "GPU supported by the current Meta Quest Link compatibility list")
+            "Meta Quest Link" ->
+                ((if (!info.questLinkKnown) UNKNOWN else if (info.questLinkInstalled) "Installed" else "Not installed")
+                    to "Meta Quest Link installed")
+            "Steam" ->
+                ((if (!info.steamKnown) UNKNOWN else if (info.steamInstalled) "Installed" else "Not installed")
+                    to "Steam installed")
+            "SteamVR" ->
+                ((if (!info.steamvrKnown) UNKNOWN else if (info.steamvrInstalled) "Installed" else "Not installed")
+                    to "SteamVR installed")
+            "OpenXR Active Runtime" ->
+                ((if (info.openXrKnown) info.openXrRuntime else UNKNOWN) to "An active OpenXR runtime")
+            "USB 3.x" ->
+                ((if (info.usb3Known && info.usb3Available) "Detected" else UNKNOWN) to "USB 3.x controller")
+            "مساحة قرص النظام" ->
+                ("${"%.1f".format(Locale.US, info.systemDriveFreeGb)} GB free" to "10 GB free")
+            "نوع الاتصال" ->
+                ((if (info.networkKnown) info.networkType else UNKNOWN) to "Stable Ethernet or Wi-Fi")
+            else -> (check.detected to check.minimum)
+        }
+        return check.copy(
+            detected = check.detected.ifBlank { values.first },
+            minimum = check.minimum.ifBlank { values.second }
+        )
+    }
+
     private fun result(title: String, status: PcvrCheckStatus, explanation: String,
                        solution: String, details: String = "") =
         PcvrCheckResult(title, status, explanation, solution, details)
@@ -871,6 +1032,10 @@ object PcvrChecker {
                 PcvrCheckStatus.UNKNOWN -> "❓"
             }
             sb.appendLine("$symbol ${it.title}")
+            if (it.detected.isNotBlank() || it.minimum.isNotBlank()) {
+                sb.appendLine("   detected: ${it.detected.ifBlank { UNKNOWN }}")
+                sb.appendLine("   minimum: ${it.minimum.ifBlank { UNKNOWN }}")
+            }
             sb.appendLine("   التفاصيل: ${it.explanation}")
             sb.appendLine("   الحل: ${it.solution}").appendLine()
         }
@@ -880,9 +1045,15 @@ object PcvrChecker {
         return sb.toString()
     }
 
-    /** Unknown and warning results must never be presented as definitive readiness. */
+    /**
+     * UNKNOWN means that a probe could not answer; it is not evidence that the
+     * machine is unsuitable.  A known FAIL is the only blocking result.  Keep
+     * UNKNOWN-only/empty lists non-ready so an empty result cannot look healthy.
+     */
     fun isReady(checks: List<PcvrCheckResult>): Boolean =
-        checks.isNotEmpty() && checks.all { it.status == PcvrCheckStatus.PASS }
+        checks.isNotEmpty() &&
+            checks.any { it.status == PcvrCheckStatus.PASS } &&
+            checks.none { it.status == PcvrCheckStatus.FAIL }
 
     private val PROBE_SCRIPT = """
 @@ErrorActionPreference = 'SilentlyContinue'
@@ -904,8 +1075,12 @@ Emit OS_ARCH @@os.OSArchitecture
 @@cpus = TryCim 'Win32_Processor'
 if (@@cpus.Count -gt 0) {
   Emit CPU_NAME @@cpus[0].Name
-  Emit CPU_CORES ((@@cpus | Measure-Object NumberOfCores -Sum).Sum)
-  Emit CPU_LOGICAL ((@@cpus | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+  @@coreCount = ((@@cpus | Where-Object { @@_.NumberOfCores -as [int] -gt 0 } |
+    Measure-Object NumberOfCores -Sum).Sum)
+  if (@@coreCount -gt 0) { Emit CPU_CORES @@coreCount }
+  @@logicalCount = ((@@cpus | Where-Object { @@_.NumberOfLogicalProcessors -as [int] -gt 0 } |
+    Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+  if (@@logicalCount -gt 0) { Emit CPU_LOGICAL @@logicalCount }
   Emit CPU_ARCH @@cpus[0].Architecture
 }
 @@computer = @(TryCim 'Win32_ComputerSystem') | Select-Object -First 1

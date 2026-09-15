@@ -4,6 +4,11 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.security.MessageDigest
 import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 
 data class GameInfo(
     val name: String,
@@ -219,32 +224,65 @@ class ModsManager(private val adbClient: AdbClient) {
         installedApp: InstalledQuestApp? = null
     ): ModPackageAnalysis = ModPackageAnalyzer().analyze(zipFile, installedApp)
 
-    suspend fun scanInstalledQuestApps(serial: String): List<InstalledQuestApp> {
-        val listed = adbClient.shell(serial, "pm", "list", "packages", "-3", "-f")
-        if (listed.exit != 0) return emptyList()
+    suspend fun scanInstalledQuestApps(
+        serial: String,
+        showAll: Boolean = false,
+        onProgress: (InstalledAppsScanProgress) -> Unit = {}
+    ): List<InstalledQuestApp> = withContext(Dispatchers.IO) {
+        fun emit(progress: InstalledAppsScanProgress) {
+            // A UI observer must never be able to abort the ADB scan.
+            runCatching { onProgress(progress) }
+        }
 
-        return listed.out.lineSequence()
+        val listed = runInterruptible(Dispatchers.IO) {
+            adbClient.shell(serial, "pm", "list", "packages", "-3", "-f")
+        }
+        if (listed.exit != 0) {
+            emit(InstalledAppsScanProgress(emptyList(), 0, 0, completed = true, error = listed.err))
+            return@withContext emptyList()
+        }
+
+        val packages = listed.out.lineSequence()
             .mapNotNull(::parsePackageListLine)
             .distinctBy { it.first }
+            .filter { showAll || shouldIncludeQuestPackage(it.first) }
             .take(250)
-            .map { (packageId, apkPath) ->
-                val details = adbClient.shell(serial, "dumpsys", "package", packageId)
-                val versionName = findPackageValue(details.out, "versionName")
-                val versionCode = Regex("""versionCode=(\d+)""")
-                    .find(details.out)?.groupValues?.getOrNull(1)?.toLongOrNull()
-                val profileName = GameModProfileRegistry.findByPackageId(packageId)?.displayName
-                val label = findBestLabel(details.out) ?: profileName ?: packageId.substringAfterLast('.')
-                InstalledQuestApp(
-                    packageName = packageId,
-                    versionName = versionName,
-                    versionCode = versionCode,
-                    displayName = label,
-                    apkPath = apkPath,
-                    thirdParty = true
-                )
-            }
-            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName ?: it.packageName })
             .toList()
+        val total = packages.size
+        var processed = 0
+        val discovered = mutableListOf<InstalledQuestApp>()
+        emit(InstalledAppsScanProgress(emptyList(), 0, total))
+
+        for ((packageId, apkPath) in packages) {
+            currentCoroutineContext().ensureActive()
+            val details = runInterruptible(Dispatchers.IO) {
+                adbClient.shell(serial, "dumpsys", "package", packageId)
+            }
+            val versionName = findPackageValue(details.out, "versionName")
+            val versionCode = Regex("""versionCode=(\d+)""")
+                .find(details.out)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            val profileName = GameModProfileRegistry.findByPackageId(packageId)?.displayName
+            val label = findBestLabel(details.out) ?: profileName ?: packageId.substringAfterLast('.')
+            discovered += InstalledQuestApp(
+                packageName = packageId,
+                versionName = versionName,
+                versionCode = versionCode,
+                displayName = label,
+                apkPath = apkPath,
+                thirdParty = true
+            )
+            processed++
+            emit(InstalledAppsScanProgress(discovered.toList(), processed, total))
+        }
+
+        val sorted = discovered.sortedWith(
+            compareBy<InstalledQuestApp, String>(String.CASE_INSENSITIVE_ORDER) {
+                it.displayName ?: it.packageName
+            }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.packageName }
+        )
+        emit(InstalledAppsScanProgress(sorted, total, total, completed = true))
+        sorted
     }
 
     suspend fun executeInstallPlan(
