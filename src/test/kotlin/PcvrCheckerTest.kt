@@ -1,6 +1,7 @@
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PcvrCheckerTest {
@@ -108,5 +109,95 @@ class PcvrCheckerTest {
         )
 
         assertEquals(PcvrCheckStatus.WARN, result.status)
+    }
+
+    @Test
+    fun partialCimOutputKeepsFallbackSectionsAndUnknowns() {
+        val cim = parsePcvrProbeOutput(
+            listOf(
+                "OS_CAPTION\tMicrosoft Windows 11 Pro",
+                "CPU_NAME\tAMD Ryzen 7 7800X3D",
+                "GPU_NAME\t",
+                "QUEST_INSTALLED\t__UNKNOWN__",
+                "STEAM_INSTALLED\tfalse"
+            )
+        )
+        val fallback = PcvrProbeData(
+            cpuLogicalProcessors = 16,
+            driveFreeBytes = 50_000_000_000L,
+            driveSizeBytes = 500_000_000_000L,
+            questInstalled = true,
+            questPath = "C:\\Program Files\\Oculus",
+            openXrRuntime = "C:\\OpenXR\\runtime.json"
+        )
+
+        val merged = PcvrChecker.mergePcvrProbeData(cim, fallback)
+
+        assertEquals("AMD Ryzen 7 7800X3D", merged.cpuName)
+        assertEquals(16, merged.cpuLogicalProcessors)
+        assertEquals(true, merged.questInstalled)
+        assertEquals("C:\\OpenXR\\runtime.json", merged.openXrRuntime)
+        assertNull(merged.gpuName)
+        assertEquals(false, merged.steamInstalled)
+    }
+
+    @Test
+    fun malformedAndOverflowingGpuRamIsUnknownNotNegative() {
+        val data = parsePcvrProbeOutput(
+            listOf(
+                "GPU\tNVIDIA GeForce RTX 4090\t-1\t551.23",
+                "GPU\tAMD Radeon RX 7900 XTX\t999999999999999999999999\t24.1",
+                "GPU_VRAM_BYTES\t12884901888"
+            )
+        )
+
+        assertEquals(2, data.gpus.size)
+        assertNull(data.gpus[0].adapterRamBytes)
+        assertNull(data.gpus[1].adapterRamBytes)
+        assertEquals(12884901888L, data.gpuVramBytes)
+    }
+
+    @Test
+    fun commandFailureShapeDoesNotPretendToContainProbeData() {
+        val failure = PcvrChecker.PcvrCommandResult(
+            stdout = emptyList(),
+            stderr = listOf("Get-CimInstance: provider unavailable"),
+            exitCode = 1,
+            timedOut = false
+        )
+
+        assertTrue(failure.stdout.isEmpty())
+        assertEquals(1, failure.exitCode)
+        assertFalse(failure.timedOut)
+    }
+
+    @Test
+    fun registryCommandFailureRemainsUnknown() {
+        val failure = PcvrChecker.registryPresence(
+            PcvrChecker.PcvrCommandResult(
+                stdout = emptyList(),
+                stderr = listOf("reg.exe is not recognized as a command"),
+                exitCode = 1,
+                timedOut = false
+            )
+        )
+
+        assertNull(failure.present)
+        assertNull(PcvrChecker.combinePcvrPresence(listOf(failure.present)))
+    }
+
+    @Test
+    fun successfulRegistryNotFoundIsDefinitivelyAbsent() {
+        val notFound = PcvrChecker.registryPresence(
+            PcvrChecker.PcvrCommandResult(
+                stdout = emptyList(),
+                stderr = listOf("ERROR: The system was unable to find the specified registry key or value."),
+                exitCode = 1,
+                timedOut = false
+            )
+        )
+
+        assertFalse(notFound.present ?: true)
+        assertEquals(false, PcvrChecker.combinePcvrPresence(listOf(notFound.present)))
     }
 }

@@ -26,6 +26,7 @@ import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.application
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
@@ -52,7 +53,8 @@ private data class GameEntry(
     val folder: File,
     val apk: File,
     val obbDirs: List<File>,
-    val requiredBytes: Long
+    val requiredBytes: Long,
+    val packageName: String?
 )
 
 data class CmdResult(val exit: Int, val out: String, val err: String)
@@ -519,24 +521,6 @@ open fun pushWithProgress(
     }
 }
 
-private fun parseFirstDevice(devicesOutput: String): Pair<String, Boolean>? {
-    val lines = devicesOutput.lines().map { it.trim() }.filter { it.isNotBlank() }
-    val dataLines = lines.dropWhile { !it.startsWith("List of devices") }.drop(1)
-
-    for (ln in dataLines) {
-        val parts = ln.split(Regex("\\s+"))
-        if (parts.isEmpty()) continue
-        val serial = parts[0]
-        val state = parts.getOrNull(1) ?: continue
-        return when (state) {
-            "device" -> serial to true
-            "unauthorized" -> serial to false
-            else -> null
-        }
-    }
-    return null
-}
-
 private fun parseDfToGb(dfOutput: String): Pair<Double, Double>? {
     val lines = dfOutput.lines().map { it.trim() }.filter { it.isNotBlank() }
     if (lines.size < 2) return null
@@ -563,15 +547,22 @@ private fun scanGameFolder(folder: File): GameEntry? {
     }
 
     val required = apk.length() + obbDirs.sumOf { dirSizeBytes(it) }
-    return GameEntry(folder = folder, apk = apk, obbDirs = obbDirs, requiredBytes = required)
+    return GameEntry(
+        folder = folder,
+        apk = apk,
+        obbDirs = obbDirs,
+        requiredBytes = required,
+        packageName = readApkPackageName(apk)
+    )
 }
 
-private fun chooseFolder(): File? {
+private fun chooseFolder(initialDirectory: File? = null): File? {
     UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
     val fc = JFileChooser()
     fc.fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
     fc.isAcceptAllFileFilterUsed = false
     fc.dialogTitle = "اختر مجلد اللعبة"
+    initialDirectory?.takeIf { it.isDirectory }?.let { fc.currentDirectory = it }
     val result = fc.showOpenDialog(null)
     return if (result == JFileChooser.APPROVE_OPTION) fc.selectedFile else null
 }
@@ -627,7 +618,8 @@ fun main() = application {
     var statusText by remember { mutableStateOf("الحالة: جاهز") }
     var warningText by remember { mutableStateOf<String?>(null) }
 
-    var folders by remember { mutableStateOf(listOf<File>()) }
+    var savedPaths by remember { mutableStateOf(PathPreferences()) }
+    var folders by remember { mutableStateOf(emptyList<File>()) }
     var queue by remember { mutableStateOf<List<GameEntry>>(emptyList()) }
     var gamesLogAutoScroll by remember { mutableStateOf(true) }
     var gameToRemove by remember { mutableStateOf<GameEntry?>(null) }
@@ -635,6 +627,7 @@ fun main() = application {
     var isInstalling by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
     var progressLabel by remember { mutableStateOf("—") }
+    var installPhase by remember { mutableStateOf(GameInstallPhase.IDLE) }
 
     var logText by remember { mutableStateOf("") }
     var showRestart by remember { mutableStateOf(false) }
@@ -647,11 +640,17 @@ fun main() = application {
     var appSearch by remember { mutableStateOf("") }
     var scanningApps by remember { mutableStateOf(false) }
     var modZipFile by remember { mutableStateOf<File?>(null) }
+    var lastModArchiveDirectory by remember { mutableStateOf<File?>(null) }
     var modAnalysis by remember { mutableStateOf<ModPackageAnalysis?>(null) }
     var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
     var modLogText by remember { mutableStateOf("") }
+    val activityHistory = remember { BoundedActivityHistory() }
+    val uiScope = rememberCoroutineScope()
+    val appScanMutex = remember { Mutex() }
+    val installMutex = remember { Mutex() }
+    var activityEvents by remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
 
     // ===== LICENSE UI STATE =====
     var licenseKeyInput by remember { mutableStateOf("") }
@@ -673,16 +672,31 @@ fun main() = application {
         }
     }
 
-    fun appendLog(line: String) {
+    fun appendLog(line: String, stdout: String = "", stderr: String = "") {
         logText += if (logText.isBlank()) line else "\n$line"
         if (logText.length > 100_000) logText = logText.takeLast(100_000)
-        DiagnosticLogger.info(line)
+        val event = ActivityEvent(
+            phase = installPhase,
+            message = line,
+            stdout = stdout.take(12_000),
+            stderr = stderr.take(12_000)
+        )
+        activityHistory.add(event)
+        activityEvents = activityHistory.snapshot()
+        uiScope.launch {
+            withContext(Dispatchers.IO) {
+                ActivityHistoryStore.append(event)
+                DiagnosticLogger.info(line)
+            }
+        }
     }
 
     fun appendModLog(line: String) {
         modLogText += if (modLogText.isBlank()) line else "\n$line"
         if (modLogText.length > 100_000) modLogText = modLogText.takeLast(100_000)
-        DiagnosticLogger.info(line)
+        uiScope.launch {
+            withContext(Dispatchers.IO) { DiagnosticLogger.info(line) }
+        }
     }
 
     fun openUrl(url: String) {
@@ -695,35 +709,38 @@ fun main() = application {
         }
     }
 
-    fun rebuildQueue() {
-        queue = folders.mapNotNull { scanGameFolder(it) }
+    suspend fun rebuildQueueOnIo() {
+        val scanned = withContext(Dispatchers.IO) {
+            folders.mapNotNull { scanGameFolder(it) }
+        }
+        queue = scanned
     }
 
-    fun chooseModFile(): File? {
+    fun chooseModFile(initialDirectory: File? = null): File? {
         UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
         val fc = JFileChooser()
         fc.fileSelectionMode = JFileChooser.FILES_ONLY
         fc.isAcceptAllFileFilterUsed = false
         fc.fileFilter = javax.swing.filechooser.FileNameExtensionFilter("ZIP Files", "zip")
         fc.dialogTitle = "اختر ملف المود (ZIP)"
+        initialDirectory?.takeIf { it.isDirectory }?.let { fc.currentDirectory = it }
         val result = fc.showOpenDialog(null)
         return if (result == JFileChooser.APPROVE_OPTION) fc.selectedFile else null
     }
 
     suspend fun getAuthorizedSerialOrNull(): String? {
-        val dev = adb.devices()
-        val parsed = parseFirstDevice(dev.out) ?: return null
-        val (serial, authorized) = parsed
-        return if (authorized) serial else null
+        val dev = withContext(Dispatchers.IO) { adb.devices() }
+        return selectAdbDevice(dev.out).selectedSerial
     }
 
-    suspend fun getFreeGb(serial: String): Double {
-        val dfRes = adb.shell(serial, "df", "-k", "/data")
-        val pair = parseDfToGb(dfRes.out) ?: return 0.0
+    suspend fun getFreeGb(serial: String): Double? {
+        val dfRes = withContext(Dispatchers.IO) { adb.shell(serial, "df", "-k", "/data") }
+        val pair = parseDfToGb(dfRes.out) ?: return null
         return pair.second
     }
 
     suspend fun refreshInstalledApps() {
+        if (!appScanMutex.tryLock()) return
         scanningApps = true
         try {
             val serial = getAuthorizedSerialOrNull()
@@ -732,7 +749,9 @@ fun main() = application {
                 selectedApp = null
                 return
             }
-            installedApps = modsManager.scanInstalledQuestApps(serial)
+            installedApps = withContext(Dispatchers.IO) {
+                modsManager.scanInstalledQuestApps(serial)
+            }
             selectedApp = selectedApp?.let { selected ->
                 installedApps.firstOrNull { it.packageName == selected.packageName }
             }
@@ -742,6 +761,7 @@ fun main() = application {
             DiagnosticLogger.error("فشل فحص تطبيقات Quest المثبتة", e)
         } finally {
             scanningApps = false
+            appScanMutex.unlock()
         }
     }
 
@@ -750,7 +770,9 @@ fun main() = application {
         analyzingMod = true
         modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.ANALYZING, null, "تحليل بنية الحزمة وبياناتها")
         try {
-            val analysis = modsManager.analyzeModPackage(file, selectedApp)
+            val analysis = withContext(Dispatchers.IO) {
+                modsManager.analyzeModPackage(file, selectedApp)
+            }
             modAnalysis = analysis
             appendModLog("تحليل الحزمة: ${analysis.packageType} — ${analysis.message}")
         } catch (e: Exception) {
@@ -773,29 +795,35 @@ fun main() = application {
 
     suspend fun refreshDeviceInfo() {
         try {
-            adb.startServer()
-            val dev = adb.devices()
-            val parsed = parseFirstDevice(dev.out)
-
-            if (parsed == null) {
+            withContext(Dispatchers.IO) { adb.startServer() }
+            val dev = withContext(Dispatchers.IO) { adb.devices() }
+            val selection = selectAdbDevice(dev.out)
+            val rows = selection.rows
+            if (rows.isEmpty()) {
                 hasAuthorizedDevice = false
                 connectionText = "الاتصال: لا يوجد جهاز متصل"
                 deviceText = "—"
                 storageText = "—"
                 pausedBecauseDisconnected = isInstalling
-                if (isInstalling) statusText = "الحالة: توقف مؤقت — اشبك النظارة بالسلك"
+                if (isInstalling) {
+                    installPhase = GameInstallPhase.PAUSED
+                    statusText = "الحالة: توقف مؤقت — اشبك النظارة بالسلك"
+                }
                 return
             }
 
-            val (serial, authorized) = parsed
-            if (!authorized) {
+            val serial = selection.selectedSerial
+            if (serial == null) {
                 hasAuthorizedDevice = false
-                connectionText = "الاتصال: تم العثور على جهاز — يحتاج موافقة داخل النظارة"
-                deviceText = "السيريال: $serial"
+                connectionText = "الاتصال: جهاز ADB يحتاج إجراء"
+                deviceText = rows.joinToString("، ") { "${it.serial}: ${it.state.name.lowercase()}" }
                 storageText = "—"
                 statusText =
-                    if (isInstalling) "الحالة: توقف مؤقت — وافق على USB Debugging داخل النظارة"
-                    else "الحالة: وافق على USB Debugging داخل النظارة (إذا ظهرت)"
+                    if (isInstalling) {
+                        installPhase = GameInstallPhase.PAUSED
+                        "الحالة: توقف مؤقت — ${selection.message}"
+                    }
+                    else "الحالة: ${selection.message}"
                 return
             }
 
@@ -803,14 +831,20 @@ fun main() = application {
             warningText = null
 
             connectionText = "الاتصال: تم العثور على جهاز"
-            val modelRes = adb.shell(serial, "getprop", "ro.product.model")
+            val modelRes = withContext(Dispatchers.IO) {
+                adb.shell(serial, "getprop", "ro.product.model")
+            }
             val model = modelRes.out.trim().ifBlank { "Meta Quest" }
 
-            val dfRes = adb.shell(serial, "df", "-k", "/data")
-            val (totalGb, freeGb) = parseDfToGb(dfRes.out) ?: (0.0 to 0.0)
+            val dfRes = withContext(Dispatchers.IO) {
+                adb.shell(serial, "df", "-k", "/data")
+            }
+            val storage = parseDfToGb(dfRes.out)
 
             deviceText = "الجهاز: $model  |  السيريال: $serial"
-            storageText = "المساحة: المتاح ${formatGb(freeGb)} من ${formatGb(totalGb)}"
+            storageText = storage?.let { (totalGb, freeGb) ->
+                "المساحة: المتاح ${formatGb(freeGb)} من ${formatGb(totalGb)}"
+            } ?: "المساحة: تعذر قراءتها بأمان"
 
             if (pausedBecauseDisconnected && isInstalling) {
                 pausedBecauseDisconnected = false
@@ -824,18 +858,25 @@ fun main() = application {
             deviceText = "—"
             storageText = "—"
             statusText = if (isInstalling) "الحالة: توقف مؤقت" else "الحالة: تعذر تشغيل ADB"
-            warningText = safeUiMsg(e)
+            warningText = "${safeUiMsg(e)}\n\n${translateAdbFailure(e.message.orEmpty())}"
             DiagnosticLogger.error("تعذر تحديث معلومات جهاز Meta Quest", e)
         }
     }
 
     suspend fun installQueue() {
+        if (!installMutex.tryLock()) return
         if (queue.isEmpty()) {
+            installPhase = GameInstallPhase.FAILED
             warningText = "ما فيه ألعاب جاهزة للتثبيت. أضف مجلد لعبة يحتوي APK."
+            installMutex.unlock()
             return
         }
 
         isInstalling = true
+        installPhase = transitionInstallPhase(
+            GameInstallPhase.IDLE,
+            InstallPhaseTransition.BEGIN_PREFLIGHT
+        )
         showRestart = false
         warningText = null
         progress = 0f
@@ -845,13 +886,14 @@ fun main() = application {
         appendLog("==============================================")
 
         try {
-            adb.startServer()
+            withContext(Dispatchers.IO) { adb.startServer() }
 
             var i = resumeIndex
             while (i < queue.size) {
                 val serial = getAuthorizedSerialOrNull()
                 if (serial == null) {
                     pausedBecauseDisconnected = true
+                    installPhase = GameInstallPhase.PAUSED
                     statusText = "الحالة: توقف مؤقت — اشبك النظارة/وافق داخل النظارة"
                     while (true) {
                         delay(1500)
@@ -861,19 +903,37 @@ fun main() = application {
 
                 val s2 = getAuthorizedSerialOrNull()!!
                 val entry = queue[i]
-
-
-val base = (i.toFloat() / queue.size.toFloat()).coerceIn(0f, 1f)
+                val localIssues = withContext(Dispatchers.IO) {
+                    validateLocalPreflight(entry.apk, entry.obbDirs, entry.packageName)
+                }
+                if (localIssues.isNotEmpty()) {
+                    installPhase = GameInstallPhase.FAILED
+                    warningText = localIssues.joinToString("\n")
+                    statusText = "الحالة: فشل الفحص المسبق"
+                    progressLabel = "ملفات غير صالحة"
+                    appendLog("فشل الفحص المسبق: ${localIssues.joinToString(" | ")}")
+                    resumeIndex = i
+                    return
+                }
+                val base = (i.toFloat() / queue.size.toFloat()).coerceIn(0f, 1f)
 val step = (1f / queue.size.toFloat()).coerceIn(0f, 1f)
 fun setProgressWithinGame(p: Float) {
     val v = (base + step * p.coerceIn(0f, 1f)).coerceIn(0f, 1f)
-    SwingUtilities.invokeLater { progress = v }
+    uiScope.launch { progress = v }
 }
 setProgressWithinGame(0f)
 
+                installPhase = transitionInstallPhase(
+                    installPhase,
+                    InstallPhaseTransition.STORAGE_CHECK_STARTED
+                )
                 val freeGb = getFreeGb(s2)
                 val requiredGb = bytesToGb(entry.requiredBytes)
-                if (freeGb < requiredGb) {
+                if (freeGb != null && freeGb < requiredGb) {
+                    installPhase = transitionInstallPhase(
+                        installPhase,
+                        InstallPhaseTransition.STORAGE_INSUFFICIENT
+                    )
                     warningText =
                         "تنبيه: المساحة غير كافية لهذه اللعبة. المطلوب تقريبًا ${formatGb(requiredGb)} والمتاح ${formatGb(freeGb)}."
                     statusText = "الحالة: أفرغ مساحة ثم اضغط (تثبيت الكل) للإكمال"
@@ -884,6 +944,10 @@ setProgressWithinGame(0f)
                     return
                 }
 
+                installPhase = transitionInstallPhase(
+                    installPhase,
+                    InstallPhaseTransition.STORAGE_AVAILABLE
+                )
                 progressLabel = "تثبيت APK: ${entry.apk.name}"
                 statusText = "الحالة: جاري تثبيت ${i + 1} / ${queue.size}"
 
@@ -891,10 +955,18 @@ setProgressWithinGame(0f)
                 appendLog("لعبة: ${entry.folder.name}")
                 appendLog("APK: ${entry.apk.name}")
 
-                val installRes = adb.installApk(s2, entry.apk)
-                appendLog(installRes.out.trim().ifBlank { "تثبيت APK: (بدون مخرجات)" })
+                val installRes = withContext(Dispatchers.IO) {
+                    adb.installApk(s2, entry.apk)
+                }
+                appendLog(
+                    installRes.out.trim().ifBlank { "تثبيت APK: (بدون مخرجات)" },
+                    installRes.out,
+                    installRes.err
+                )
                 if (installRes.exit != 0) {
-                    warningText = "فشل تثبيت APK للعبة الحالية. تأكد من اتصال النظارة وصلاحيات USB Debugging."
+                    installPhase = GameInstallPhase.FAILED
+                    val raw = boundedRawCommandOutput(installRes.out, installRes.err)
+                    warningText = "${translateAdbFailure(raw)}\n\n$raw"
                     statusText = "الحالة: فشل"
                     resumeIndex = i
                     isInstalling = false
@@ -905,37 +977,47 @@ setProgressWithinGame(0f)
                 setProgressWithinGame(0.25f)
 
                 if (entry.obbDirs.isNotEmpty()) {
-                    val totalObbBytes = entry.obbDirs.sumOf { dirSizeBytes(it) }.coerceAtLeast(1L)
+                    val totalObbBytes = withContext(Dispatchers.IO) {
+                        entry.obbDirs.sumOf { dirSizeBytes(it) }.coerceAtLeast(1L)
+                    }
                     var copiedObbBytes = 0L
                     for (dir in entry.obbDirs) {
+                        installPhase = GameInstallPhase.TRANSFERRING_OBB
                         progressLabel = "نسخ ملفات OBB: ${dir.name}"
                         appendLog("نسخ OBB: ${dir.name}")
 
                         val target = "/sdcard/Android/obb/${dir.name}"
 
-                        val pushRes = adb.pushWithProgress(s2, dir, target) { copied, _ ->
+                        val pushRes = withContext(Dispatchers.IO) {
+                            adb.pushWithProgress(s2, dir, target) { copied, _ ->
                             // تحديث نسبة حقيقية حسب حجم ملفات OBB
                             val overall = (copiedObbBytes + copied).coerceAtMost(totalObbBytes)
                             val frac = overall.toFloat() / totalObbBytes.toFloat()
                             setProgressWithinGame(0.25f + 0.70f * frac)
+                            }
                         }
 
-                        appendLog(pushRes.out.trim().ifBlank { "نسخ OBB: (بدون مخرجات)" })
+                        appendLog(
+                            pushRes.out.trim().ifBlank { "نسخ OBB: (بدون مخرجات)" },
+                            pushRes.out,
+                            pushRes.err
+                        )
 
                         if (pushRes.exit != 0) {
                             val combined = (pushRes.out + "\n" + pushRes.err).lowercase()
                             if (combined.contains("no space left")) {
-                                warningText =
-                                    "تنبيه: نفدت المساحة أثناء نسخ ملفات اللعبة. أفرغ مساحة ثم اضغط (تثبيت الكل) للإكمال."
+                                installPhase = GameInstallPhase.PAUSED
+                                val raw = boundedRawCommandOutput(pushRes.out, pushRes.err)
+                                warningText = "${translateAdbFailure(raw)}\n\n$raw"
                                 statusText = "الحالة: متوقف بسبب المساحة"
                                 resumeIndex = i
                                 isInstalling = false
                                 progressLabel = "متوقف بسبب المساحة"
                                 return
                             }
-                            val err = pushRes.err.trim()
-                            val extra = if (err.isNotEmpty()) "\nتفاصيل: $err" else ""
-                            warningText = "فشل نسخ ملفات OBB للعبة الحالية. جرّب فصل/إعادة توصيل السلك ثم أكمل.$extra"
+                            installPhase = GameInstallPhase.FAILED
+                            val raw = boundedRawCommandOutput(pushRes.out, pushRes.err)
+                            warningText = "${translateAdbFailure(raw)}\n\n$raw"
                             statusText = "الحالة: فشل"
                             resumeIndex = i
                             isInstalling = false
@@ -944,7 +1026,8 @@ setProgressWithinGame(0f)
                         }
 
                         // نجاح النسخ — ثبّت التقدم لهذه اللعبة
-                        copiedObbBytes = (copiedObbBytes + dirSizeBytes(dir)).coerceAtMost(totalObbBytes)
+                        val copiedDirectoryBytes = withContext(Dispatchers.IO) { dirSizeBytes(dir) }
+                        copiedObbBytes = (copiedObbBytes + copiedDirectoryBytes).coerceAtMost(totalObbBytes)
                         setProgressWithinGame(0.25f + 0.70f * (copiedObbBytes.toFloat() / totalObbBytes.toFloat()))
                     }
                 } else {
@@ -957,9 +1040,78 @@ setProgressWithinGame(0f)
                 delay(1200)
                 i++
                 resumeIndex = i
-                progress = (i.toFloat() / queue.size.toFloat()).coerceIn(0f, 1f)
+                progress = (i.toFloat() / queue.size.toFloat()).coerceAtMost(0.95f)
             }
 
+            installPhase = transitionInstallPhase(
+                installPhase,
+                InstallPhaseTransition.BEGIN_VERIFICATION
+            )
+            progress = 0.98f
+            progressLabel = "التحقق من التثبيت والملفات..."
+            val verifySerial = getAuthorizedSerialOrNull()
+            if (verifySerial == null) {
+                installPhase = GameInstallPhase.PAUSED
+                warningText = "انقطع اتصال النظارة قبل التحقق. أعد توصيلها ثم اضغط (تثبيت الكل) للإكمال."
+                statusText = "الحالة: توقف مؤقت — التحقق مطلوب"
+                return
+            }
+            for (entry in queue) {
+                val packageName = entry.packageName
+                if (packageName.isNullOrBlank()) {
+                    installPhase = transitionInstallPhase(
+                        installPhase,
+                        InstallPhaseTransition.FAILED
+                    )
+                    warningText = "تعذر التحقق من package الخاص بـ ${entry.apk.name}."
+                    statusText = "الحالة: فشل التحقق"
+                    return
+                }
+                val packageCheck = withContext(Dispatchers.IO) {
+                    adb.shell(verifySerial, "pm", "path", packageName)
+                }
+                val packagePresent = packageCheck.exit == 0 &&
+                    packageCheck.out.lineSequence().any { it.trim().startsWith("package:") }
+                appendLog(
+                    "التحقق من ${entry.folder.name} ($packageName): ${if (packagePresent) "تم" else "فشل"}",
+                    packageCheck.out,
+                    packageCheck.err
+                )
+                if (!packagePresent) {
+                    installPhase = GameInstallPhase.FAILED
+                    val raw = boundedRawCommandOutput(packageCheck.out, packageCheck.err)
+                    warningText = "${translateAdbFailure(raw)}\n\n$raw"
+                    statusText = "الحالة: فشل التحقق"
+                    return
+                }
+                for (dir in entry.obbDirs) {
+                    val target = "/sdcard/Android/obb/${dir.name}"
+                    val expected = withContext(Dispatchers.IO) {
+                        expectedObbFiles(dir, target)
+                    }
+                    val actual = expected.mapNotNull { expectedFile ->
+                        val check = withContext(Dispatchers.IO) {
+                            adb.shell(verifySerial, "stat", "-c", "%s", expectedFile.remotePath)
+                        }
+                        check.out.trim().lines().lastOrNull()?.trim()?.toLongOrNull()?.let {
+                            ActualObbFile(expectedFile.remotePath, it)
+                        }
+                    }
+                    val verification = verifyExpectedObbFiles(expected, actual)
+                    if (!verification.valid) {
+                        installPhase = GameInstallPhase.FAILED
+                        warningText = "تعذر التحقق من ملفات OBB ${dir.name}.\n" +
+                            "مفقود: ${verification.missing.joinToString(", ")}\n" +
+                            "بحجم غير صحيح: ${verification.mismatched.joinToString(", ")}"
+                        statusText = "الحالة: فشل التحقق"
+                        return
+                    }
+                }
+            }
+            installPhase = transitionInstallPhase(
+                installPhase,
+                InstallPhaseTransition.VERIFIED
+            )
             progress = 1f
             progressLabel = "اكتمل التثبيت"
             statusText = "الحالة: تم بنجاح"
@@ -967,9 +1119,9 @@ setProgressWithinGame(0f)
             appendLog("اكتمل التثبيت بنجاح")
             appendLog("==============================================")
 
-            adb.killServer()
+            withContext(Dispatchers.IO) { adb.killServer() }
 
-            warningText = "تمت العملية بنجاح.\nافصل السلك واستمتع باللعب.\nولا تنسانا من التقييم لتطوير خدماتنا لكم."
+            warningText = null
             showRestart = true
         } catch (e: Throwable) {
             SupportReporter.record(
@@ -977,21 +1129,51 @@ setProgressWithinGame(0f)
                 details = e.stackTraceToString(),
                 context = progressLabel
             )
-            warningText = safeUiMsg(e)
+            installPhase = GameInstallPhase.FAILED
+            warningText = "${safeUiMsg(e)}\n\n${translateAdbFailure(e.message.orEmpty())}"
             statusText = "الحالة: تعذر الإكمال"
         } finally {
             isInstalling = false
+            installMutex.unlock()
         }
     }
 
     fun restartQuestNow() {
-        CoroutineScope(Dispatchers.IO).launch {
+        uiScope.launch {
             try {
                 val serial = getAuthorizedSerialOrNull()
-                if (serial != null) adb.reboot(serial)
-            } catch (_: Throwable) {
-            } finally {
-                hardExitApp { bundledAdb.cleanupOwnedResources() }
+                if (serial == null) {
+                    appendLog("تعذر إعادة تشغيل النظارة: لا يوجد جهاز مصرح.")
+                    return@launch
+                }
+                installPhase = GameInstallPhase.RESTARTING
+                statusText = "الحالة: جاري إعادة تشغيل النظارة..."
+                progressLabel = "انتظار عودة اتصال ADB..."
+                val result = withContext(Dispatchers.IO) { adb.reboot(serial) }
+                appendLog("ADB reboot", result.out, result.err)
+                if (result.exit != 0) {
+                    val raw = boundedRawCommandOutput(result.out, result.err)
+                    warningText = "${translateAdbFailure(raw)}\n\n$raw"
+                    statusText = "الحالة: فشل إعادة التشغيل"
+                    installPhase = GameInstallPhase.FAILED
+                    return@launch
+                }
+                repeat(40) {
+                    delay(1500)
+                    if (getAuthorizedSerialOrNull() != null) {
+                        hasAuthorizedDevice = true
+                        statusText = "الحالة: عادت النظارة بعد إعادة التشغيل"
+                        progressLabel = "جاهز"
+                        installPhase = GameInstallPhase.IDLE
+                        return@launch
+                    }
+                }
+                statusText = "الحالة: ما زلنا ننتظر عودة النظارة"
+                warningText = "تم إرسال أمر إعادة التشغيل، لكن النظارة لم تعد خلال المهلة. سيستمر الفحص تلقائيًا."
+            } catch (e: Throwable) {
+                warningText = "${safeUiMsg(e)}\n\n${translateAdbFailure(e.message.orEmpty())}"
+                statusText = "الحالة: تعذر متابعة إعادة التشغيل"
+                installPhase = GameInstallPhase.FAILED
             }
         }
     }
@@ -1012,19 +1194,21 @@ setProgressWithinGame(0f)
         appendModLog("بدء تنفيذ الخطة المعتمدة: ${file.name}")
         appendModLog("==============================================")
         try {
-            adb.startServer()
+            withContext(Dispatchers.IO) { adb.startServer() }
             val serial = getAuthorizedSerialOrNull()
             if (serial == null) {
                 appendModLog("لا يوجد جهاز متصل أو مصرح به")
                 return
             }
-            val installResult = modsManager.executeInstallPlan(
-                serial = serial,
-                zipFile = file,
-                plan = analysis.installPlan
-            ) { update ->
-                SwingUtilities.invokeLater {
-                    modExecutionProgress = update
+            val installResult = withContext(Dispatchers.IO) {
+                modsManager.executeInstallPlan(
+                    serial = serial,
+                    zipFile = file,
+                    plan = analysis.installPlan
+                ) { update ->
+                    uiScope.launch {
+                        modExecutionProgress = update
+                    }
                 }
             }
             if (installResult.success) {
@@ -1047,19 +1231,17 @@ setProgressWithinGame(0f)
     LaunchedEffect(logText) { logScroll.animateScrollTo(logScroll.maxValue) }
 
     LaunchedEffect(Unit) {
-        while (true) {
+        val loaded = withContext(Dispatchers.IO) { NfvrPathPreferences.load() }
+        savedPaths = loaded
+        folders = loaded.gameFolders.map(::File)
+        lastModArchiveDirectory = loaded.modArchiveDirectory?.let(::File)
+        rebuildQueueOnIo()
+    }
+
+    LaunchedEffect(Unit) {
+        while (isActive) {
             refreshDeviceInfo()
-
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    val serial = getAuthorizedSerialOrNull()
-                    if (serial != null) {
-                        refreshInstalledApps()
-                    }
-                } catch (_: Exception) {
-                }
-            }
-
+            runCatching { refreshInstalledApps() }
             delay(2000)
         }
     }
@@ -1078,7 +1260,12 @@ setProgressWithinGame(0f)
                 val showSettings = remember { mutableStateOf(false) }
 
                 Column(
-                    modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(pageScroll),
+                    // The mods workflow owns its LazyColumn scroll.  Applying
+                    // another scroll container around it causes a nested
+                    // scroll measurement crash on Compose Desktop.
+                    modifier = Modifier.fillMaxSize().padding(16.dp).then(
+                        if (selectedTab == 1) Modifier else Modifier.verticalScroll(pageScroll)
+                    ),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     // HEADER
@@ -1127,6 +1314,32 @@ setProgressWithinGame(0f)
                             Text(connectionText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             Text(deviceText, style = MaterialTheme.typography.bodyMedium)
                             Text(storageText, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "إعداد Quest: أنشئ حساب مطور Meta، فعّل Developer Mode من تطبيق Meta Horizon، " +
+                                    "استخدم كابل USB بيانات، ثم اختر Always allow from this computer ووافق على USB Debugging داخل النظارة.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        openUrl("https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/")
+                                    }
+                                ) { Text("فتح دليل التفعيل") }
+                                OutlinedButton(
+                                    onClick = {
+                                        openUrl("https://developer.oculus.com/manage/organizations/create/")
+                                    }
+                                ) { Text("فتح صفحة Meta للمطورين") }
+                                OutlinedButton(
+                                            onClick = { uiScope.launch { refreshDeviceInfo() } }
+                                ) { Text("إعادة فحص الاتصال") }
+                            }
+                            Text(
+                                "البريد الإلكتروني لحساب Meta غير متاح للتطبيق؛ لا نجمع أو نستخرج بيانات خاصة.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
 
@@ -1163,8 +1376,9 @@ setProgressWithinGame(0f)
                                         enabled = !checkingUpdate,
                                         onClick = {
                                             checkingUpdate = true
-                                            updateScope.launch(Dispatchers.IO) {
-                                                val message = when (val result = UpdateManager.check()) {
+                                            updateScope.launch {
+                                                val message = withContext(Dispatchers.IO) {
+                                                    when (val result = UpdateManager.check()) {
                                                     UpdateCheckResult.Unavailable -> "خدمة التحديث غير مهيأة حاليًا."
                                                     UpdateCheckResult.Current -> "لديك أحدث إصدار."
                                                     is UpdateCheckResult.Available ->
@@ -1174,11 +1388,10 @@ setProgressWithinGame(0f)
                                                             "يتوفر الإصدار ${result.metadata.latestVersion}. سيتم تفعيل التنزيل بعد اعتماد خدمة التحديث."
                                                         }
                                                     is UpdateCheckResult.Error -> result.message
+                                                    }
                                                 }
-                                                SwingUtilities.invokeLater {
-                                                    updateStatus = message
-                                                    checkingUpdate = false
-                                                }
+                                                updateStatus = message
+                                                checkingUpdate = false
                                             }
                                         }
                                     ) {
@@ -1271,12 +1484,12 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     append(DiagnosticLogger.recent())
                 }
             )
-            scopeReport.launch(Dispatchers.IO) {
-                val (ok, msg) = SupportReporter.send(SUPPORT_REPORT_URL, payloadRaw)
-                SwingUtilities.invokeLater {
-                    sendingReport = false
-                    reportStatus = if (ok) "تم إرسال التقرير بنجاح." else "فشل إرسال التقرير: $msg"
+            scopeReport.launch {
+                val result = withContext(Dispatchers.IO) {
+                    SupportReporter.send(SUPPORT_REPORT_URL, payloadRaw)
                 }
+                sendingReport = false
+                reportStatus = if (result.first) "تم إرسال التقرير بنجاح." else "فشل إرسال التقرير: ${result.second}"
             }
         }
     ) {
@@ -1309,19 +1522,20 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                 isActivating = true
                                                 activationUiMsg = "جاري التفعيل..."
 
-                                                CoroutineScope(Dispatchers.IO).launch {
+                                                uiScope.launch {
+                                                    withContext(Dispatchers.IO) {
                                                     val deviceHash = fp
                                                     val key = licenseKeyInput.trim()
 
                                                     try {
-                                                        val result = OnlineLicenseApi.activate(
+                                                         val result = OnlineLicenseApi.activate(
                                                             baseUrl = LICENSE_API_BASE_URL,
                                                             licenseKey = key,
                                                             deviceHash = deviceHash,
                                                             productCode = LICENSE_PRODUCT_CODE
                                                         )
 
-                                                        if (result.ok) {
+                                                         if (result.ok) {
                                                             val saved = LocalLicenseStore.saveActivated(
                                                                 fingerprint = deviceHash,
                                                                 licenseKey = key
@@ -1329,7 +1543,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                             val ok = saved.first
                                                             val msg = saved.second
 
-                                                            SwingUtilities.invokeLater {
+                                                             uiScope.launch {
                                                                 if (ok) {
                                                                     activationUiMsg = "تم التفعيل بنجاح"
                                                                     licenseState.value = LocalLicenseStore.load(deviceHash)
@@ -1340,16 +1554,17 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                                 isActivating = false
                                                             }
                                                         } else {
-                                                            SwingUtilities.invokeLater {
+                                                             uiScope.launch {
                                                                 activationUiMsg = "فشل: ${result.message}"
                                                                 isActivating = false
                                                             }
                                                         }
                                                     } catch (e: Exception) {
-                                                        SwingUtilities.invokeLater {
+                                                         uiScope.launch {
                                                             activationUiMsg = "فشل: ${e.message ?: "خطأ غير معروف"}"
                                                             isActivating = false
                                                         }
+                                                    }
                                                     }
                                                 }
                                             },
@@ -1474,10 +1689,18 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Button(
                                                 onClick = {
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
-                                                    val f = chooseFolder()
+                                                    val f = chooseFolder(
+                                                        savedPaths.lastGameFolder?.let(::File)
+                                                            ?: folders.lastOrNull()?.parentFile
+                                                    )
                                                     if (f != null) {
                                                         folders = folders + f
-                                                        rebuildQueue()
+                                                        uiScope.launch {
+                                                            withContext(Dispatchers.IO) {
+                                                                NfvrPathPreferences.saveGameFolders(folders)
+                                                            }
+                                                            rebuildQueueOnIo()
+                                                        }
                                                         appendLog("تمت إضافة مجلد: ${f.absolutePath}")
                                                     }
                                                 },
@@ -1487,7 +1710,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Button(
                                                 onClick = {
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
-                                                    CoroutineScope(Dispatchers.IO).launch { installQueue() }
+                                                    uiScope.launch { installQueue() }
                                                 },
                                                 enabled = hasAuthorizedDevice && !isInstalling && queue.isNotEmpty()
                                             ) { Text("تثبيت الكل") }
@@ -1513,14 +1736,27 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             modifier = Modifier.fillMaxWidth(),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            LinearProgressIndicator(
-                                                progress = { progress },
-                                                modifier = Modifier.weight(1f).height(10.dp),
-                                                color = if (progress >= 1f) Color(0xFF1B5E20) else MaterialTheme.colorScheme.primary
-                                            )
+                                            val indeterminate = installPhase == GameInstallPhase.RESTARTING ||
+                                                installPhase == GameInstallPhase.INSTALLING_APK
+                                            if (indeterminate) {
+                                                LinearProgressIndicator(
+                                                    modifier = Modifier.weight(1f).height(10.dp),
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            } else {
+                                                LinearProgressIndicator(
+                                                    progress = { progress.coerceIn(0f, 1f) },
+                                                    modifier = Modifier.weight(1f).height(10.dp),
+                                                    color = when (installPhase) {
+                                                        GameInstallPhase.COMPLETED -> MaterialTheme.colorScheme.tertiary
+                                                        GameInstallPhase.FAILED -> MaterialTheme.colorScheme.error
+                                                        else -> MaterialTheme.colorScheme.primary
+                                                    }
+                                                )
+                                            }
                                             Spacer(Modifier.width(10.dp))
                                             Text(
-                                                text = "${(progress * 100f).toInt()}%",
+                                                text = if (indeterminate) "جارٍ التنفيذ" else "${(progress * 100f).toInt()}%",
                                                 style = MaterialTheme.typography.bodyMedium,
                                                 fontWeight = FontWeight.SemiBold
                                             )
@@ -1531,13 +1767,13 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         if (!warningText.isNullOrBlank()) {
                                             Box(
                                                 modifier = Modifier.fillMaxWidth()
-                                                    .background(Color(0xFFFFF3CD))
+                                                     .background(MaterialTheme.colorScheme.errorContainer)
                                                     .padding(10.dp)
                                             ) {
                                                 Text(
                                                     warningText!!,
                                                     style = MaterialTheme.typography.bodyMedium,
-                                                    color = Color(0xFF6B4E00)
+                                                     color = MaterialTheme.colorScheme.onErrorContainer
                                                 )
                                             }
                                         }
@@ -1565,8 +1801,13 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                         onClick = {
                                                             if (isInstalling) return@IconButton
                                                             val target = g.folder.absolutePath
-                                                            folders = folders.filterNot { it.absolutePath == target }
-                                                            rebuildQueue()
+                                                             folders = folders.filterNot { it.absolutePath == target }
+                                                            uiScope.launch {
+                                                                withContext(Dispatchers.IO) {
+                                                                    NfvrPathPreferences.saveGameFolders(folders)
+                                                                }
+                                                                rebuildQueueOnIo()
+                                                            }
                                                             appendLog("تم حذف اللعبة من القائمة: ${g.folder.name}")
                                                         },
                                                         enabled = !isInstalling
@@ -1580,20 +1821,95 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 }
 
                                 Card(modifier = Modifier.fillMaxWidth()) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Text("سجل تثبيت الألعاب", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                         Row(
+                                             modifier = Modifier.fillMaxWidth(),
+                                             verticalAlignment = Alignment.CenterVertically
+                                         ) {
+                                             Column(Modifier.weight(1f)) {
+                                                 Text("سجل تثبيت الألعاب", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                                 Text(
+                                                     "نشاط مباشر مع الوقت والمرحلة وسبب الفشل عند توفره",
+                                                     style = MaterialTheme.typography.bodySmall,
+                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                 )
+                                             }
+                                             OutlinedButton(
+                                                 enabled = activityEvents.isNotEmpty(),
+                                                 onClick = {
+                                                     val details = activityEvents.joinToString("\n") {
+                                                         "[${it.timestamp.substringAfter('T').take(8)}] ${it.phase}: ${it.message}" +
+                                                             listOf(it.stdout, it.stderr)
+                                                                 .filter(String::isNotBlank)
+                                                                 .joinToString("\n", prefix = "\n")
+                                                     }
+                                                     copyToClipboard(details)
+                                                 }
+                                             ) { Text("نسخ التفاصيل") }
+                                             Spacer(Modifier.width(8.dp))
+                                             OutlinedButton(
+                                                 enabled = !isInstalling && activityEvents.isNotEmpty(),
+                                                 onClick = {
+                                                     activityHistory.clear()
+                                                     activityEvents = emptyList()
+                                                     logText = ""
+                                                     ActivityHistoryStore.clear()
+                                                 }
+                                             ) { Text("مسح السجل") }
+                                         }
                                         Spacer(Modifier.height(8.dp))
                                         Box(
                                             modifier = Modifier.fillMaxWidth().height(260.dp)
-                                                .background(Color(0xFFF6F6F6))
+                                                 .background(MaterialTheme.colorScheme.background)
                                                 .padding(10.dp)
                                         ) {
-                                            Text(
-                                                if (logText.isBlank()) "—" else logText,
-                                                style = MaterialTheme.typography.bodySmall,
-                                                textAlign = TextAlign.Start,
-                                                modifier = Modifier.verticalScroll(logScroll)
-                                            )
+                                             if (activityEvents.isEmpty()) {
+                                                 Text(
+                                                     "لا يوجد نشاط بعد. ستظهر خطوات الفحص والنقل والتثبيت هنا.",
+                                                     style = MaterialTheme.typography.bodyMedium,
+                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                 )
+                                             } else {
+                                                 Column(
+                                                     modifier = Modifier.fillMaxWidth().verticalScroll(logScroll),
+                                                     verticalArrangement = Arrangement.spacedBy(6.dp)
+                                                 ) {
+                                                     activityEvents.forEach { event ->
+                                                         val accent = when (event.phase) {
+                                                             GameInstallPhase.COMPLETED -> MaterialTheme.colorScheme.tertiary
+                                                             GameInstallPhase.FAILED -> MaterialTheme.colorScheme.error
+                                                             GameInstallPhase.PAUSED -> Color(0xFFFFC857)
+                                                             else -> MaterialTheme.colorScheme.primary
+                                                         }
+                                                         Row(
+                                                             modifier = Modifier.fillMaxWidth()
+                                                                 .background(MaterialTheme.colorScheme.surfaceVariant)
+                                                                 .padding(horizontal = 10.dp, vertical = 8.dp),
+                                                             horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                                         ) {
+                                                             Text(
+                                                                 event.timestamp.substringAfter('T').take(8),
+                                                                 style = MaterialTheme.typography.labelSmall,
+                                                                 color = accent
+                                                             )
+                                                             Column(Modifier.weight(1f)) {
+                                                                 Text(
+                                                                     event.message,
+                                                                     style = MaterialTheme.typography.bodySmall,
+                                                                     color = MaterialTheme.colorScheme.onSurface
+                                                                 )
+                                                                 if (event.stderr.isNotBlank()) {
+                                                                     Text(
+                                                                         event.stderr.take(500),
+                                                                         style = MaterialTheme.typography.labelSmall,
+                                                                         color = MaterialTheme.colorScheme.error
+                                                                     )
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                 }
+                                             }
                                         }
                                     }
                                 }
@@ -1608,7 +1924,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onSearchFilterChange = { appSearch = it },
                                     selectedApp = selectedApp,
                                     onRefresh = {
-                                        CoroutineScope(Dispatchers.IO).launch { refreshInstalledApps() }
+                                        uiScope.launch { refreshInstalledApps() }
                                     },
                                     onSelectApp = { app ->
                                         selectedApp = app
@@ -1617,9 +1933,17 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     },
                                     selectedZipFilename = modZipFile?.name,
                                     onChooseFile = {
-                                        val file = chooseModFile()
+                                         val file = chooseModFile(lastModArchiveDirectory)
                                         if (file != null) {
                                             modZipFile = file
+                                             lastModArchiveDirectory = file.parentFile
+                                             file.parentFile?.let { directory ->
+                                                 uiScope.launch {
+                                                     withContext(Dispatchers.IO) {
+                                                         NfvrPathPreferences.saveModArchiveDirectory(directory)
+                                                     }
+                                                 }
+                                             }
                                             modAnalysis = null
                                             modExecutionProgress = null
                                             appendModLog("تم اختيار ملف المود: ${file.name}")
@@ -1628,15 +1952,15 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     analyzing = analyzingMod,
                                     analysis = modAnalysis,
                                     onAnalyze = {
-                                        CoroutineScope(Dispatchers.IO).launch { analyzeSelectedMod() }
+                                        uiScope.launch { analyzeSelectedMod() }
                                     },
                                     installing = isInstallingMod,
                                     executionProgress = modExecutionProgress,
                                     onInstall = {
-                                        CoroutineScope(Dispatchers.IO).launch { installSelectedMod() }
+                                        uiScope.launch { installSelectedMod() }
                                     },
                                     logText = modLogText,
-                                    modifier = Modifier.fillMaxWidth()
+                                     modifier = Modifier.fillMaxWidth().weight(1f)
                                 )
                             }
                             2 -> {

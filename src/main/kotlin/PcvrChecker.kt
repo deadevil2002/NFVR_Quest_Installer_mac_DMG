@@ -1,6 +1,18 @@
 import java.text.SimpleDateFormat
+import java.io.InputStream
+import java.math.BigInteger
+import java.net.NetworkInterface
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
+import java.io.IOException
+import java.io.FileNotFoundException
 import java.util.Date
 import java.util.Locale
+import java.util.Base64
+import java.util.concurrent.TimeUnit
 
 enum class PcvrCheckStatus {
     PASS, WARN, FAIL, UNKNOWN
@@ -114,7 +126,7 @@ fun parsePcvrProbeOutput(lines: List<String>): PcvrProbeData {
             if (name.isNotBlank()) {
                 gpus += PcvrGpuData(
                     name = name,
-                    adapterRamBytes = fields.getOrNull(2)?.trim()?.toLongOrNull(),
+                    adapterRamBytes = parsePcvrByteCount(fields.getOrNull(2)?.trim()),
                     driverVersion = fields.getOrNull(3)?.trim()?.ifBlank { null }
                 )
             }
@@ -154,6 +166,25 @@ fun parsePcvrProbeOutput(lines: List<String>): PcvrProbeData {
         networkDescription = s("NET_DESCRIPTION"), networkLinkSpeed = s("NET_LINK_SPEED"),
         gpus = gpus
     )
+}
+
+/**
+ * AdapterRAM is exposed by some WMI providers as a signed UInt32, while
+ * other providers print an unsigned number or a decimal string.  Never let a
+ * malformed/overflowing value turn into a negative VRAM amount.
+ */
+private fun parsePcvrByteCount(value: String?): Long? {
+    val text = value?.trim()?.removeSuffix("L")?.removeSuffix("l").orEmpty()
+    if (text.isBlank() || text.equals("__UNKNOWN__", true)) return null
+    return runCatching {
+        val number = if (text.startsWith("0x", true)) {
+            BigInteger(text.substring(2), 16)
+        } else {
+            BigInteger(text)
+        }
+        if (number.signum() < 0 || number > BigInteger.valueOf(Long.MAX_VALUE)) null
+        else number.toLong().takeIf { it > 0L }
+    }.getOrNull()
 }
 
 /**
@@ -214,7 +245,25 @@ object PcvrChecker {
 
     private fun gatherSystemInfo(advanced: Boolean = false): PcvrSystemInfo {
         val windows = System.getProperty("os.name", "").contains("win", ignoreCase = true)
-        val data = if (windows) parsePcvrProbeOutput(runPowerShell(PROBE_SCRIPT)) else PcvrProbeData()
+        val data = if (windows) {
+            val command = runPowerShell(PROBE_SCRIPT)
+            // A failed command can still have useful section output before a
+            // provider failed.  With no stdout at all, discard it and rely
+            // exclusively on the independent fallbacks.
+            val primary = if (command.stdout.isEmpty() &&
+                (command.timedOut || command.exitCode != 0)
+            ) {
+                PcvrProbeData()
+            } else {
+                parsePcvrProbeOutput(command.stdout)
+            }
+            mergePcvrProbeData(
+                primary,
+                collectPcvrFallbacks()
+            )
+        } else {
+            PcvrProbeData()
+        }
         val networkName = data.networkName.orEmpty()
         val networkDescription = data.networkDescription.orEmpty()
         val networkType = when {
@@ -272,18 +321,315 @@ object PcvrChecker {
     }
 
     private fun isReliableGpuVram(bytes: Long): Boolean =
-        bytes > 0L && bytes < 4L * 1024L * 1024L * 1024L
+        // Win32_VideoController.AdapterRAM is a UInt32 in common providers;
+        // 0xffffffff is its overflow/sentinel value.  Do not reject genuine
+        // 8/12/16GB values supplied by a provider that exposes UInt64.
+        bytes > 0L && bytes <= 256L * 1024L * 1024L * 1024L && bytes != 0xFFFF_FFFFL
 
-    private fun runPowerShell(script: String): List<String> {
+    /**
+     * A command result intentionally keeps stdout, stderr, exit status and
+     * timeout separate.  The old implementation merged stderr into stdout,
+     * making a provider error look like an empty successful probe.
+     */
+    internal data class PcvrCommandResult(
+        val stdout: List<String>,
+        val stderr: List<String>,
+        val exitCode: Int?,
+        val timedOut: Boolean
+    )
+
+    internal data class PcvrPresenceResult(
+        val present: Boolean?,
+        val evidence: String? = null
+    )
+
+    private fun runPowerShell(script: String): PcvrCommandResult {
         val executable = if (System.getenv("SystemRoot").isNullOrBlank()) "powershell.exe"
         else "${System.getenv("SystemRoot")}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        /*
+         * EncodedCommand is UTF-16LE by PowerShell convention.  Passing the
+         * script as one ProcessBuilder argument is already shell-safe, but
+         * encoding it also protects paths containing quotes, ampersands, or
+         * Arabic text from PowerShell's command-line parser.
+         */
+        val encoded = Base64.getEncoder().encodeToString(
+            script.toByteArray(StandardCharsets.UTF_16LE)
+        )
         return runCatching {
-            runOwnedCommand(
-                listOf(executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                    "-ExecutionPolicy", "Bypass", "-Command", script),
+            runPcvrCommand(
+                listOf(
+                    executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded
+                ),
                 POWERSHELL_TIMEOUT_MS
             )
-        }.getOrElse { emptyList() }
+        }.getOrElse {
+            PcvrCommandResult(emptyList(), listOf(it.javaClass.simpleName), null, false)
+        }
+    }
+
+    private fun runPcvrCommand(command: List<String>, timeoutMs: Long): PcvrCommandResult {
+        val process = ProcessBuilder(command).redirectErrorStream(false).start()
+        OwnedProcessRegistry.add(process)
+        val stdout = mutableListOf<String>()
+        val stderr = mutableListOf<String>()
+        val outThread = readPcvrStream(process.inputStream, stdout)
+        val errThread = readPcvrStream(process.errorStream, stderr)
+        var timedOut = false
+        try {
+            if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                timedOut = true
+                process.destroy()
+                if (!process.waitFor(500, TimeUnit.MILLISECONDS)) process.destroyForcibly()
+                process.waitFor(2, TimeUnit.SECONDS)
+            }
+            outThread.join(2_000)
+            errThread.join(2_000)
+            return PcvrCommandResult(
+                stdout.toList(), stderr.toList(),
+                runCatching { process.exitValue() }.getOrNull(), timedOut
+            )
+        } finally {
+            if (process.isAlive) process.destroyForcibly()
+            outThread.join(500)
+            errThread.join(500)
+            OwnedProcessRegistry.remove(process)
+        }
+    }
+
+    private fun readPcvrStream(stream: InputStream, destination: MutableList<String>): Thread {
+        val thread = Thread {
+            runCatching {
+                stream.bufferedReader().useLines { lines ->
+                    lines.take(4_000).forEach { line ->
+                        synchronized(destination) {
+                            if (destination.size < 4_000) destination += line
+                        }
+                    }
+                }
+            }
+        }
+        thread.isDaemon = true
+        thread.start()
+        return thread
+    }
+
+    /**
+     * Fallbacks deliberately use only read-only, user-accessible sources.
+     * A failed PowerShell provider therefore cannot turn an unavailable
+     * section into "not installed".
+     */
+    internal fun mergePcvrProbeData(primary: PcvrProbeData, fallback: PcvrProbeData): PcvrProbeData =
+        PcvrProbeData(
+            osCaption = primary.osCaption ?: fallback.osCaption,
+            osBuild = primary.osBuild ?: fallback.osBuild,
+            osArchitecture = primary.osArchitecture ?: fallback.osArchitecture,
+            cpuName = primary.cpuName ?: fallback.cpuName,
+            cpuCores = primary.cpuCores ?: fallback.cpuCores,
+            cpuLogicalProcessors = primary.cpuLogicalProcessors ?: fallback.cpuLogicalProcessors,
+            cpuArchitecture = primary.cpuArchitecture ?: fallback.cpuArchitecture,
+            totalRamBytes = primary.totalRamBytes ?: fallback.totalRamBytes,
+            availableRamKb = primary.availableRamKb ?: fallback.availableRamKb,
+            gpuName = primary.gpuName ?: fallback.gpuName,
+            gpuVramBytes = primary.gpuVramBytes ?: fallback.gpuVramBytes,
+            gpuDriver = primary.gpuDriver ?: fallback.gpuDriver,
+            driveFreeBytes = primary.driveFreeBytes ?: fallback.driveFreeBytes,
+            driveSizeBytes = primary.driveSizeBytes ?: fallback.driveSizeBytes,
+            questInstalled = primary.questInstalled ?: fallback.questInstalled,
+            questPath = primary.questPath ?: fallback.questPath,
+            ovrService = primary.ovrService ?: fallback.ovrService,
+            steamInstalled = primary.steamInstalled ?: fallback.steamInstalled,
+            steamvrInstalled = primary.steamvrInstalled ?: fallback.steamvrInstalled,
+            openXrRuntime = primary.openXrRuntime ?: fallback.openXrRuntime,
+            usbControllers = primary.usbControllers ?: fallback.usbControllers,
+            networkName = primary.networkName ?: fallback.networkName,
+            networkDescription = primary.networkDescription ?: fallback.networkDescription,
+            networkLinkSpeed = primary.networkLinkSpeed ?: fallback.networkLinkSpeed,
+            gpus = if (primary.gpus.isNotEmpty()) primary.gpus else fallback.gpus
+        )
+
+    private fun collectPcvrFallbacks(): PcvrProbeData {
+        val root = runCatching {
+            val drive = System.getenv("SystemDrive")?.trim()?.takeIf { it.isNotBlank() } ?: "C:"
+            Path.of(if (drive.endsWith("\\") || drive.endsWith("/")) drive else "$drive\\")
+        }.getOrNull()
+        val store = root?.let { runCatching { Files.getFileStore(it) }.getOrNull() }
+        val logical = Runtime.getRuntime().availableProcessors().takeIf { it > 0 }
+        val arch = System.getProperty("os.arch").orEmpty().ifBlank { null }
+        val cpuName = System.getenv("PROCESSOR_IDENTIFIER")?.trim()?.ifBlank { null }
+
+        val questCandidates = listOfNotNull(
+            System.getenv("ProgramFiles")?.let { Path.of(it, "Oculus") },
+            System.getenv("ProgramFiles(x86)")?.let { Path.of(it, "Oculus") },
+            System.getenv("ProgramFiles")?.let { Path.of(it, "Meta Quest Link") },
+            System.getenv("LOCALAPPDATA")?.let { Path.of(it, "Oculus") }
+        )
+        val questRegistryKeys = listOf(
+            "HKLM\\SOFTWARE\\Meta\\Oculus",
+            "HKLM\\SOFTWARE\\WOW6432Node\\Oculus VR, LLC\\Oculus",
+            "HKLM\\SOFTWARE\\WOW6432Node\\Meta\\Oculus"
+        )
+        val questRegistry = questRegistryKeys.map(::registryPresence)
+        val questPaths = questCandidates.map { it to pathPresence(it) }
+        val questPath = questPaths.firstOrNull { it.second == true }?.first
+
+        val steamRoots = mutableListOf<Path>()
+        registryValue("HKCU\\SOFTWARE\\Valve\\Steam", "SteamPath")?.let { steamRoots.add(Path.of(it)) }
+        registryValue("HKLM\\SOFTWARE\\Valve\\Steam", "InstallPath")?.let { steamRoots.add(Path.of(it)) }
+        listOfNotNull(
+            System.getenv("ProgramFiles")?.let { Path.of(it, "Steam") },
+            System.getenv("ProgramFiles(x86)")?.let { Path.of(it, "Steam") }
+        ).forEach { steamRoots.add(it) }
+        val steamKeys = listOf(
+            "HKCU\\SOFTWARE\\Valve\\Steam",
+            "HKLM\\SOFTWARE\\Valve\\Steam",
+            "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam"
+        ).map(::registryPresence)
+        val steamPaths = steamRoots.map { it to pathPresence(it) }
+        val steamRoot = steamPaths.firstOrNull { it.second == true }?.first
+        val steamVrRegistry = listOf(
+            "HKCU\\SOFTWARE\\Valve\\Steam\\Apps\\250820",
+            "HKLM\\SOFTWARE\\Valve\\Steam\\Apps\\250820"
+        ).map(::registryPresence)
+        val steamVrPaths = steamRoots.map {
+            it.resolve("steamapps").resolve("common").resolve("SteamVR") to
+                pathPresence(it.resolve("steamapps").resolve("common").resolve("SteamVR"))
+        }
+        val staticSteamVrPaths = listOfNotNull(
+            System.getenv("ProgramFiles")?.let { Path.of(it, "Steam", "steamapps", "common", "SteamVR") },
+            System.getenv("ProgramFiles(x86)")?.let { Path.of(it, "Steam", "steamapps", "common", "SteamVR") }
+        ).map { it to pathPresence(it) }
+
+        val openXr = listOf(
+            "HKCU\\SOFTWARE\\Khronos\\OpenXR\\1",
+            "HKLM\\SOFTWARE\\Khronos\\OpenXR\\1",
+            "HKLM\\SOFTWARE\\WOW6432Node\\Khronos\\OpenXR\\1"
+        ).firstNotNullOfOrNull { registryValue(it, "ActiveRuntime") }
+
+        val service = queryOvrService()
+        val network = findPcvrNetwork()
+        return PcvrProbeData(
+            osCaption = listOfNotNull(
+                System.getProperty("os.name")?.takeIf { it.isNotBlank() },
+                System.getProperty("os.version")?.takeIf { it.isNotBlank() }
+            ).joinToString(" ").ifBlank { null },
+            osArchitecture = arch,
+            cpuName = cpuName,
+            cpuLogicalProcessors = logical,
+            cpuArchitecture = arch,
+            driveFreeBytes = store?.let { runCatching { it.usableSpace }.getOrNull() },
+            driveSizeBytes = store?.let { runCatching { it.totalSpace }.getOrNull() },
+            questInstalled = combinePcvrPresence(
+                questRegistry.map { it.present } + questPaths.map { it.second }
+            ),
+            questPath = questPath?.toString() ?: questRegistry.firstOrNull { it.present == true }?.evidence,
+            ovrService = service,
+            steamInstalled = combinePcvrPresence(
+                steamKeys.map { it.present } + steamPaths.map { it.second }
+            ),
+            steamvrInstalled = combinePcvrPresence(
+                steamVrRegistry.map { it.present } +
+                    steamVrPaths.map { it.second } + staticSteamVrPaths.map { it.second }
+            ),
+            openXrRuntime = openXr,
+            networkName = network?.first,
+            networkDescription = network?.second
+        )
+    }
+
+    internal fun combinePcvrPresence(probes: List<Boolean?>): Boolean? {
+        if (probes.isEmpty()) return null
+        if (probes.any { it == true }) return true
+        return if (probes.all { it == false }) false else null
+    }
+
+    private fun pathPresence(path: Path): Boolean? =
+        try {
+            Files.readAttributes(path, BasicFileAttributes::class.java)
+            true
+        } catch (_: NoSuchFileException) {
+            false
+        } catch (_: FileNotFoundException) {
+            false
+        } catch (_: IOException) {
+            null
+        } catch (_: SecurityException) {
+            null
+        }
+
+    internal fun registryPresence(result: PcvrCommandResult?): PcvrPresenceResult {
+        if (result == null || result.timedOut || result.exitCode == null) {
+            return PcvrPresenceResult(null)
+        }
+        if (result.exitCode == 0) {
+            return PcvrPresenceResult(true)
+        }
+        val output = (result.stdout + result.stderr).joinToString(" ")
+        val notFound = output.contains("unable to find the specified registry", true) ||
+            output.contains("specified registry key or value", true) ||
+            output.contains("specified key or value", true)
+        return if (notFound) PcvrPresenceResult(false) else PcvrPresenceResult(null)
+    }
+
+    private fun registryPresence(key: String): PcvrPresenceResult {
+        val result = runRegistryCommand(listOf("reg.exe", "query", key))
+        return registryPresence(result).let {
+            if (it.present == true) it.copy(evidence = key) else it
+        }
+    }
+
+    private fun registryValue(key: String, value: String): String? {
+        val attempts = listOf(
+            listOf("reg.exe", "query", key, "/v", value, "/reg:64"),
+            listOf("reg.exe", "query", key, "/v", value, "/reg:32"),
+            listOf("reg.exe", "query", key, "/v", value)
+        )
+        for (command in attempts) {
+            val result = runRegistryCommand(command) ?: continue
+            if (result.exitCode != 0) continue
+            result.stdout.forEach { line ->
+                val match = Regex("""^\s*$value\s+\S+\s+(.+?)\s*$""", RegexOption.IGNORE_CASE)
+                    .find(line)
+                if (match != null) return match.groupValues[1].trim().takeIf { it.isNotBlank() }
+            }
+        }
+        return null
+    }
+
+    private fun runRegistryCommand(command: List<String>): PcvrCommandResult? =
+        runCatching { runPcvrCommand(command, 3_000) }.getOrNull()
+
+    private fun queryOvrService(): String? {
+        val result = runRegistryCommand(listOf("sc.exe", "query", "OVRService")) ?: return null
+        if (result.exitCode != 0) {
+            val absent = result.stdout.any {
+                it.contains("1060") || it.contains("does not exist", true)
+            }
+            return if (absent) "NotInstalled" else null
+        }
+        val state = result.stdout.firstNotNullOfOrNull { line ->
+            Regex("""STATE\s*:\s*\d+\s+(\w+)""", RegexOption.IGNORE_CASE)
+                .find(line)?.groupValues?.getOrNull(1)
+        }
+        return state ?: "Unknown"
+    }
+
+    private fun findPcvrNetwork(): Pair<String, String>? {
+        val interfaces = runCatching {
+            NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+        val candidate = interfaces.firstOrNull {
+            runCatching { it.isUp && !it.isLoopback && !it.isVirtual }.getOrDefault(false)
+        } ?: return null
+        val name = candidate.displayName?.ifBlank { null } ?: candidate.name?.ifBlank { null }
+            ?: return null
+        val description = when {
+            name.contains("wi-fi", true) || name.contains("wifi", true) ||
+                name.contains("wireless", true) -> "Wi-Fi"
+            name.contains("ethernet", true) || name.contains("lan", true) -> "Ethernet"
+            else -> name
+        }
+        return name to description
     }
 
     private fun parseLinkSpeedMbps(value: String?): Double {
@@ -314,7 +660,7 @@ object PcvrChecker {
                 "PCVR يتطلب نظام Windows 10 أو 11 فقط.")
         info.windowsVersion == UNKNOWN ->
             result("نظام التشغيل", PcvrCheckStatus.UNKNOWN, "تعذر قراءة إصدار Windows.",
-                "أعد الفحص بصلاحيات تسمح بقراءة CIM.")
+                "تعذر الحصول على هذه المعلومة من مصادر Windows المتاحة؛ تحقق من الإصدار يدويًا.")
         !info.is64Bit && info.windowsArchitecture.isNotBlank() ->
             result("نظام التشغيل", PcvrCheckStatus.FAIL, "نسخة Windows ليست 64-bit: ${info.windowsArchitecture}",
                 "استخدم Windows 10 أو 11 بنواة 64-bit.")
@@ -327,7 +673,7 @@ object PcvrChecker {
 
     private fun checkRam(info: PcvrSystemInfo) = when {
         info.totalRamGb <= 0.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.UNKNOWN,
-            "تعذر قراءة الذاكرة الفعلية من Windows.", "أعد الفحص بصلاحيات تسمح بقراءة CIM.")
+            "تعذر قراءة الذاكرة الفعلية من Windows.", "تحقق من حجم الذاكرة من إعدادات Windows ثم أعد الفحص.")
         info.totalRamGb >= 16.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.PASS,
             ramExplanation(info), "16GB أو أكثر مناسبة مبدئيًا لمعظم ألعاب PCVR.")
         info.totalRamGb >= 12.0 -> result("ذاكرة الوصول العشوائي (RAM)", PcvrCheckStatus.WARN,
@@ -344,7 +690,7 @@ object PcvrChecker {
     private fun checkCpu(info: PcvrSystemInfo) = when {
         info.cpuName == UNKNOWN || info.cpuCores <= 0 ->
             result("المعالج (CPU)", PcvrCheckStatus.UNKNOWN, "تعذر قراءة طراز أو أنوية المعالج.",
-                "أعد الفحص بصلاحيات تسمح بقراءة CIM.")
+                "تحقق من طراز المعالج والأنوية في إعدادات Windows ثم أعد الفحص.")
         info.cpuCores < 4 -> result("المعالج (CPU)", PcvrCheckStatus.FAIL,
             cpuExplanation(info), "يُنصح بأربعة أنوية فعلية على الأقل لـ PCVR.")
         info.cpuArchitecture.isBlank() || info.cpuArchitecture == UNKNOWN ->
@@ -362,7 +708,7 @@ object PcvrChecker {
 
     internal fun evaluateGpu(info: PcvrSystemInfo) = when {
         !info.gpuKnown -> result("كارت الشاشة (GPU)", PcvrCheckStatus.UNKNOWN,
-            "تعذر قراءة محول الرسوميات من Windows.", "أعد الفحص بصلاحيات تسمح بقراءة CIM.")
+            "تعذر قراءة محول الرسوميات من Windows.", "تحقق من محول PCVR الفعلي في إعدادات الرسوميات ثم أعد الفحص.")
         isRemoteGpuName(info.gpuName) -> result("كارت الشاشة (GPU)", PcvrCheckStatus.UNKNOWN,
             "المحول المقروء يبدو Remote/Virtual أو Display-only: ${info.gpuName}.",
             "أعد الفحص على سطح المكتب المحلي أو تحقق من محول PCVR الفعلي.")
@@ -547,21 +893,25 @@ function Emit([string]@@k, @@v) {
     Write-Output (@@k + "`t" + @@s)
   }
 }
-@@os = Get-CimInstance Win32_OperatingSystem
+function TryCim([string]@@class) {
+  try { return @(Get-CimInstance -ClassName @@class -ErrorAction Stop) }
+  catch { return @() }
+}
+@@os = @(TryCim 'Win32_OperatingSystem') | Select-Object -First 1
 Emit OS_CAPTION @@os.Caption
 Emit OS_BUILD @@os.BuildNumber
 Emit OS_ARCH @@os.OSArchitecture
-@@cpus = @(Get-CimInstance Win32_Processor)
+@@cpus = TryCim 'Win32_Processor'
 if (@@cpus.Count -gt 0) {
   Emit CPU_NAME @@cpus[0].Name
   Emit CPU_CORES ((@@cpus | Measure-Object NumberOfCores -Sum).Sum)
   Emit CPU_LOGICAL ((@@cpus | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
   Emit CPU_ARCH @@cpus[0].Architecture
 }
-@@computer = Get-CimInstance Win32_ComputerSystem
+@@computer = @(TryCim 'Win32_ComputerSystem') | Select-Object -First 1
 Emit RAM_TOTAL_BYTES @@computer.TotalPhysicalMemory
 Emit RAM_AVAILABLE_KB @@os.FreePhysicalMemory
-@@gpus = @(Get-CimInstance Win32_VideoController)
+@@gpus = TryCim 'Win32_VideoController'
 function EmitGpu(@@g) {
   @@name = ([string]@@g.Name).Replace("`t", " ").Replace("`r", " ").Replace("`n", " ")
   @@ram = ([string]@@g.AdapterRAM).Replace("`t", " ")
@@ -569,7 +919,8 @@ function EmitGpu(@@g) {
   Write-Output ("GPU`t" + @@name + "`t" + @@ram + "`t" + @@driver)
 }
 @@gpus | ForEach-Object { EmitGpu @@_ }
-@@drive = Get-CimInstance Win32_LogicalDisk | Where-Object DeviceID -eq @@env:SystemDrive
+@@drive = TryCim 'Win32_LogicalDisk' | Where-Object DeviceID -eq @@env:SystemDrive |
+  Select-Object -First 1
 Emit DRIVE_FREE_BYTES @@drive.FreeSpace
 Emit DRIVE_SIZE_BYTES @@drive.Size
 @@questPaths = @(
@@ -581,9 +932,14 @@ Emit DRIVE_SIZE_BYTES @@drive.Size
   "@@env:LOCALAPPDATA\Oculus"
 )
 @@quest = @@questPaths | Where-Object { Test-Path @@_ } | Select-Object -First 1
-if (@@quest) { Emit QUEST_INSTALLED @@true; Emit QUEST_PATH @@quest } else { Emit QUEST_INSTALLED @@false }
-@@ovr = Get-Service -Name OVRService -ErrorAction SilentlyContinue
-if (@@ovr) { Emit OVR_SERVICE @@ovr.Status } else { Emit OVR_SERVICE 'NotInstalled' }
+if (@@quest) { Emit QUEST_INSTALLED @@true; Emit QUEST_PATH @@quest }
+try {
+  @@ovr = Get-Service -Name OVRService -ErrorAction Stop
+  if (@@ovr) { Emit OVR_SERVICE @@ovr.Status }
+} catch {
+  # A missing service is resolved by the read-only sc.exe fallback.  Do not
+  # call a provider error "NotInstalled" here.
+}
 @@steamPaths = @(
   'HKCU:\SOFTWARE\Valve\Steam',
   'HKLM:\SOFTWARE\Valve\Steam',
@@ -592,7 +948,7 @@ if (@@ovr) { Emit OVR_SERVICE @@ovr.Status } else { Emit OVR_SERVICE 'NotInstall
   "@@{env:ProgramFiles(x86)}\Steam\steam.exe"
 )
 @@steam = @@steamPaths | Where-Object { Test-Path @@_ } | Select-Object -First 1
-if (@@steam) { Emit STEAM_INSTALLED @@true } else { Emit STEAM_INSTALLED @@false }
+if (@@steam) { Emit STEAM_INSTALLED @@true }
 @@steamVrPaths = @(
   'HKCU:\SOFTWARE\Valve\Steam\Apps\250820',
   'HKLM:\SOFTWARE\Valve\Steam\Apps\250820',
@@ -600,7 +956,7 @@ if (@@steam) { Emit STEAM_INSTALLED @@true } else { Emit STEAM_INSTALLED @@false
   "@@env:ProgramFiles\Steam\steamapps\common\SteamVR"
 )
 @@steamvr = @@steamVrPaths | Where-Object { Test-Path @@_ } | Select-Object -First 1
-if (@@steamvr) { Emit STEAMVR_INSTALLED @@true } else { Emit STEAMVR_INSTALLED @@false }
+if (@@steamvr) { Emit STEAMVR_INSTALLED @@true }
 @@xrPaths = @(
   'HKCU:\SOFTWARE\Khronos\OpenXR\1',
   'HKLM:\SOFTWARE\Khronos\OpenXR\1',
@@ -610,7 +966,7 @@ foreach (@@p in @@xrPaths) {
   @@xr = Get-ItemProperty -Path @@p -Name ActiveRuntime -ErrorAction SilentlyContinue
   if (@@xr.ActiveRuntime) { Emit OPENXR_RUNTIME @@xr.ActiveRuntime; break }
 }
-@@controllers = @(Get-CimInstance Win32_USBController | Select-Object -ExpandProperty Name)
+@@controllers = @(TryCim 'Win32_USBController' | Select-Object -ExpandProperty Name)
 if (@@controllers.Count -gt 0) { Emit USB_CONTROLLERS (@@controllers -join '; ') }
 @@adapter = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object Status -eq 'Up' | Select-Object -First 1)
 if (@@adapter.Count -gt 0) {
