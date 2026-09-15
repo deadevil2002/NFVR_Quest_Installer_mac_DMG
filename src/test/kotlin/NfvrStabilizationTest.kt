@@ -1,7 +1,9 @@
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import java.io.File
@@ -39,6 +41,29 @@ class NfvrStabilizationTest {
             transition = { order += "transition" }
         )
         assertEquals(listOf("clear", "transition"), order)
+    }
+
+    @Test
+    fun safeUiTransitionYieldsBetweenFocusClearAndCommit() {
+        val order = mutableListOf<String>()
+        safeUiTransition(
+            clearFocus = { order += "clear" },
+            yieldOnce = { order += "yield" },
+            commit = { order += "commit" }
+        )
+        assertEquals(listOf("clear", "yield", "commit"), order)
+    }
+
+    @Test
+    fun pickerWorkflowStateClosesAfterCancelOrError() {
+        val state = PickerWorkflowState()
+        assertTrue(state.begin())
+        assertTrue(state.isOpen())
+        assertTrue(!state.begin())
+        state.complete()
+        assertTrue(!state.isOpen())
+        assertTrue(state.begin())
+        state.complete()
     }
 
     @Test
@@ -101,6 +126,98 @@ class NfvrStabilizationTest {
         assertTrue(!gate.isOpen())
         assertTrue(gate.tryAcquire())
         gate.release()
+    }
+
+    @Test
+    fun zipSelectionOrchestrationUpdatesBeforePersistAndAnalyzesExactlyOnce() = runBlocking {
+        val game = InstalledQuestApp(
+            packageName = "com.example.game",
+            displayName = "Game"
+        )
+        val file = File.createTempFile("nfvr-dispatch-", ".zip")
+        try {
+            val events = mutableListOf<String>()
+            var analysisCalls = 0
+            var observedGame: InstalledQuestApp? = game
+            orchestrateZipChooserResult(
+                result = DesktopChooserResult.Selected(file),
+                isInstalling = { false },
+                selectedGame = { observedGame },
+                onStaleInstalling = { events += "stale" },
+                onZipStateUpdate = { dispatch ->
+                    assertEquals(game, observedGame)
+                    assertEquals("Game", dispatch.selectedGameLabel)
+                    events += "state"
+                },
+                persistArchiveDirectory = {
+                    events += "persist"
+                },
+                log = {
+                    events += "log"
+                },
+                analyze = {
+                    events += "analyze"
+                    analysisCalls++
+                },
+                onFailure = { events += "failure" },
+                onBusy = { events += "busy" },
+                onCancelled = { events += "cancelled" }
+            )
+            assertEquals(listOf("state", "persist", "log", "log", "analyze"), events)
+            assertEquals(1, analysisCalls)
+            assertEquals(game, observedGame)
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun nonSelectedZipResultsNeverAnalyzeAndFailuresAreReported() = runBlocking {
+        val events = mutableListOf<String>()
+        var analysisCalls = 0
+        val results = listOf(
+            DesktopChooserResult.Cancelled,
+            DesktopChooserResult.Busy,
+            DesktopChooserResult.Failed("فشل", "technical")
+        )
+        results.forEach { result ->
+            orchestrateZipChooserResult(
+                result = result,
+                isInstalling = { false },
+                selectedGame = { null },
+                onStaleInstalling = { events += "stale" },
+                onZipStateUpdate = { events += "state" },
+                persistArchiveDirectory = { events += "persist" },
+                log = { events += "log" },
+                analyze = { analysisCalls++ },
+                onFailure = { events += "failure:${it.userMessage}" },
+                onBusy = { events += "busy" },
+                onCancelled = { events += "cancelled" }
+            )
+        }
+        assertEquals(listOf("cancelled", "busy", "failure:فشل"), events)
+        assertEquals(0, analysisCalls)
+    }
+
+    @Test
+    fun staleInstallingZipSelectionIsRejectedBeforeStateOrAnalysis() = runBlocking {
+        val events = mutableListOf<String>()
+        var analysisCalls = 0
+        orchestrateZipChooserResult(
+            result = DesktopChooserResult.Selected(File("stale.zip")),
+            isInstalling = { true },
+            selectedGame = { null },
+            onStaleInstalling = { events += "stale" },
+            onZipStateUpdate = { events += "state" },
+            persistArchiveDirectory = { events += "persist" },
+            log = { events += "log" },
+            analyze = { analysisCalls++ },
+            onFailure = { events += "failure" },
+            onBusy = { events += "busy" },
+            onCancelled = { events += "cancelled" }
+        )
+        assertEquals(listOf("stale"), events)
+        assertEquals(0, analysisCalls)
     }
 
     @Test

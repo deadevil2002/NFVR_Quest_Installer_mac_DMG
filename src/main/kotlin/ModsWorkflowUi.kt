@@ -58,8 +58,12 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -191,6 +195,7 @@ internal fun sanitizeModsLogText(value: String): String =
 @Suppress("UNUSED_PARAMETER")
 fun ModsWorkflowUi(
     connected: Boolean,
+    pickerOpen: Boolean = false,
     installedApps: List<InstalledQuestApp>,
     scanning: Boolean,
     searchFilter: String,
@@ -220,6 +225,17 @@ fun ModsWorkflowUi(
     modifier: Modifier = Modifier
 ) {
     val focusManager = LocalFocusManager.current
+    val modsTransitionScope = rememberCoroutineScope()
+    fun clearFocusBeforeModsTransition(
+        clearFocus: () -> Unit,
+        transition: () -> Unit
+    ) {
+        modsTransitionScope.launch(Dispatchers.Main.immediate) {
+            clearFocus()
+            yield()
+            transition()
+        }
+    }
     val filteredApps = remember(installedApps, searchFilter) {
         val query = searchFilter.trim().lowercase()
         installedApps.filter {
@@ -228,7 +244,7 @@ fun ModsWorkflowUi(
                 it.packageName.lowercase().contains(query)
         }
     }
-    val editingEnabled = modsUiControlsEnabled(installing)
+    val editingEnabled = modsUiControlsEnabled(installing) && !pickerOpen
     var appPickerRequested by remember(selectedApp) { mutableStateOf(selectedApp == null) }
     val currentStep = when {
         selectedApp == null -> 1

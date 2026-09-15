@@ -29,6 +29,8 @@ import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.application
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
+import com.sun.jna.Native
+import com.sun.jna.Pointer
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
@@ -694,6 +696,7 @@ fun main() {
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
     var modLogText by remember { mutableStateOf("") }
     var modInstallDeviceLost by remember { mutableStateOf(false) }
+    var pickerOpen by remember { mutableStateOf(false) }
     val activityHistory = remember { BoundedActivityHistory() }
     val uiScope = rememberCoroutineScope()
     val focusClearRegistry = remember { UiFocusClearRegistry() }
@@ -1727,6 +1730,32 @@ fun main() {
             NfvrTheme {
                 val pageScroll = rememberScrollState()
                 val focusManager = LocalFocusManager.current
+                val ownerHwnd = remember(window) {
+                    runCatching {
+                        Native.getComponentPointer(window)
+                            ?.let(Pointer::nativeValue)
+                            ?.takeIf { it != 0L }
+                    }.getOrNull()
+                }
+                val showSettings = remember { mutableStateOf(false) }
+                fun requestTabChange(tab: Int) {
+                    if (pickerOpen) return
+                    uiScope.launch(Dispatchers.Main.immediate) {
+                        if (pickerOpen) return@launch
+                        focusManager.clearFocus(force = true)
+                        yield()
+                        if (!pickerOpen) selectedTab = tab
+                    }
+                }
+                fun requestSettings(open: Boolean) {
+                    if (pickerOpen) return
+                    uiScope.launch(Dispatchers.Main.immediate) {
+                        if (pickerOpen) return@launch
+                        focusManager.clearFocus(force = true)
+                        yield()
+                        if (!pickerOpen) showSettings.value = open
+                    }
+                }
                 DisposableEffect(focusManager) {
                     val registration = focusClearRegistry.register {
                         focusManager.clearFocus(force = true)
@@ -1735,7 +1764,6 @@ fun main() {
                 }
                 val fingerprint = remember { LicenseManager.fingerprint() }
                 val licenseState = remember { mutableStateOf(LocalLicenseStore.load(fingerprint)) }
-                val showSettings = remember { mutableStateOf(false) }
 
                 Column(
                     // The mods workflow owns its LazyColumn scroll.  Applying
@@ -1780,12 +1808,10 @@ fun main() {
 
                             Spacer(Modifier.weight(1f))
 
-                            IconButton(onClick = {
-                               focusTransition(
-                                   clearFocus = { focusManager.clearFocus(force = true) },
-                                   transition = { showSettings.value = true }
-                               )
-                            }) {
+                             IconButton(
+                                 onClick = { requestSettings(true) },
+                                 enabled = !pickerOpen
+                             ) {
                                 Icon(Icons.Default.Settings, contentDescription = "الإعدادات")
                             }
                         }
@@ -1830,10 +1856,7 @@ fun main() {
                     if (showSettings.value) {
                         DialogWindow(
                             onCloseRequest = {
-                                focusTransition(
-                                    clearFocus = { focusManager.clearFocus(force = true) },
-                                    transition = { showSettings.value = false }
-                                )
+                                requestSettings(false)
                             },
                             title = "الإعدادات",
                             state = rememberDialogState(size = DpSize(560.dp, 720.dp)),
@@ -1852,12 +1875,10 @@ fun main() {
                                     ) {
                                         Text("الإعدادات", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                         Spacer(Modifier.weight(1f))
-                                        OutlinedButton(onClick = {
-                                            focusTransition(
-                                                clearFocus = { focusManager.clearFocus(force = true) },
-                                                transition = { showSettings.value = false }
-                                            )
-                                        }) { Text("إغلاق") }
+                                         OutlinedButton(
+                                             onClick = { requestSettings(false) },
+                                             enabled = !pickerOpen
+                                         ) { Text("إغلاق") }
                                     }
 
                                     Divider()
@@ -2144,10 +2165,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
 
                                 Button(
                                     onClick = {
-                                        focusTransition(
-                                            clearFocus = { focusManager.clearFocus(force = true) },
-                                            transition = { showSettings.value = true }
-                                        )
+                                            requestSettings(true)
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     enabled = !isActivating
@@ -2167,34 +2185,22 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     TabRow(selectedTabIndex = selectedTab) {
                         Tab(
                             selected = selectedTab == 0,
-                            onClick = {
-                                focusTransition(
-                                    clearFocus = { focusManager.clearFocus(force = true) },
-                                    transition = { selectedTab = 0 }
-                                )
-                            },
+                             onClick = { requestTabChange(0) },
+                             enabled = !pickerOpen,
                             text = { Text("تثبيت الألعاب") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 1,
-                            onClick = {
-                                focusTransition(
-                                    clearFocus = { focusManager.clearFocus(force = true) },
-                                    transition = { selectedTab = 1 }
-                                )
-                            },
+                             onClick = { requestTabChange(1) },
+                             enabled = !pickerOpen,
                             text = { Text("المودات") },
                             icon = { Icon(Icons.Default.Build, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 2,
-                            onClick = {
-                                focusTransition(
-                                    clearFocus = { focusManager.clearFocus(force = true) },
-                                    transition = { selectedTab = 2 }
-                                )
-                            },
+                             onClick = { requestTabChange(2) },
+                             enabled = !pickerOpen,
                             text = { Text("فحص جاهزية PCVR") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
@@ -2240,50 +2246,62 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         ) {
                                             Button(
                                                 onClick = {
+                                                     if (pickerOpen) return@Button
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
                                                     focusManager.clearFocus(force = true)
+                                                     pickerOpen = true
                                                     uiScope.launch {
-                                                        when (val chooserResult = WindowsIsolatedPicker.chooseFolder(
-                                                            savedPaths.lastGameFolder?.let(::File)
-                                                                ?: folders.lastOrNull()?.parentFile
-                                                        )) {
-                                                            is DesktopChooserResult.Selected -> {
-                                                                val selected = chooserResult.file
-                                                                val inspection = withContext(Dispatchers.IO) {
-                                                                    inspectGameFolder(selected)
-                                                                }
-                                                                if (!inspection.installable || inspection.apk == null) {
-                                                                    warningText = inspection.reason
-                                                                        ?: "مجلد اللعبة لا يحتوي بنية قابلة للتثبيت."
-                                                                    appendLog(
-                                                                        "تم رفض مجلد اللعبة ${selected.name}: " +
-                                                                            (inspection.reason ?: "بنية غير مدعومة")
-                                                                    )
-                                                                    return@launch
-                                                                }
-                                                                folders = (folders + inspection.folder).distinctBy { it.absolutePath }
-                                                                savedPaths = savedPaths.copy(
-                                                                    gameFolders = folders.map { it.absolutePath },
-                                                                    lastGameFolder = inspection.folder.absolutePath
-                                                                )
-                                                                withContext(Dispatchers.IO) {
-                                                                    NfvrPathPreferences.saveGameFolders(folders)
-                                                                }
-                                                                rebuildQueueOnIo()
-                                                                warningText = null
-                                                                appendLog("تمت إضافة مجلد اللعبة: ${selected.name}")
-                                                            }
-                                                            is DesktopChooserResult.Failed -> {
-                                                                warningText = chooserResult.userMessage
-                                                                appendLog("فشل اختيار مجلد اللعبة: ${chooserResult.technicalMessage}")
-                                                            }
-                                                            DesktopChooserResult.Busy ->
-                                                                warningText = "نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة."
-                                                            DesktopChooserResult.Cancelled -> Unit
+                                                         yield()
+                                                         val chooserResult =
+                                                             WindowsIsolatedPicker.chooseFolder(
+                                                                 savedPaths.lastGameFolder?.let(::File)
+                                                                     ?: folders.lastOrNull()?.parentFile,
+                                                                 ownerHwnd = ownerHwnd,
+                                                                 onNativeTaskComplete = {
+                                                                     uiScope.launch(Dispatchers.Main.immediate) {
+                                                                         pickerOpen = false
+                                                                     }
+                                                                 }
+                                                             )
+                                                         when (chooserResult) {
+                                                                 is DesktopChooserResult.Selected -> {
+                                                                     val selected = chooserResult.file
+                                                                     val inspection = withContext(Dispatchers.IO) {
+                                                                         inspectGameFolder(selected)
+                                                                     }
+                                                                     if (!inspection.installable || inspection.apk == null) {
+                                                                         warningText = inspection.reason
+                                                                             ?: "مجلد اللعبة لا يحتوي بنية قابلة للتثبيت."
+                                                                         appendLog(
+                                                                             "تم رفض مجلد اللعبة ${selected.name}: " +
+                                                                                 (inspection.reason ?: "بنية غير مدعومة")
+                                                                         )
+                                                                         return@launch
+                                                                     }
+                                                                     folders = (folders + inspection.folder).distinctBy { it.absolutePath }
+                                                                     savedPaths = savedPaths.copy(
+                                                                         gameFolders = folders.map { it.absolutePath },
+                                                                         lastGameFolder = inspection.folder.absolutePath
+                                                                     )
+                                                                     withContext(Dispatchers.IO) {
+                                                                         NfvrPathPreferences.saveGameFolders(folders)
+                                                                     }
+                                                                     rebuildQueueOnIo()
+                                                                     warningText = null
+                                                                     appendLog("تمت إضافة مجلد اللعبة: ${selected.name}")
+                                                                 }
+                                                                 is DesktopChooserResult.Failed -> {
+                                                                     warningText = chooserResult.userMessage
+                                                                     appendLog("فشل اختيار مجلد اللعبة: ${chooserResult.technicalMessage}")
+                                                                 }
+                                                                 DesktopChooserResult.Busy ->
+                                                                     appendLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
+                                                                 DesktopChooserResult.Cancelled ->
+                                                                     appendLog("تم إلغاء اختيار مجلد اللعبة.")
                                                         }
                                                     }
                                                 },
-                                                enabled = hasAuthorizedDevice && !isInstalling
+                                                 enabled = hasAuthorizedDevice && !isInstalling && !pickerOpen
                                             ) { Text("إضافة مجلد") }
 
                                             Button(
@@ -2567,36 +2585,57 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                          }
                                      },
                                     selectedZipFilename = modZipFile?.name,
+                                     pickerOpen = pickerOpen,
                                     onChooseFile = {
-                                        if (isInstallingMod) {
+                                         if (pickerOpen) {
+                                             appendModLog("نافذة اختيار أخرى مفتوحة؛ انتظر إغلاقها.")
+                                         } else if (isInstallingMod) {
                                             appendModLog("لا يمكن تغيير الحزمة أثناء تثبيت المود.")
                                         } else {
                                             focusManager.clearFocus(force = true)
+                                             pickerOpen = true
                                             uiScope.launch {
-                                            when (val chooserResult =
-                                                WindowsIsolatedPicker.chooseZipFile(lastModArchiveDirectory)) {
-                                                is DesktopChooserResult.Selected -> {
-                                                    if (isInstallingMod) {
-                                                        appendModLog("تم تجاهل اختيار حزمة وصل بعد بدء التثبيت.")
-                                                    } else {
-                                                        val file = chooserResult.file
-                                                        invalidateModOperation()
-                                                        modZipFile = file
-                                                        lastModArchiveDirectory = file.parentFile
-                                                        file.parentFile?.let { directory ->
-                                                            withContext(Dispatchers.IO) {
-                                                                NfvrPathPreferences.saveModArchiveDirectory(directory)
-                                                            }
-                                                        }
-                                                        appendModLog("تم اختيار ملف المود: ${file.name}")
-                                                    }
-                                                }
-                                                is DesktopChooserResult.Failed ->
-                                                    appendModLog(chooserResult.userMessage)
-                                                DesktopChooserResult.Busy ->
-                                                    appendModLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
-                                                DesktopChooserResult.Cancelled -> Unit
-                                            }
+                                                 yield()
+                                                 val chooserResult =
+                                                      WindowsIsolatedPicker.chooseZipFile(
+                                                          lastModArchiveDirectory,
+                                                          ownerHwnd = ownerHwnd,
+                                                          onNativeTaskComplete = {
+                                                              uiScope.launch(Dispatchers.Main.immediate) {
+                                                                  pickerOpen = false
+                                                              }
+                                                          }
+                                                       )
+                                                  orchestrateZipChooserResult(
+                                                      result = chooserResult,
+                                                      isInstalling = { isInstallingMod },
+                                                      selectedGame = { selectedApp },
+                                                      onStaleInstalling = {
+                                                          appendModLog("تم تجاهل اختيار حزمة وصل بعد بدء التثبيت.")
+                                                      },
+                                                      onZipStateUpdate = { dispatch ->
+                                                          invalidateModOperation()
+                                                          modZipFile = dispatch.file
+                                                          lastModArchiveDirectory = dispatch.archiveDirectory
+                                                      },
+                                                      persistArchiveDirectory = { directory ->
+                                                          withContext(Dispatchers.IO) {
+                                                              NfvrPathPreferences.saveModArchiveDirectory(directory)
+                                                          }
+                                                      },
+                                                      log = ::appendModLog,
+                                                      analyze = { analyzeSelectedMod() },
+                                                      onFailure = { failed ->
+                                                          appendModLog(failed.userMessage)
+                                                          appendModLog("تفاصيل اختيار الملف: ${failed.technicalMessage}")
+                                                      },
+                                                      onBusy = {
+                                                          appendModLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
+                                                      },
+                                                      onCancelled = {
+                                                          appendModLog("تم إلغاء اختيار ملف المود.")
+                                                      }
+                                                  )
                                             }
                                         }
                                     },

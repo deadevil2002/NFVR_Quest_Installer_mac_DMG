@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.nearfuturevr"
-version = "2.2.0"
+version = "2.2.1"
 
 kotlin {
     jvmToolchain(17)
@@ -33,6 +33,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
     implementation("org.json:json:20240303")
+    // Direct Windows IFileOpenDialog adapter (BSD/Apache-2.0 dual license).
+    implementation("net.java.dev.jna:jna:5.17.0")
+    implementation("net.java.dev.jna:jna-platform:5.17.0")
 
     testImplementation(kotlin("test"))
 }

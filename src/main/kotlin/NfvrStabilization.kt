@@ -18,6 +18,46 @@ fun focusTransition(clearFocus: () -> Unit, transition: () -> Unit) {
 }
 
 /**
+ * Ordering contract for Compose transitions.  The callbacks are supplied by
+ * the UI owner so this remains a pure, desktop-independent helper: focus is
+ * cleared, one dispatcher yield is allowed for composition to commit, and
+ * only then is the selected target changed.
+ */
+fun safeUiTransition(
+    clearFocus: () -> Unit,
+    yieldOnce: () -> Unit,
+    commit: () -> Unit
+) {
+    clearFocus()
+    yieldOnce()
+    commit()
+}
+
+/**
+ * Explicit picker lifecycle state used by the UI gate.  A cancelled or failed
+ * native dialog must still close the state; no caller can silently leave the
+ * application believing that a picker is open.
+ */
+class PickerWorkflowState {
+    private var open = false
+
+    @Synchronized
+    fun begin(): Boolean {
+        if (open) return false
+        open = true
+        return true
+    }
+
+    @Synchronized
+    fun complete() {
+        open = false
+    }
+
+    @Synchronized
+    fun isOpen(): Boolean = open
+}
+
+/**
  * The Compose owner installs the callback while its focus manager is alive.
  * Workflow state helpers may then clear the focused subtree before changing
  * selected targets, but never create or discover a focus manager themselves.
@@ -207,6 +247,70 @@ sealed interface DesktopChooserResult {
         val userMessage: String,
         val technicalMessage: String
     ) : DesktopChooserResult
+}
+
+data class ModZipSelectionDispatch(
+    val file: File,
+    val archiveDirectory: File?,
+    val selectedGameLabel: String,
+    val triggerAnalyzer: Boolean = true
+)
+
+/**
+ * ZIP selection changes only the package side of the Mods workflow. The
+ * selected Quest game is carried through unchanged and the caller dispatches
+ * analysis immediately; a successful picker result cannot become a silent
+ * no-op.
+ */
+fun modZipSelectionDispatch(
+    file: File,
+    selectedGame: InstalledQuestApp?
+): ModZipSelectionDispatch = ModZipSelectionDispatch(
+    file = file,
+    archiveDirectory = file.parentFile,
+    selectedGameLabel = selectedGame?.displayName
+        ?: selectedGame?.packageName
+        ?: "اللعبة المحددة"
+)
+
+/**
+ * Applies one ZIP chooser result in workflow order.  The callbacks are the
+ * Compose/IO boundary: state is updated first, persistence is completed next,
+ * and the existing analyzer is dispatched exactly once last.
+ */
+suspend fun orchestrateZipChooserResult(
+    result: DesktopChooserResult,
+    isInstalling: () -> Boolean,
+    selectedGame: () -> InstalledQuestApp?,
+    onStaleInstalling: () -> Unit,
+    onZipStateUpdate: (ModZipSelectionDispatch) -> Unit,
+    persistArchiveDirectory: suspend (File) -> Unit,
+    log: (String) -> Unit,
+    analyze: suspend () -> Unit,
+    onFailure: (DesktopChooserResult.Failed) -> Unit,
+    onBusy: () -> Unit,
+    onCancelled: () -> Unit
+) {
+    when (result) {
+        is DesktopChooserResult.Selected -> {
+            if (isInstalling()) {
+                onStaleInstalling()
+                return
+            }
+            val dispatch = modZipSelectionDispatch(result.file, selectedGame())
+            onZipStateUpdate(dispatch)
+            dispatch.archiveDirectory?.let { persistArchiveDirectory(it) }
+            log(
+                "تم اختيار ملف المود: ${dispatch.file.name} — " +
+                    "${dispatch.file.length()} بايت — اللعبة: ${dispatch.selectedGameLabel}"
+            )
+            log("جاري تحليل ملف المود تلقائيًا…")
+            if (dispatch.triggerAnalyzer) analyze()
+        }
+        is DesktopChooserResult.Failed -> onFailure(result)
+        DesktopChooserResult.Busy -> onBusy()
+        DesktopChooserResult.Cancelled -> onCancelled()
+    }
 }
 
 /**
