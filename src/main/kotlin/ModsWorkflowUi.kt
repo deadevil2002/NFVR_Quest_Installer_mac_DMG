@@ -58,12 +58,137 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/**
+ * Focus must be cleared before a conditional Mods subtree is changed.  Keeping
+ * the ordering in a small pure helper makes it difficult for a future click
+ * handler to accidentally update state first (which can leave Desktop
+ * Compose with an ActiveParent that has no focused child).
+ */
+internal fun clearFocusBeforeModsTransition(
+    clearFocus: () -> Unit,
+    transition: () -> Unit
+) {
+    clearFocus()
+    transition()
+}
+
+internal enum class ModsUiStatusTone {
+    SUCCESS,
+    INFO,
+    WARNING,
+    ERROR
+}
+
+internal data class ModsUiOutcome(
+    val tone: ModsUiStatusTone,
+    val title: String,
+    val action: String
+)
+
+/**
+ * Maps the engine's explicit outcome to presentation only.  The precondition
+ * fallback keeps an unsafe archive red even if an older analysis object did
+ * not populate the outcome field.
+ */
+internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
+    val blocked = analysis.installPlan.preconditions.filterNot { it.satisfied }
+    val codes = blocked.map { it.code.uppercase(Locale.ROOT) }
+    val hasUnsafeOrCorruptArchive = codes.any { code ->
+        code == "INVALID_ARCHIVE" ||
+            code == "UNSAFE_ARCHIVE" ||
+            code == "CORRUPT_ARCHIVE" ||
+            code == "MALFORMED_ARCHIVE" ||
+            code.contains("UNSAFE") ||
+            code.contains("DANGEROUS_PAYLOAD") ||
+            code.contains("TRAVERSAL")
+    }
+    val requiresLoader = analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ||
+        codes.any { it.contains("LOADER") } ||
+        blocked.any {
+            Regex("(?i)\\b(loader|modloader|محمّل|محمل)\\b").containsMatchIn(it.message)
+        }
+    val builtInContent = analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ||
+        analysis.isBuiltInGameContent ||
+        analysis.externalWorkflow != null
+
+    return when {
+        analysis.outcome == ModInstallOutcome.UNSAFE_ARCHIVE || hasUnsafeOrCorruptArchive -> ModsUiOutcome(
+            ModsUiStatusTone.ERROR,
+            "أرشيف غير آمن أو تالف",
+            "لم يتم نقل أي ملف"
+        )
+        builtInContent -> ModsUiOutcome(
+            ModsUiStatusTone.INFO,
+            "محتوى مخصص مدمج في اللعبة",
+            "يُدار بواسطة نظام المحتوى المخصص المدمج في اللعبة"
+        )
+        requiresLoader -> ModsUiOutcome(
+            ModsUiStatusTone.WARNING,
+            "يتطلب محمّل مودات",
+            "جهّز محمّل المودات المطلوب ثم أعد التحليل"
+        )
+        analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY -> ModsUiOutcome(
+            ModsUiStatusTone.SUCCESS,
+            "جاهز للتثبيت",
+            "استخراج → نقل → تحقق"
+        )
+        analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
+            analysis.packageType == ModPackageType.UNKNOWN ||
+            !analysis.recognized -> ModsUiOutcome(
+            ModsUiStatusTone.WARNING,
+            "غير مدعوم حاليًا",
+            "لا توجد وجهة آمنة معروفة — لم يتم نقل أي ملف"
+        )
+        else -> ModsUiOutcome(
+            ModsUiStatusTone.WARNING,
+            "تحتاج الخطة إلى متطلبات",
+            "لا يمكن التثبيت بهذه الخطة"
+        )
+    }
+}
+
+internal fun modsUiControlsEnabled(installing: Boolean): Boolean = !installing
+
+internal fun sanitizeModsUiText(value: String): String {
+    if (value.isBlank()) return value
+    val withoutUrls = value.replace(
+        Regex("(?i)\\b(?:https?://|www\\.)[^\\s<>]+"),
+        ""
+    )
+    val withoutDomains = withoutUrls.replace(
+        Regex("(?i)\\b(?:[a-z0-9-]+\\.)+(?:com|net|org|io|gg|dev|app)(?:/[^\\s<>]*)?"),
+        ""
+    )
+    return withoutDomains
+        .replace(Regex("(?i)\\bmod\\s*\\.\\s*io\\b"), "")
+        .replace(Regex("(?i)\\b(?:browser|website|web\\s+page|open|visit|browse|external)\\b"), "")
+        .replace(
+            Regex("المتصفح|الموقع|صفحة\\s+(?:الويب|الإنترنت)|فتح\\s+(?:الرابط|صفحة)|افتح|اذهب\\s+إلى"),
+            ""
+        )
+        .replace(Regex("\\s{2,}"), " ")
+        .trim()
+}
+
+internal fun sanitizeModsLogText(value: String): String =
+    value.lineSequence()
+        .filterNot { line ->
+            Regex(
+                "(?i)(https?://|www\\.|\\bmod\\s*\\.\\s*io\\b|\\b(?:browser|website|web\\s+page|external)\\b|المتصفح|الموقع|صفحة\\s+(?:الويب|الإنترنت)|فتح\\s+(?:الرابط|صفحة)|رابط\\s+خارجي|إجراء\\s+خارجي)"
+            ).containsMatchIn(line)
+        }
+        .map(::sanitizeModsUiText)
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+
 @Composable
+@Suppress("UNUSED_PARAMETER")
 fun ModsWorkflowUi(
     connected: Boolean,
     installedApps: List<InstalledQuestApp>,
@@ -88,10 +213,13 @@ fun ModsWorkflowUi(
     installing: Boolean,
     executionProgress: ModsManager.ModExecutionProgress?,
     onInstall: () -> Unit,
+    // Kept for source compatibility with the host screen.  It is intentionally
+    // not invoked; built-in content is informational in this UI.
     onOpenExternalUrl: (String) -> Unit = {},
     logText: String,
     modifier: Modifier = Modifier
 ) {
+    val focusManager = LocalFocusManager.current
     val filteredApps = remember(installedApps, searchFilter) {
         val query = searchFilter.trim().lowercase()
         installedApps.filter {
@@ -100,12 +228,14 @@ fun ModsWorkflowUi(
                 it.packageName.lowercase().contains(query)
         }
     }
+    val editingEnabled = modsUiControlsEnabled(installing)
     var appPickerRequested by remember(selectedApp) { mutableStateOf(selectedApp == null) }
     val currentStep = when {
         selectedApp == null -> 1
         selectedZipFilename.isNullOrBlank() -> 2
         analysis == null -> 3
-        analysis.isExternalWorkflow || installing || executionProgress != null -> 5
+        analysis.isBuiltInGameContent || analysis.isExternalWorkflow ||
+            installing || executionProgress != null -> 5
         else -> 4
     }
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -114,7 +244,25 @@ fun ModsWorkflowUi(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 28.dp, vertical = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp)
             ) {
-                item { Header(connected, scanning, onRefresh, onCancelScan) }
+                item {
+                    Header(
+                        connected = connected,
+                        scanning = scanning,
+                        enabled = editingEnabled,
+                        refresh = {
+                            clearFocusBeforeModsTransition(
+                                { focusManager.clearFocus(force = true) },
+                                onRefresh
+                            )
+                        },
+                        cancelScan = {
+                            clearFocusBeforeModsTransition(
+                                { focusManager.clearFocus(force = true) },
+                                onCancelScan
+                            )
+                        }
+                    )
+                }
                 if (scanning || scanProgress != null) {
                     item { ScanStatus(scanProgress, scanning) }
                 }
@@ -124,9 +272,19 @@ fun ModsWorkflowUi(
                     item {
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                                SearchBox(searchFilter, onSearchFilterChange)
+                                SearchBox(searchFilter, onSearchFilterChange, enabled = editingEnabled)
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Checkbox(checked = showAllApps, onCheckedChange = onShowAllAppsChange)
+                                    Checkbox(
+                                        checked = showAllApps,
+                                        enabled = editingEnabled,
+                                        onCheckedChange = { value ->
+                                            clearFocusBeforeModsTransition(
+                                                { focusManager.clearFocus(force = true) }
+                                            ) {
+                                                onShowAllAppsChange(value)
+                                            }
+                                        }
+                                    )
                                     Text("إظهار تطبيقات النظام والخدمات الداخلية", style = MaterialTheme.typography.labelMedium)
                                 }
                                 when {
@@ -135,10 +293,14 @@ fun ModsWorkflowUi(
                                     filteredApps.isEmpty() -> EmptyState("لا توجد ألعاب مطابقة", "جرّب كلمة بحث أخرى أو حدّث قائمة التطبيقات.", Icons.Default.Search)
                                     else -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         filteredApps.forEach { app ->
-                                            AppRow(app, app == selectedApp) {
-                                                if (scanning) onCancelActiveScanOnSelection()
-                                                appPickerRequested = false
-                                                onSelectApp(app)
+                                            AppRow(app, app == selectedApp, enabled = editingEnabled) {
+                                                clearFocusBeforeModsTransition(
+                                                    { focusManager.clearFocus(force = true) }
+                                                ) {
+                                                    if (scanning) onCancelActiveScanOnSelection()
+                                                    appPickerRequested = false
+                                                    onSelectApp(app)
+                                                }
                                             }
                                         }
                                     }
@@ -150,25 +312,53 @@ fun ModsWorkflowUi(
                     item {
                         SelectedAppCard(
                             selectedApp,
+                            enabled = editingEnabled,
                             onChange = {
-                                appPickerRequested = true
-                                onChangeSelectedApp()
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) }
+                                ) {
+                                    appPickerRequested = true
+                                    onChangeSelectedApp()
+                                }
                             },
                             onClear = {
-                                appPickerRequested = true
-                                onClearSelectedApp()
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) }
+                                ) {
+                                    appPickerRequested = true
+                                    onClearSelectedApp()
+                                }
                             }
                         )
                     }
                 }
                 item { StepTitle("02", "اختر حزمة المود", "يتم فحص ملف ZIP آمنًا قبل لمس أي ملف على النظارة") }
-                if (currentStep == 2) item { ZipCard(selectedZipFilename, onChooseFile, selectedApp) }
+                if (currentStep == 2) {
+                    item {
+                        ZipCard(
+                            selectedZipFilename,
+                            onChooseFile = {
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) },
+                                    onChooseFile
+                                )
+                            },
+                            selectedApp = selectedApp,
+                            enabled = editingEnabled
+                        )
+                    }
+                }
                 else if (!selectedZipFilename.isNullOrBlank()) item { CompletedSummaryCard("حزمة المود", selectedZipFilename) }
                 item { StepTitle("03", "حلّل الحزمة", "تحقق من النوع والتوافق قبل إعداد خطة النقل") }
                 if (currentStep == 3) item {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Button(
-                            onClick = onAnalyze,
+                            onClick = {
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) },
+                                    onAnalyze
+                                )
+                            },
                             enabled = connected && selectedApp != null && !selectedZipFilename.isNullOrBlank() && !analyzing && !installing,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                         ) {
@@ -180,14 +370,32 @@ fun ModsWorkflowUi(
                         if (analysis != null) Text("التحليل مكتمل", color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.labelLarge)
                     }
                 }
-                else if (analysis != null) item { CompletedSummaryCard("التحليل", if (analysis.isExternalWorkflow) "مسار خارجي مدعوم" else "اكتمل فحص الحزمة") }
+                else if (analysis != null) item {
+                    CompletedSummaryCard(
+                        "التحليل",
+                        if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
+                            "محتوى تديره اللعبة"
+                        } else {
+                            "اكتمل فحص الحزمة"
+                        }
+                    )
+                }
                 item { StepTitle("04", "راجع خطة التثبيت", "لا يبدأ النقل إلا بعد فحص النوع والتوافق والوجهات") }
                 if (currentStep == 4 && analysis != null) {
                     item { AnalysisCard(analysis) }
                     item {
                         Button(
-                            onClick = onInstall,
-                            enabled = analysis.installable && analysis.compatibility.compatible && !analysis.installPlan.hasBlockingPreconditions && !installing,
+                            onClick = {
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) },
+                                    onInstall
+                                )
+                            },
+                            enabled = analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+                                analysis.installable &&
+                                analysis.compatibility.compatible &&
+                                !analysis.installPlan.hasBlockingPreconditions &&
+                                !installing,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
                         ) {
                             Icon(Icons.Default.PlayArrow, null)
@@ -196,14 +404,23 @@ fun ModsWorkflowUi(
                         }
                     }
                 }
-                item { StepTitle("05", "الإجراء", "تثبيت متحقق أو فتح مسار خارجي في المتصفح") }
+                item { StepTitle("05", "الإجراء", "تثبيت متحقق أو محتوى تديره اللعبة") }
                 if (currentStep == 5 && analysis != null) item {
-                    if (analysis.isExternalWorkflow) {
-                        ExternalWorkflowCard(analysis, onOpenExternalUrl)
+                    if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
+                        BuiltInContentCard(analysis)
                     } else {
                         Button(
-                            onClick = onInstall,
-                            enabled = analysis.installable && analysis.compatibility.compatible && !analysis.installPlan.hasBlockingPreconditions && !installing,
+                            onClick = {
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) },
+                                    onInstall
+                                )
+                            },
+                            enabled = analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+                                analysis.installable &&
+                                analysis.compatibility.compatible &&
+                                !analysis.installPlan.hasBlockingPreconditions &&
+                                !installing,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
                         ) {
                             if (installing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -214,7 +431,7 @@ fun ModsWorkflowUi(
                     }
                 }
                 if (installing || executionProgress != null) item { ProgressCard(executionProgress) }
-                item { LogCard(logText) }
+                item { LogCard(sanitizeModsLogText(logText)) }
                 item { Spacer(Modifier.height(20.dp)) }
             }
         }
@@ -224,6 +441,7 @@ fun ModsWorkflowUi(
 @Composable private fun Header(
     connected: Boolean,
     scanning: Boolean,
+    enabled: Boolean,
     refresh: () -> Unit,
     cancelScan: () -> Unit
 ) {
@@ -235,9 +453,9 @@ fun ModsWorkflowUi(
         }
         StatusPill(if (connected) "متصل" else "غير متصل", connected)
         if (scanning) {
-            OutlinedButton(onClick = cancelScan) { Text("إلغاء الفحص") }
+            OutlinedButton(onClick = cancelScan, enabled = enabled) { Text("إلغاء الفحص") }
         }
-        IconButton(onClick = refresh, enabled = !scanning) { Icon(Icons.Default.Refresh, "تحديث") }
+        IconButton(onClick = refresh, enabled = enabled && !scanning) { Icon(Icons.Default.Refresh, "تحديث") }
     }
 }
 
@@ -317,12 +535,12 @@ fun ModsWorkflowUi(
     }
 }
 
-@Composable private fun SearchBox(value: String, change: (String) -> Unit) {
+@Composable private fun SearchBox(value: String, change: (String) -> Unit, enabled: Boolean) {
     Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.Search, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(10.dp))
-            BasicTextField(value, change, Modifier.weight(1f), textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true, decorationBox = { inner ->
+            BasicTextField(value, change, Modifier.weight(1f), enabled = enabled, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true, decorationBox = { inner ->
                 if (value.isBlank()) Text("ابحث باسم اللعبة أو package id", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 inner()
             })
@@ -330,8 +548,8 @@ fun ModsWorkflowUi(
     }
 }
 
-@Composable private fun AppRow(app: InstalledQuestApp, selected: Boolean, onClick: () -> Unit) {
-    Surface(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick), color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null) {
+@Composable private fun AppRow(app: InstalledQuestApp, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    Surface(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(enabled = enabled, onClick = onClick), color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null) {
         Row(Modifier.padding(13.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.background), contentAlignment = Alignment.Center) { Text((app.displayName ?: app.packageName).take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold) }
             Spacer(Modifier.width(12.dp))
@@ -347,6 +565,7 @@ fun ModsWorkflowUi(
 
 @Composable private fun SelectedAppCard(
     app: InstalledQuestApp?,
+    enabled: Boolean,
     onChange: () -> Unit,
     onClear: () -> Unit
 ) {
@@ -359,9 +578,9 @@ fun ModsWorkflowUi(
                 Text(app.displayName ?: app.packageName, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text("${app.packageName} · ${app.versionName ?: "إصدار غير معروف"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            OutlinedButton(onClick = onChange) { Text("تغيير") }
+            OutlinedButton(onClick = onChange, enabled = enabled) { Text("تغيير") }
             Spacer(Modifier.width(6.dp))
-            OutlinedButton(onClick = onClear) { Text("مسح") }
+            OutlinedButton(onClick = onClear, enabled = enabled) { Text("مسح") }
         }
     }
 }
@@ -383,7 +602,8 @@ fun ModsWorkflowUi(
 @Composable private fun ZipCard(
     filename: String?,
     onChooseFile: () -> Unit,
-    selectedApp: InstalledQuestApp?
+    selectedApp: InstalledQuestApp?,
+    enabled: Boolean
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -395,80 +615,231 @@ fun ModsWorkflowUi(
                     Text(filename ?: "لم يتم اختيار ملف ZIP", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(if (filename == null) "اختر حزمة مود من جهاز الكمبيوتر" else "الحزمة جاهزة للتحليل", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                OutlinedButton(onClick = onChooseFile) { Text("اختيار ملف") }
+                OutlinedButton(onClick = onChooseFile, enabled = enabled) { Text("اختيار ملف") }
             }
             if (selectedApp != null) StatusNote("الهدف المحدد: ${selectedApp.displayName ?: selectedApp.packageName}", Icons.Default.CheckCircle, MaterialTheme.colorScheme.tertiary)
         }
     }
 }
 
-@Composable private fun ExternalWorkflowCard(
-    analysis: ModPackageAnalysis,
-    onOpenUrl: (String) -> Unit
-) {
-    val workflow = analysis.externalWorkflow ?: return
+@Composable private fun BuiltInContentCard(analysis: ModPackageAnalysis) {
+    val outcome = modsUiOutcome(analysis)
+    val tone = outcomeColor(outcome.tone)
     Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFE0F7FA)),
-        border = BorderStroke(1.dp, Color(0xFF26A6C9))
+        colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.10f)),
+        border = BorderStroke(1.dp, tone)
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Info, null, tint = Color(0xFF087EA4))
+                Icon(Icons.Default.Info, null, tint = tone)
                 Spacer(Modifier.width(10.dp))
-                Text("مسار خارجي مدعوم — Gorilla Tag / mod.io", style = MaterialTheme.typography.titleMedium, color = Color(0xFF075B75))
+                Column(Modifier.weight(1f)) {
+                    Text(outcome.title, style = MaterialTheme.typography.titleMedium, color = tone)
+                    Text(
+                        "النوع: ${displayModPackageType(analysis.packageType)}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            Text(workflow.guidance, color = Color(0xFF075B75))
-            OutlinedButton(onClick = { onOpenUrl(workflow.actionUrl) }) {
-                Text("فتح صفحة mod.io في المتصفح")
-            }
+            Text(
+                sanitizeModsUiText(analysis.message),
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            StatusNote(outcome.action, Icons.Default.Info, tone)
+            StatusNote(
+                "لا توجد وجهة نقل مباشرة آمنة لهذا النوع؛ لم يتم نقل أي ملف.",
+                Icons.Default.CheckCircle,
+                tone
+            )
         }
     }
 }
 
 @Composable private fun AnalysisCard(analysis: ModPackageAnalysis) {
-    val compatible = analysis.compatibility.compatible
-    val warnings = deduplicateModWarnings(analysis.installPlan.preconditions)
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), border = BorderStroke(1.dp, if (compatible) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error)) {
+    val outcome = modsUiOutcome(analysis)
+    val tone = outcomeColor(outcome.tone)
+    val allWarnings = deduplicateModWarnings(analysis.installPlan.preconditions)
+    val loaderPreconditions = allWarnings.filter(::isLoaderPrecondition)
+    val warnings = allWarnings.filterNot(::isLoaderPrecondition)
+    val displayedWarnings = allWarnings.map { it.message }.toSet()
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, tone)
+    ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(if (compatible) Icons.Default.CheckCircle else Icons.Default.Warning, null, tint = if (compatible) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error)
+                Icon(
+                    if (outcome.tone == ModsUiStatusTone.ERROR) Icons.Default.Warning
+                    else if (outcome.tone == ModsUiStatusTone.SUCCESS) Icons.Default.CheckCircle
+                    else Icons.Default.Info,
+                    null,
+                    tint = tone
+                )
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(if (analysis.recognized) "حزمة معروفة وقابلة للفحص" else "تعذر التعرف على الحزمة", style = MaterialTheme.typography.titleMedium)
-                    Text(analysis.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(outcome.title, style = MaterialTheme.typography.titleMedium, color = tone)
+                    Text(
+                        sanitizeModsUiText(analysis.message),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
-                TypeTag(analysis.packageType.name)
+                TypeTag(displayModPackageType(analysis.packageType))
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             InfoGrid(analysis)
+            StatusNote(outcome.action, Icons.Default.Info, tone)
             if (analysis.installPlan.mappings.isNotEmpty()) {
                 Text("خطة الملفات والوجهات", style = MaterialTheme.typography.titleMedium)
                 analysis.installPlan.mappings.forEach { mapping ->
                     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                        Text(mapping.sourcePath, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("← ${mapping.destinationPath}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            mapping.sourcePath,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            "← ${mapping.destinationPath}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
+            LoaderRequirementDetails(analysis.installPlan.loaderRequirement, loaderPreconditions)
             if (warnings.isNotEmpty()) {
                 Text("المتطلبات والتنبيهات", style = MaterialTheme.typography.titleMedium)
-                warnings.forEach { pre -> StatusNote(pre.message, if (pre.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning, if (pre.satisfied) MaterialTheme.colorScheme.tertiary else Color(0xFFFFC266)) }
+                warnings.forEach { pre ->
+                    StatusNote(
+                        sanitizeModsUiText(pre.message),
+                        if (pre.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning,
+                        if (pre.satisfied) MaterialTheme.colorScheme.tertiary else warningColor()
+                    )
+                }
             }
-            val displayedWarnings = warnings.map { it.message }.toSet()
             analysis.compatibility.reasons
                 .distinct()
                 .filterNot(displayedWarnings::contains)
-                .forEach { reason -> StatusNote(reason, Icons.Default.Warning, Color(0xFFFFC266)) }
+                .forEach { reason ->
+                    StatusNote(sanitizeModsUiText(reason), Icons.Default.Warning, warningColor())
+                }
         }
     }
 }
 
+private fun isLoaderPrecondition(precondition: ModInstallPrecondition): Boolean {
+    val code = precondition.code.uppercase(Locale.ROOT)
+    return code.contains("LOADER") ||
+        Regex("(?i)\\b(loader|modloader|محمّل|محمل)\\b")
+            .containsMatchIn(precondition.message)
+}
+
+@Composable
+private fun LoaderRequirementDetails(
+    requirement: ModLoaderRequirement?,
+    legacyPreconditions: List<ModInstallPrecondition>
+) {
+    Text("متطلبات المحمّل وحالته", style = MaterialTheme.typography.titleMedium)
+    if (requirement == null) {
+        if (legacyPreconditions.isEmpty()) {
+            StatusNote(
+                "لم تُعلن الخطة متطلب محمّل مودات.",
+                Icons.Default.Info,
+                MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            legacyPreconditions.forEach { precondition ->
+                StatusNote(
+                    sanitizeModsUiText(precondition.message),
+                    if (precondition.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning,
+                    if (precondition.satisfied) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        warningColor()
+                    }
+                )
+            }
+        }
+        return
+    }
+
+    val requested = requirement.requested
+        .sortedBy { it.displayName }
+        .joinToString(" أو ") { it.displayName }
+        .ifBlank { "غير محدد" }
+    val (statusText, statusIcon, tint) = when (requirement.status) {
+        ModLoaderStatus.DETECTED -> Triple(
+            "تم الاكتشاف",
+            Icons.Default.CheckCircle,
+            MaterialTheme.colorScheme.tertiary
+        )
+        ModLoaderStatus.NOT_DETECTED -> Triple(
+            "غير مكتشف",
+            Icons.Default.Warning,
+            warningColor()
+        )
+        ModLoaderStatus.UNKNOWN -> Triple(
+            "غير معروف",
+            Icons.Default.Info,
+            warningColor()
+        )
+    }
+    StatusNote("المطلوب: $requested", Icons.Default.Info, tint)
+    StatusNote("الحالة: $statusText", statusIcon, tint)
+
+    requirement.message
+        .takeIf { it.isNotBlank() }
+        ?.let { StatusNote(sanitizeModsUiText(it), Icons.Default.Info, tint) }
+
+    val evidence = requirement.detection
+        ?.let { detection ->
+            requirement.requested
+                .sortedBy { it.displayName }
+                .flatMap { loader ->
+                    detection.evidence[loader]?.evidence.orEmpty().map { detail ->
+                        "${loader.displayName}: ${sanitizeModsUiText(detail)}"
+                    }
+                }
+                .filter(String::isNotBlank)
+                .distinct()
+        }
+        .orEmpty()
+    if (evidence.isNotEmpty()) {
+        Text("الدليل المقروء", style = MaterialTheme.typography.labelMedium)
+        evidence.forEach { detail ->
+            StatusNote(detail, Icons.Default.Info, tint)
+        }
+    } else if (requirement.detection != null) {
+        StatusNote(
+            "تم فحص حالة المحمّل بأدلة قراءة فقط؛ لم يتوفر تفصيل إضافي.",
+            Icons.Default.Info,
+            tint
+        )
+    }
+}
+
 @Composable private fun InfoGrid(analysis: ModPackageAnalysis) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        InfoCell("النوع", analysis.packageType.name)
-        InfoCell("الهدف", analysis.installPlan.targetPackageId ?: "غير محدد")
-        InfoCell("الملفات", "${analysis.installPlan.totalFiles}")
-        InfoCell("الحجم", bytes(analysis.installPlan.totalBytes))
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            InfoCell("النتيجة", displayModOutcome(analysis.outcome))
+            InfoCell("النوع", displayModPackageType(analysis.packageType))
+            InfoCell("الهدف", analysis.installPlan.targetPackageId ?: "غير محدد")
+            InfoCell("الملفات", "${analysis.installPlan.totalFiles}")
+            InfoCell("الحجم", bytes(analysis.installPlan.totalBytes))
+        }
+        analysis.installPlan.destinationRoot?.let { destination ->
+            Column {
+                Text(
+                    "جذر الوجهة",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(destination, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
     }
 }
 
@@ -478,18 +849,36 @@ fun ModsWorkflowUi(
 
 @Composable private fun ProgressCard(progress: ModsManager.ModExecutionProgress?) {
     val complete = progress?.phase == ModsManager.ModInstallPhase.COMPLETED
-    Card(colors = CardDefaults.cardColors(containerColor = if (complete) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.primaryContainer)) {
+    val failed = progress?.phase == ModsManager.ModInstallPhase.FAILED
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = when {
+                complete -> MaterialTheme.colorScheme.tertiaryContainer
+                failed -> MaterialTheme.colorScheme.errorContainer
+                else -> MaterialTheme.colorScheme.primaryContainer
+            }
+        )
+    ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (complete) Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.tertiary)
+                else if (failed) Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
                 else CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(12.dp))
-                Text(progress?.message ?: "جارٍ تجهيز التثبيت…", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    sanitizeModsUiText(progress?.message ?: "جارٍ تجهيز التثبيت…"),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                )
             }
             val fraction = progress?.fraction
-            if (fraction == null) LinearProgressIndicator(Modifier.fillMaxWidth()) else {
-                LinearProgressIndicator({ fraction.toFloat().coerceIn(0f, 1f) }, Modifier.fillMaxWidth())
-                Text("${(fraction * 100).toInt()}% — ${progress?.kind?.name ?: "INSTALL"} / ${progress?.phase?.name ?: "PROCESSING"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!failed) {
+                if (fraction == null) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator({ fraction.toFloat().coerceIn(0f, 1f) }, Modifier.fillMaxWidth())
+                    Text("${(fraction * 100).toInt()}% — ${progress?.kind?.name ?: "INSTALL"} / ${progress?.phase?.name ?: "PROCESSING"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -547,4 +936,35 @@ private fun bytes(value: Long): String = when {
     value >= 1024L * 1024L -> "${value / (1024L * 1024L)} MB"
     value >= 1024L -> "${value / 1024L} KB"
     else -> "$value B"
+}
+
+private fun displayModPackageType(type: ModPackageType): String = when (type) {
+    ModPackageType.BONELAB_NATIVE_CONTENT -> "BONELAB — محتوى أصلي"
+    ModPackageType.BONELAB_CODE_MOD -> "BONELAB — Code Mod"
+    ModPackageType.QMOD -> "QMOD"
+    ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> "Virtual Stump — محتوى مدمج"
+    ModPackageType.NFVR_MANIFEST -> "NFVR manifest"
+    ModPackageType.ANDROID_DATA_LAYOUT -> "Android/data"
+    ModPackageType.ANDROID_OBB_LAYOUT -> "Android/obb"
+    ModPackageType.KNOWN_GAME_PROFILE -> "ملف تعريف لعبة معروف"
+    ModPackageType.GENERIC_DATA -> "بيانات Android"
+    ModPackageType.UNKNOWN -> "غير معروف"
+}
+
+private fun displayModOutcome(outcome: ModInstallOutcome): String = when (outcome) {
+    ModInstallOutcome.DIRECT_INSTALL_READY -> "جاهز للتثبيت"
+    ModInstallOutcome.REQUIRES_MOD_LOADER -> "يتطلب محمّل مودات"
+    ModInstallOutcome.BUILT_IN_GAME_CONTENT -> "محتوى مخصص مدمج في اللعبة"
+    ModInstallOutcome.UNSUPPORTED -> "غير مدعوم"
+    ModInstallOutcome.UNSAFE_ARCHIVE -> "أرشيف غير آمن"
+}
+
+private fun warningColor(): Color = Color(0xFFFFB547)
+
+@Composable
+private fun outcomeColor(tone: ModsUiStatusTone): Color = when (tone) {
+    ModsUiStatusTone.SUCCESS -> MaterialTheme.colorScheme.tertiary
+    ModsUiStatusTone.INFO -> Color(0xFF3B9DB3)
+    ModsUiStatusTone.WARNING -> warningColor()
+    ModsUiStatusTone.ERROR -> MaterialTheme.colorScheme.error
 }

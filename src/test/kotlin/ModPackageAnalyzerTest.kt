@@ -16,15 +16,27 @@ class ModPackageAnalyzerTest {
         val zip = zipOf(
             "mod.json" to """
                 {"name":"Tiny mod","id":"tiny","author":"NFVR","version":"1.0",
-                 "packageId":"com.StressLevelZero.BONELAB","modFiles":["lib/tiny.so"]}
+                 "packageId":"com.StressLevelZero.BONELAB","modFiles":["lib/tiny.dat"]}
             """.trimIndent(),
-            "lib/tiny.so" to "binary"
+            "lib/tiny.dat" to "binary"
         )
-        val analysis = analyzer.analyze(zip, bonelab)
+        val analysis = analyzer.analyze(
+            zip,
+            bonelab,
+            ModLoaderDetection(
+                bonelab.packageName,
+                mapOf(
+                    ModLoaderKind.QUEST_LOADER to ModLoaderEvidence(
+                        ModLoaderKind.QUEST_LOADER,
+                        ModLoaderStatus.DETECTED
+                    )
+                )
+            )
+        )
         assertEquals(ModPackageType.QMOD, analysis.packageType)
         assertTrue(analysis.installable)
         assertEquals(1, analysis.installPlan.mappings.size)
-        assertTrue(analysis.installPlan.mappings.single().destinationPath.endsWith("/Mods/lib/tiny.so"))
+        assertTrue(analysis.installPlan.mappings.single().destinationPath.endsWith("/mods/tiny.dat"))
         zip.delete()
     }
 
@@ -92,16 +104,16 @@ class ModPackageAnalyzerTest {
             "nfvr-mod.json" to """
                 {"schemaVersion":1,"name":"Controlled","version":"1",
                  "targetPackageId":"com.StressLevelZero.BONELAB",
-                 "files":[{"source":"payload/mod.so","destination":"controlled/mod.so",
+                 "files":[{"source":"payload/mod.dat","destination":"controlled/mod.dat",
                  "sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}]}
             """.trimIndent(),
-            "payload/mod.so" to "payload"
+            "payload/mod.dat" to "payload"
         )
         val analysis = analyzer.analyze(zip, bonelab)
         assertEquals(ModPackageType.NFVR_MANIFEST, analysis.packageType)
         assertTrue(analysis.installable)
         assertEquals(
-            "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods/controlled/mod.so",
+            "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods/controlled/mod.dat",
             analysis.installPlan.mappings.single().destinationPath
         )
         zip.delete()
@@ -112,9 +124,9 @@ class ModPackageAnalyzerTest {
         val unsafeDestination = zipOf(
             "nfvr-mod.json" to """
                 {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
-                 "files":[{"source":"payload.so","destination":"../payload.so"}]}
+                 "files":[{"source":"payload.dat","destination":"../payload.dat"}]}
             """.trimIndent(),
-            "payload.so" to "payload"
+            "payload.dat" to "payload"
         )
         val destinationAnalysis = analyzer.analyze(unsafeDestination, bonelab)
         assertFalse(destinationAnalysis.installable)
@@ -145,10 +157,10 @@ class ModPackageAnalyzerTest {
     fun computesMissingHashesAndRejectsDangerousSemantics() {
         val zip = zipOf(
             "mod.json" to """
-                {"packageId":"com.StressLevelZero.BONELAB","modFiles":["payload.so"],
+                {"packageId":"com.StressLevelZero.BONELAB","modFiles":["payload.dat"],
                  "commands":["rm -rf /"]}
             """.trimIndent(),
-            "payload.so" to "payload",
+            "payload.dat" to "payload",
             "install.ps1" to "Write-Host unsafe"
         )
         val analysis = analyzer.analyze(zip, bonelab)
@@ -162,9 +174,9 @@ class ModPackageAnalyzerTest {
         val safe = zipOf(
             "nfvr-mod.json" to """
                 {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
-                 "files":[{"source":"payload.so","destination":"payload.so"}]}
+                 "files":[{"source":"payload.dat","destination":"payload.dat"}]}
             """.trimIndent(),
-            "payload.so" to "payload"
+            "payload.dat" to "payload"
         )
         val safeAnalysis = analyzer.analyze(safe, bonelab)
         assertTrue(safeAnalysis.installable)
@@ -200,9 +212,9 @@ class ModPackageAnalyzerTest {
         val zip = zipOf(
             "nfvr-mod.json" to """
                 {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
-                 "files":[{"source":"payload.so","destination":"payload.so"}]}
+                 "files":[{"source":"payload.dat","destination":"payload.dat"}]}
             """.trimIndent(),
-            "payload.so" to "payload"
+            "payload.dat" to "payload"
         )
         val before = analyzer.analyze(zip, bonelab)
         assertTrue(before.installable)
@@ -219,9 +231,9 @@ class ModPackageAnalyzerTest {
             val zip = zipOf(
                 "nfvr-mod.json" to """
                     {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
-                     "files":[{"source":"payload.so","destination":"payload.so"}]}
+                     "files":[{"source":"payload.dat","destination":"payload.dat"}]}
                 """.trimIndent(),
-                "payload.so" to "payload"
+                "payload.dat" to "payload"
             )
             val analysis = analyzer.analyze(zip, bonelab)
             assertTrue(analysis.installable)
@@ -241,9 +253,9 @@ class ModPackageAnalyzerTest {
             val zip = zipOf(
                 "nfvr-mod.json" to """
                     {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
-                     "files":[{"source":"payload.so","destination":"payload.so"}]}
+                     "files":[{"source":"payload.dat","destination":"payload.dat"}]}
                 """.trimIndent(),
-                "payload.so" to "payload"
+                "payload.dat" to "payload"
             )
             val analysis = analyzer.analyze(zip, bonelab)
             assertTrue(analysis.installable)
@@ -270,6 +282,9 @@ class ModPackageAnalyzerTest {
 
     private class FakeAdb : AdbClient(BundledAdb(HostOs.LINUX)) {
         var pushCalls = 0
+
+        override fun pullReadOnly(serial: String, remotePath: String, localFile: File): CmdResult =
+            CmdResult(1, "", "test fake has no APK artifact")
 
         override fun shell(serial: String, vararg args: String): CmdResult =
             when (args.firstOrNull()) {

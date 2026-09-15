@@ -42,4 +42,89 @@ class ModsWorkflowPureTest {
         assertFalse(shouldCollapseInstalledAppList(app, changeRequested = true))
         assertFalse(shouldCollapseInstalledAppList(null, changeRequested = false))
     }
+
+    @Test
+    fun focusIsClearedBeforeAConditionalModsTransition() {
+        val events = mutableListOf<String>()
+
+        clearFocusBeforeModsTransition(
+            clearFocus = { events += "clear-focus" },
+            transition = { events += "change-selection" }
+        )
+
+        assertEquals(listOf("clear-focus", "change-selection"), events)
+    }
+
+    @Test
+    fun targetAndRescanControlsAreLockedWhileInstalling() {
+        assertFalse(modsUiControlsEnabled(installing = true))
+        assertTrue(modsUiControlsEnabled(installing = false))
+    }
+
+    @Test
+    fun legacyExternalLogTextIsNotExposedInModsUi() {
+        val safe = sanitizeModsLogText(
+            "تم تحليل الحزمة\nفتح https://mod.io/g/gorilla-tag في المتصفح\nاكتمل الفحص"
+        )
+
+        assertEquals("تم تحليل الحزمة\nاكتمل الفحص", safe)
+    }
+
+    @Test
+    fun builtInContentTextDoesNotExposeSiteOrBrowserCopy() {
+        val safe = sanitizeModsUiText(
+            "Virtual Stump is managed by mod.io. Open the page in your browser."
+        )
+
+        assertFalse(safe.contains("mod.io", ignoreCase = true))
+        assertFalse(safe.contains("browser", ignoreCase = true))
+        assertFalse(safe.contains("open", ignoreCase = true))
+    }
+
+    @Test
+    fun engineOutcomesKeepSafetyColorsDistinct() {
+        assertEquals(
+            ModsUiStatusTone.SUCCESS,
+            modsUiOutcome(testAnalysis(ModInstallOutcome.DIRECT_INSTALL_READY, ModPackageType.QMOD)).tone
+        )
+        assertEquals(
+            ModsUiStatusTone.WARNING,
+            modsUiOutcome(testAnalysis(ModInstallOutcome.UNSUPPORTED)).tone
+        )
+        assertEquals(
+            ModsUiStatusTone.WARNING,
+            modsUiOutcome(testAnalysis(ModInstallOutcome.REQUIRES_MOD_LOADER, ModPackageType.BONELAB_CODE_MOD)).tone
+        )
+        assertEquals(
+            ModsUiStatusTone.INFO,
+            modsUiOutcome(
+                testAnalysis(
+                    ModInstallOutcome.BUILT_IN_GAME_CONTENT,
+                    ModPackageType.GORILLA_TAG_VIRTUAL_STUMP
+                )
+            ).tone
+        )
+        assertEquals(
+            ModsUiStatusTone.ERROR,
+            modsUiOutcome(testAnalysis(ModInstallOutcome.UNSAFE_ARCHIVE)).tone
+        )
+    }
+
+    private fun testAnalysis(
+        outcome: ModInstallOutcome,
+        packageType: ModPackageType = ModPackageType.UNKNOWN
+    ): ModPackageAnalysis {
+        val installable = outcome == ModInstallOutcome.DIRECT_INSTALL_READY
+        return ModPackageAnalysis(
+            packageType = packageType,
+            recognized = packageType != ModPackageType.UNKNOWN,
+            message = "test",
+            compatibility = ModCompatibility(installable),
+            installPlan = ModInstallPlan(
+                installable = installable,
+                outcome = outcome,
+                packageType = packageType
+            )
+        )
+    }
 }

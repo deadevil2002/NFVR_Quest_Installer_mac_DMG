@@ -14,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.loadImageBitmap
 import androidx.compose.ui.text.font.FontWeight
@@ -32,8 +33,6 @@ import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.awt.Desktop
-import java.awt.FileDialog
-import java.awt.Frame
 import java.net.URI
 import javax.swing.SwingUtilities
 import java.nio.file.Files
@@ -54,7 +53,7 @@ enum class HostOs { WINDOWS, MAC, LINUX }
 private data class GameEntry(
     val folder: File,
     val apk: File,
-    val obbDirs: List<File>,
+    val allowedObbFiles: List<AllowedObbFile>,
     val requiredBytes: Long,
     val packageName: String?
 )
@@ -429,6 +428,25 @@ open class AdbClient(private val bundled: BundledAdb) {
         return runProcess(listOf(adb.absolutePath, "devices", "-l"), workDir = dir)
     }
 
+    /**
+     * Pulls one known remote file without invoking a shell.  This is used for
+     * read-only APK metadata inspection; the caller owns the temporary local
+     * file and is responsible for deleting it.
+     */
+    open fun pullReadOnly(serial: String, remotePath: String, localFile: File): CmdResult {
+        val destination = localFile.absoluteFile
+        val parent = destination.parentFile
+        if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
+            return CmdResult(1, "", "Unable to create pull destination directory")
+        }
+        val (adb, dir) = adbBase()
+        return runProcess(
+            listOf(adb.absolutePath, "-s", serial, "pull", remotePath, destination.absolutePath),
+            workDir = dir,
+            timeoutMs = 20 * 60_000
+        )
+    }
+
 
 
 /**
@@ -547,160 +565,6 @@ private fun parseDfToGb(dfOutput: String): Pair<Double, Double>? {
     val freeGb = availKb.toDouble() / (1024.0 * 1024.0)
     return totalGb to freeGb
 }
-
-private fun scanGameFolder(folder: File): GameEntry? {
-    if (!folder.exists() || !folder.isDirectory) return null
-    val apks = folder.listFiles()?.filter { it.isFile && it.name.lowercase().endsWith(".apk") } ?: emptyList()
-    if (apks.isEmpty()) return null
-    val apk = apks.first()
-
-    val dirs = folder.listFiles()?.filter { it.isDirectory } ?: emptyList()
-    val obbDirs = dirs.filterNot {
-        val n = it.name.lowercase()
-        n == "usb_driver" || n == "drivers" || n.contains("platform-tools")
-    }
-
-    val required = apk.length() + obbDirs.sumOf { dirSizeBytes(it) }
-    return GameEntry(
-        folder = folder,
-        apk = apk,
-        obbDirs = obbDirs,
-        requiredBytes = required,
-        packageName = readApkPackageName(apk)
-    )
-}
-
-/**
- * Opens the native AWT desktop chooser synchronously from a user action.
- *
- * FileDialog has no reliable Windows "select directory" mode.  For a game
- * directory request we therefore use a controlled native strategy: the user
- * selects any regular file inside the game folder (normally its APK), and we
- * return that file's parent.  This avoids Swing ownership/focus races and
- * cannot accidentally return a path which is not a directory.  The game
- * preflight still validates the resulting folder and APK.
- */
-private fun showOwnedChooser(
-    owner: Frame,
-    title: String,
-    mode: DesktopChooserMode,
-    initialDirectory: File? = null,
-    zipOnly: Boolean = false,
-    gate: DesktopChooserGate = desktopChooserGate
-): DesktopChooserResult {
-    if (!gate.tryAcquire()) {
-        DiagnosticLogger.info("chooser busy: title=$title mode=$mode")
-        return DesktopChooserResult.Busy
-    }
-
-    fun restoreOwnerFocusAfterNativeTeardown() {
-        java.awt.EventQueue.invokeLater {
-            runCatching {
-                if (owner.isDisplayable) {
-                    // One deferred request only. Forcing toFront/focus while
-                    // Windows is still tearing down the modal peer can race
-                    // Compose's focus tree and trigger ActiveParent failures.
-                    owner.requestFocus()
-                }
-            }.onFailure {
-                DiagnosticLogger.error("chooser focus restore failed", it)
-            }
-        }
-    }
-
-    fun openOnEdt(): DesktopChooserResult {
-        check(java.awt.EventQueue.isDispatchThread()) { "chooser lifecycle must run on EDT" }
-        var dialog: FileDialog? = null
-        return try {
-            DiagnosticLogger.info(
-                "chooser open: title=$title mode=$mode initial=${initialDirectory?.absolutePath ?: "<default>"}"
-            )
-            dialog = FileDialog(owner, title, FileDialog.LOAD).apply {
-                isMultipleMode = false
-                initialDirectory?.takeIf { it.isDirectory }?.let {
-                    directory = it.absolutePath
-                }
-                filenameFilter = java.io.FilenameFilter { directory, name ->
-                    val candidate = File(directory, name)
-                    candidate.isFile && (!zipOnly || name.lowercase().endsWith(".zip"))
-                }
-            }
-            dialog.isVisible = true
-            val selectedName = dialog.file
-            val selectedDirectory = dialog.directory
-            if (selectedName.isNullOrBlank() || selectedDirectory.isNullOrBlank()) {
-                DiagnosticLogger.info("chooser cancel: title=$title mode=$mode")
-                return DesktopChooserResult.Cancelled
-            }
-
-            val selected = File(selectedDirectory, selectedName).absoluteFile
-            val result = when {
-                !selected.isFile || !selected.canRead() ->
-                    DesktopChooserResult.Failed(
-                        "تعذر قراءة العنصر المحدد. اختر ملفًا صالحًا ثم أعد المحاولة.",
-                        "not-readable:${selected.absolutePath}"
-                    )
-                zipOnly && !selected.name.lowercase().endsWith(".zip") ->
-                    DesktopChooserResult.Failed(
-                        "اختر ملف ZIP صالحًا.",
-                        "not-zip:${selected.name}"
-                    )
-                mode == DesktopChooserMode.DIRECTORY ->
-                    DesktopChooserResult.Selected(selected.parentFile.absoluteFile)
-                else -> DesktopChooserResult.Selected(selected)
-            }
-            when (result) {
-                is DesktopChooserResult.Selected ->
-                    DiagnosticLogger.info("chooser result: ${result.file.absolutePath}")
-                is DesktopChooserResult.Failed ->
-                    DiagnosticLogger.error("chooser result error: ${result.technicalMessage}")
-                else -> Unit
-            }
-            result
-        } catch (error: Throwable) {
-            DiagnosticLogger.error("chooser error: title=$title mode=$mode", error)
-            DesktopChooserResult.Failed(
-                "تعذر فتح نافذة اختيار الملفات. حاول مرة أخرى.",
-                "${error::class.java.name}: ${error.message.orEmpty()}"
-            )
-        } finally {
-            runCatching { dialog?.dispose() }
-                .onFailure { DiagnosticLogger.error("chooser dispose failed", it) }
-            restoreOwnerFocusAfterNativeTeardown()
-        }
-    }
-
-    return try {
-        if (SwingUtilities.isEventDispatchThread()) {
-            openOnEdt()
-        } else {
-            var result: DesktopChooserResult? = null
-            SwingUtilities.invokeAndWait { result = openOnEdt() }
-            result ?: DesktopChooserResult.Failed(
-                "تعذر إكمال نافذة الاختيار. حاول مرة أخرى.",
-                "EDT returned no chooser result"
-            )
-        }
-    } catch (error: Throwable) {
-        DiagnosticLogger.error("chooser dispatch error: title=$title mode=$mode", error)
-        DesktopChooserResult.Failed(
-            "تعذر فتح نافذة الاختيار. حاول مرة أخرى.",
-            "${error::class.java.name}: ${error.message.orEmpty()}"
-        )
-    } finally {
-        gate.release()
-    }
-}
-
-private val desktopChooserGate = DesktopChooserGate()
-
-private fun chooseFolder(owner: Frame, initialDirectory: File? = null): DesktopChooserResult =
-    showOwnedChooser(
-        owner = owner,
-        title = "اختر مجلد اللعبة (اختر أي ملف داخله)",
-        mode = DesktopChooserMode.DIRECTORY,
-        initialDirectory = initialDirectory
-    )
 
 private fun copyToClipboard(text: String) {
     runCatching {
@@ -829,11 +693,16 @@ fun main() {
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
     var modLogText by remember { mutableStateOf("") }
+    var modInstallDeviceLost by remember { mutableStateOf(false) }
     val activityHistory = remember { BoundedActivityHistory() }
     val uiScope = rememberCoroutineScope()
+    val focusClearRegistry = remember { UiFocusClearRegistry() }
+    val scanRequestCoalescer = remember { ScanRequestCoalescer() }
     val appScanMutex = remember { Mutex() }
     var appScanGeneration by remember { mutableStateOf(0L) }
     val installMutex = remember { Mutex() }
+    val modOperationMutex = remember { Mutex() }
+    var modOperationGeneration by remember { mutableStateOf(0L) }
     var activityEvents by remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
 
     // ===== LICENSE UI STATE =====
@@ -883,6 +752,73 @@ fun main() {
         }
     }
 
+    fun invalidateModOperation(clearFocus: Boolean = true) {
+        // This state gate is only reached from Main-dispatched UI/device
+        // callbacks. ADB workers report through Main before calling it.
+        if (clearFocus) focusClearRegistry.clearBeforeUiMutation()
+        modOperationGeneration += 1L
+        modAnalysis = null
+        if (!isInstallingMod) modExecutionProgress = null
+    }
+
+    fun sameModFileSnapshot(current: File?, captured: File): Boolean {
+        if (current == null) return false
+        val currentCanonical = runCatching { current.canonicalFile }.getOrNull() ?: return false
+        val capturedCanonical = runCatching { captured.canonicalFile }.getOrNull() ?: return false
+        return currentCanonical == capturedCanonical &&
+            currentCanonical.isFile &&
+            currentCanonical.length() == captured.length() &&
+            currentCanonical.lastModified() == captured.lastModified()
+    }
+
+    fun sameInstalledAppSnapshot(current: InstalledQuestApp?, captured: InstalledQuestApp): Boolean =
+        current != null &&
+            current.packageName == captured.packageName &&
+            current.versionName == captured.versionName &&
+            current.versionCode == captured.versionCode &&
+            current.apkPath == captured.apkPath
+
+    fun modOperationStillCurrent(
+        generation: Long,
+        capturedFile: File,
+        capturedApp: InstalledQuestApp,
+        capturedSerial: String
+    ): Boolean =
+        generation == modOperationGeneration &&
+            sameModFileSnapshot(modZipFile, capturedFile) &&
+            sameInstalledAppSnapshot(selectedApp, capturedApp) &&
+            connectedDeviceSerial == capturedSerial
+
+    fun updateConnectedDeviceSerial(next: String?) {
+        if (connectedDeviceSerial != next) {
+            val lostDuringInstall = isInstallingMod &&
+                connectedDeviceSerial != null &&
+                connectedDeviceSerial != next
+            focusClearRegistry.clearBeforeUiMutation()
+            connectedDeviceSerial = next
+            if (lostDuringInstall) {
+                modInstallDeviceLost = true
+                statusText = "الحالة: فقد الاتصال — انتظار إنهاء النقل الحالي"
+                warningText = "انقطع اتصال النظارة أثناء نقل المود. لن يتم إخفاء العملية؛ أعد التوصيل وانتظر انتهائها."
+                appendModLog("انقطع اتصال النظارة أثناء نقل المود؛ تم منع اعتماد النتيجة القديمة.")
+            }
+            invalidateModOperation(clearFocus = false)
+        }
+    }
+
+    fun updateSelectedAppFromScan(next: InstalledQuestApp?) {
+        if (isInstallingMod) return
+        // Scanner progress callbacks are marshalled to Dispatchers.Main.immediate
+        // before this helper is called; never clear Compose focus from ADB IO.
+        focusClearRegistry.clearBeforeUiMutation()
+        if (selectedApp != null &&
+            (next == null || !sameInstalledAppSnapshot(selectedApp, next))
+        ) {
+            invalidateModOperation(clearFocus = false)
+        }
+        selectedApp = next
+    }
+
     fun openUrl(url: String) {
         try {
             if (Desktop.isDesktopSupported()) {
@@ -894,20 +830,27 @@ fun main() {
     }
 
     suspend fun rebuildQueueOnIo() {
-        val scanned = withContext(Dispatchers.IO) {
-            folders.mapNotNull { scanGameFolder(it) }
+        val inspected = withContext(Dispatchers.IO) {
+            folders.map { inspectGameFolder(it) }
         }
-        queue = scanned
-    }
-
-    fun chooseModFile(owner: Frame, initialDirectory: File? = null): DesktopChooserResult {
-        return showOwnedChooser(
-            owner = owner,
-            title = "اختر ملف المود (ZIP)",
-            mode = DesktopChooserMode.FILES,
-            initialDirectory = initialDirectory,
-            zipOnly = true
-        )
+        queue = inspected.mapNotNull { inspection ->
+            if (!inspection.installable || inspection.apk == null) return@mapNotNull null
+            GameEntry(
+                folder = inspection.folder,
+                apk = inspection.apk,
+                allowedObbFiles = inspection.allowedObbFiles,
+                requiredBytes = inspection.requiredBytes,
+                packageName = inspection.packageName
+            )
+        }
+        inspected
+            .filterNot { it.installable }
+            .forEach { inspection ->
+                appendLog(
+                    "تم تجاهل مجلد ${inspection.folder.name}: " +
+                        (inspection.reason ?: "لا يحتوي بنية لعبة قابلة للتثبيت.")
+                )
+            }
     }
 
     suspend fun getAuthorizedSerialOrNull(): String? {
@@ -950,11 +893,11 @@ fun main() {
                                 previousSnapshot,
                                 (update.apps + previousSnapshot).distinctBy { it.packageName }
                             )
-                            selectedApp = resolveScanSelection(
+                            updateSelectedAppFromScan(resolveScanSelection(
                                 capturedPackageName = selectedPackageName,
                                 currentPackageName = selectedApp?.packageName,
                                 apps = installedApps
-                            )
+                            ))
                         }
                     }
                 }
@@ -969,11 +912,11 @@ fun main() {
                 val currentPackages = scanned.mapTo(mutableSetOf()) { it.packageName }
                 val retainedPrevious = previousSnapshot.filter { it.packageName in currentPackages }
                 installedApps = mergeInstalledAppSnapshot(retainedPrevious, scanned)
-                selectedApp = resolveScanSelection(
+                updateSelectedAppFromScan(resolveScanSelection(
                     capturedPackageName = selectedPackageName,
                     currentPackageName = selectedApp?.packageName,
                     apps = installedApps
-                )
+                ))
                 appScanProgress = InstalledAppsScanProgress(
                     apps = installedApps,
                     processed = scanned.size,
@@ -990,12 +933,17 @@ fun main() {
             }
             throw e
         } catch (e: Exception) {
-            appendModLog("تعذر فحص التطبيقات المثبتة: ${e.message ?: "خطأ غير معروف"}")
-            appScanProgress = (appScanProgress
-                ?: InstalledAppsScanProgress(previousSnapshot, 0, null))
-                .copy(error = e.message ?: "خطأ غير معروف")
+            if (generation == appScanGeneration) {
+                appendModLog("تعذر فحص التطبيقات المثبتة: ${e.message ?: "خطأ غير معروف"}")
+                appScanProgress = (appScanProgress
+                    ?: InstalledAppsScanProgress(previousSnapshot, 0, null))
+                    .copy(error = e.message ?: "خطأ غير معروف")
+            }
             DiagnosticLogger.error("فشل فحص تطبيقات Quest المثبتة", e)
         } finally {
+            // Invalidate callbacks queued by the scanner after either a
+            // successful final snapshot, an error, or cancellation.
+            if (generation == appScanGeneration) appScanGeneration += 1L
             scanningApps = false
             appScanMutex.unlock()
         }
@@ -1005,13 +953,19 @@ fun main() {
         // Keep the visible scanning state until the interruptible ADB process
         // has actually terminated and the scan coroutine reaches its catch/
         // finally block. This prevents reporting cancellation prematurely.
-        if (invalidatePendingCallbacks) appScanGeneration += 1L
+        // Always invalidate queued progress/finalization callbacks.  A normal
+        // cancel must not allow a late ADB snapshot to replace a newer one.
+        scanRequestCoalescer.cancel()
+        appScanGeneration += 1L
         appScanJob?.cancel()
     }
 
     fun startInstalledAppsScan() {
-        if (appScanJob?.isActive == true) return
-        val job = uiScope.launch { runCatching { refreshInstalledApps() } }
+        if (appScanJob?.isActive == true || scanningApps) {
+            scanRequestCoalescer.requestWhileBusy()
+            return
+        }
+        val job = uiScope.launch { refreshInstalledApps() }
         appScanJob = job
         job.invokeOnCompletion {
             uiScope.launch(Dispatchers.Main.immediate) {
@@ -1021,27 +975,77 @@ fun main() {
                         .copy(apps = installedApps, cancelled = true)
                 }
                 if (appScanJob === job) appScanJob = null
+                if (scanRequestCoalescer.takePendingAfterCompletion()) {
+                    startInstalledAppsScan()
+                }
             }
         }
     }
 
     suspend fun analyzeSelectedMod() {
-        val file = modZipFile ?: return
-        analyzingMod = true
-        modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.ANALYZING, null, "تحليل بنية الحزمة وبياناتها")
+        if (!modOperationMutex.tryLock()) {
+            appendModLog("هناك عملية مود أخرى قيد التنفيذ.")
+            return
+        }
         try {
+            val file = modZipFile
+            val app = selectedApp
+            if (file == null) {
+                appendModLog("اختر ملف المود قبل التحليل.")
+                return
+            }
+            if (app == null) {
+                appendModLog("اختر لعبة مثبتة قبل تحليل المود.")
+                return
+            }
+            val requestGeneration = modOperationGeneration
+            val serial = getAuthorizedSerialOrNull()
+            if (serial == null) {
+                appendModLog("لا يوجد جهاز مصرح به لتحليل المود.")
+                return
+            }
+            if (requestGeneration != modOperationGeneration ||
+                !sameModFileSnapshot(modZipFile, file) ||
+                !sameInstalledAppSnapshot(selectedApp, app)
+            ) {
+                appendModLog("تم إلغاء التحليل لأن اختيار الحزمة أو اللعبة تغيّر.")
+                return
+            }
+            if (connectedDeviceSerial != null && connectedDeviceSerial != serial) {
+                appendModLog("تغيّر جهاز Quest أثناء تجهيز التحليل. أعد المحاولة.")
+                return
+            }
+            // A scan may not have published the serial yet when the user
+            // presses Analyze. Establish the snapshot without treating the
+            // same device as a race.
+            connectedDeviceSerial = serial
+            val generation = ++modOperationGeneration
+            analyzingMod = true
+            modExecutionProgress = ModsManager.ModExecutionProgress(
+                ModsManager.ModInstallPhase.ANALYZING,
+                null,
+                "تحليل بنية الحزمة وبياناتها"
+            )
             val analysis = withContext(Dispatchers.IO) {
-                modsManager.analyzeModPackage(file, selectedApp)
+                modsManager.analyzeModPackage(serial, file, app)
+            }
+            val currentSerial = getAuthorizedSerialOrNull()
+            if (currentSerial != serial ||
+                !modOperationStillCurrent(generation, file, app, serial)
+            ) {
+                appendModLog("تم تجاهل نتيجة تحليل قديمة بعد تغيّر الحزمة أو اللعبة أو الجهاز.")
+                return
             }
             modAnalysis = analysis
             appendModLog("تحليل الحزمة: ${analysis.packageType} — ${analysis.message}")
         } catch (e: Exception) {
             modAnalysis = null
             appendModLog("فشل تحليل الحزمة: ${e.message ?: "خطأ غير معروف"}")
-            DiagnosticLogger.error("فشل تحليل حزمة مود ${file.name}", e)
+            DiagnosticLogger.error("فشل تحليل حزمة مود ${modZipFile?.name.orEmpty()}", e)
         } finally {
             analyzingMod = false
             modExecutionProgress = null
+            modOperationMutex.unlock()
         }
     }
 
@@ -1062,7 +1066,7 @@ fun main() {
             if (rows.isEmpty()) {
                 hasAuthorizedDevice = false
                 deviceGuidance = DeviceGuidanceState.NO_DEVICE
-                connectedDeviceSerial = null
+                updateConnectedDeviceSerial(null)
                 connectionText = "الاتصال: لا يوجد جهاز متصل"
                 deviceText = "—"
                 storageText = "—"
@@ -1080,7 +1084,7 @@ fun main() {
             if (serial == null) {
                 hasAuthorizedDevice = false
                 deviceGuidance = deviceGuidanceState(rows, false)
-                connectedDeviceSerial = null
+                updateConnectedDeviceSerial(null)
                 connectionText = "الاتصال: جهاز ADB يحتاج إجراء"
                 deviceText = rows.joinToString("، ") { "${it.serial}: ${it.state.name.lowercase()}" }
                 storageText = "—"
@@ -1097,7 +1101,7 @@ fun main() {
 
             hasAuthorizedDevice = true
             deviceGuidance = DeviceGuidanceState.AUTHORIZED
-            connectedDeviceSerial = serial
+            updateConnectedDeviceSerial(serial)
             warningText = null
 
             connectionText = "الاتصال: مصرح وجاهز"
@@ -1142,7 +1146,7 @@ fun main() {
         } catch (e: Throwable) {
             hasAuthorizedDevice = false
             deviceGuidance = DeviceGuidanceState.NO_DEVICE
-            connectedDeviceSerial = null
+            updateConnectedDeviceSerial(null)
             connectionText = "الاتصال: ADB غير جاهز"
             deviceText = "—"
             storageText = "—"
@@ -1202,7 +1206,14 @@ fun main() {
                 val s2 = getAuthorizedSerialOrNull()!!
                 val entry = queue[i]
                 val localIssues = withContext(Dispatchers.IO) {
-                    validateLocalPreflight(entry.apk, entry.obbDirs, entry.packageName)
+                    validateLocalPreflight(entry.apk, emptyList(), entry.packageName) +
+                        validateAllowedObbFiles(
+                            entry.folder,
+                            entry.allowedObbFiles,
+                            entry.packageName
+                        ).map {
+                            "ملف OBB غير صالح أو تغيّر منذ الفحص: $it"
+                        }
                 }
                 if (localIssues.isNotEmpty()) {
                     installPhase = GameInstallPhase.FAILED
@@ -1302,26 +1313,52 @@ fun main() {
 
                 setProgressWithinGame(0.25f)
 
-                if (entry.obbDirs.isNotEmpty()) {
+                if (entry.allowedObbFiles.isNotEmpty()) {
                     val totalObbBytes = withContext(Dispatchers.IO) {
-                        entry.obbDirs.sumOf { dirSizeBytes(it) }.coerceAtLeast(1L)
+                        entry.allowedObbFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
                     }
                     var copiedObbBytes = 0L
-                    for (dir in entry.obbDirs) {
+                    val obbTargetRoot = entry.allowedObbFiles
+                        .first()
+                        .remoteDirectory
+                    val mkdirResult = withContext(Dispatchers.IO) {
+                        adb.shell(s2, "mkdir", "-p", obbTargetRoot)
+                    }
+                    if (mkdirResult.exit != 0) {
+                        installPhase = GameInstallPhase.FAILED
+                        warningText = "تعذر إنشاء مجلد OBB للعبة."
+                        statusText = "الحالة: فشل نسخ OBB"
+                        appendLog("فشل إنشاء مجلد OBB", mkdirResult.out, mkdirResult.err)
+                        resumeIndex = i
+                        isInstalling = false
+                        return
+                    }
+                    for (allowed in entry.allowedObbFiles) {
+                        val obbFile = withContext(Dispatchers.IO) {
+                            revalidateAllowedObbFile(entry.folder, allowed)
+                        }
+                        if (obbFile == null) {
+                            installPhase = GameInstallPhase.FAILED
+                            warningText = "تغيّر ملف OBB أثناء التثبيت: ${allowed.relativePath}. أعد فحص مجلد اللعبة."
+                            statusText = "الحالة: فشل نسخ OBB"
+                            appendLog("تم إيقاف التثبيت لأن ملف OBB تغيّر: ${allowed.relativePath}")
+                            resumeIndex = i
+                            isInstalling = false
+                            return
+                        }
                         installPhase = GameInstallPhase.TRANSFERRING_OBB
-                        progressLabel = "نسخ ملفات OBB: ${dir.name}"
-                        appendLog("نسخ OBB: ${dir.name}")
-
-                        val target = "/sdcard/Android/obb/${dir.name}"
+                        progressLabel = "نسخ ملف OBB: ${allowed.file.name}"
+                        appendLog("نسخ OBB: ${allowed.relativePath}")
+                        val target = "${allowed.remoteDirectory}/${allowed.remoteFileName}"
 
                         val pushRes = withContext(Dispatchers.IO) {
-                            adb.pushWithProgress(s2, dir, target) { copied, _ ->
+                            adb.pushWithProgress(s2, obbFile, target) { copied, _ ->
                             // تحديث نسبة حقيقية حسب حجم ملفات OBB
                             val overall = (copiedObbBytes + copied).coerceAtMost(totalObbBytes)
                             val frac = overall.toFloat() / totalObbBytes.toFloat()
                             setProgressWithinGame(
                                 p = 0.25f + 0.70f * frac,
-                                item = "OBB: ${dir.name}"
+                                item = "OBB: ${allowed.file.name}"
                             )
                             }
                         }
@@ -1355,8 +1392,7 @@ fun main() {
                         }
 
                         // نجاح النسخ — ثبّت التقدم لهذه اللعبة
-                        val copiedDirectoryBytes = withContext(Dispatchers.IO) { dirSizeBytes(dir) }
-                        copiedObbBytes = (copiedObbBytes + copiedDirectoryBytes).coerceAtMost(totalObbBytes)
+                        copiedObbBytes = (copiedObbBytes + allowed.sizeBytes).coerceAtMost(totalObbBytes)
                         setProgressWithinGame(0.25f + 0.70f * (copiedObbBytes.toFloat() / totalObbBytes.toFloat()))
                     }
                 } else {
@@ -1429,11 +1465,13 @@ fun main() {
                     statusText = "الحالة: فشل التحقق"
                     return
                 }
-                for (dir in entry.obbDirs) {
-                    val target = "/sdcard/Android/obb/${dir.name}"
-                    val expected = withContext(Dispatchers.IO) {
-                        expectedObbFiles(dir, target)
-                    }
+                val expected = entry.allowedObbFiles.map { allowed ->
+                    ExpectedObbFile(
+                        remotePath = "${allowed.remoteDirectory}/${allowed.remoteFileName}",
+                        sizeBytes = allowed.sizeBytes
+                    )
+                }
+                if (entry.allowedObbFiles.isNotEmpty()) {
                     val actual = expected.mapNotNull { expectedFile ->
                         val check = withContext(Dispatchers.IO) {
                             adb.shell(verifySerial, "stat", "-c", "%s", expectedFile.remotePath)
@@ -1445,7 +1483,7 @@ fun main() {
                     val verification = verifyExpectedObbFiles(expected, actual)
                     if (!verification.valid) {
                         installPhase = GameInstallPhase.FAILED
-                        warningText = "تعذر التحقق من ملفات OBB ${dir.name}.\n" +
+                        warningText = "تعذر التحقق من ملفات OBB للعبة ${entry.folder.name}.\n" +
                             "مفقود: ${verification.missing.joinToString(", ")}\n" +
                             "بحجم غير صحيح: ${verification.mismatched.joinToString(", ")}"
                         statusText = "الحالة: فشل التحقق"
@@ -1540,25 +1578,56 @@ fun main() {
     }
 
     suspend fun installSelectedMod() {
-        val file = modZipFile
-        val analysis = modAnalysis
-        if (file == null || analysis == null) {
-            appendModLog("اختر الحزمة وحللها قبل التثبيت.")
+        if (!modOperationMutex.tryLock()) {
+            appendModLog("هناك عملية مود أخرى قيد التنفيذ.")
             return
         }
-        if (!analysis.installPlan.installable || analysis.installPlan.hasBlockingPreconditions) {
-            appendModLog("تم إيقاف التثبيت: الخطة غير متوافقة أو غير آمنة.")
-            return
-        }
-        isInstallingMod = true
-        appendModLog("==============================================")
-        appendModLog("بدء تنفيذ الخطة المعتمدة: ${file.name}")
-        appendModLog("==============================================")
+        var operationGeneration: Long? = null
         try {
+            val file = modZipFile
+            val analysis = modAnalysis
+            val app = selectedApp
+            if (file == null || analysis == null || app == null) {
+                appendModLog("اختر الحزمة ولعبة مثبتة وحللها قبل التثبيت.")
+                return
+            }
+            if (!analysis.installPlan.installable || analysis.installPlan.hasBlockingPreconditions) {
+                appendModLog("تم إيقاف التثبيت: الخطة غير متوافقة أو غير آمنة.")
+                return
+            }
+            val requestGeneration = modOperationGeneration
             withContext(Dispatchers.IO) { adb.startServer() }
             val serial = getAuthorizedSerialOrNull()
             if (serial == null) {
                 appendModLog("لا يوجد جهاز متصل أو مصرح به")
+                return
+            }
+            if (requestGeneration != modOperationGeneration ||
+                !sameModFileSnapshot(modZipFile, file) ||
+                !sameInstalledAppSnapshot(selectedApp, app)
+            ) {
+                appendModLog("تم إيقاف التثبيت لأن اختيار الحزمة أو اللعبة تغيّر.")
+                return
+            }
+            if (connectedDeviceSerial != null && connectedDeviceSerial != serial) {
+                appendModLog("تغيّر جهاز Quest أثناء تجهيز التثبيت. أعد التحليل.")
+                return
+            }
+            connectedDeviceSerial = serial
+            val generation = ++modOperationGeneration
+            operationGeneration = generation
+            isInstallingMod = true
+            modInstallDeviceLost = false
+            modExecutionProgress = ModsManager.ModExecutionProgress(
+                ModsManager.ModInstallPhase.PREPARING,
+                null,
+                "تنفيذ خطة تثبيت المود"
+            )
+            appendModLog("==============================================")
+            appendModLog("بدء تنفيذ الخطة المعتمدة: ${file.name}")
+            appendModLog("==============================================")
+            if (!modOperationStillCurrent(generation, file, app, serial)) {
+                appendModLog("تم إيقاف التثبيت لأن اختيار اللعبة أو الحزمة أو الجهاز تغيّر.")
                 return
             }
             val installResult = withContext(Dispatchers.IO) {
@@ -1568,9 +1637,29 @@ fun main() {
                     plan = analysis.installPlan
                 ) { update ->
                     uiScope.launch {
-                        modExecutionProgress = update
+                        if (generation == modOperationGeneration) {
+                            modExecutionProgress = update
+                        }
                     }
                 }
+            }
+            val currentSerial = getAuthorizedSerialOrNull()
+            if (currentSerial != serial ||
+                !modOperationStillCurrent(generation, file, app, serial)
+            ) {
+                if (modInstallDeviceLost) {
+                    appendModLog("انتهى النقل بعد فقد الاتصال؛ لم يتم اعتماد نتيجته.")
+                    warningText = "فقد الاتصال أثناء نقل المود. أعد توصيل النظارة ثم أعد التحليل والتثبيت."
+                    statusText = "الحالة: لم يتم اعتماد التثبيت"
+                    modExecutionProgress = ModsManager.ModExecutionProgress(
+                        ModsManager.ModInstallPhase.FAILED,
+                        null,
+                        "فقد الاتصال أثناء النقل؛ أعد تشغيل التثبيت بعد إعادة التحليل."
+                    )
+                } else {
+                    appendModLog("تم تجاهل نتيجة تثبيت قديمة بعد تغيّر الحزمة أو اللعبة أو الجهاز.")
+                }
+                return
             }
             if (installResult.success) {
                 appendModLog(installResult.message)
@@ -1579,13 +1668,26 @@ fun main() {
                 appendModLog("==============================================")
             } else {
                 appendModLog("فشل التثبيت: ${installResult.message}")
-                    modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.FAILED, null, installResult.message)
+                modExecutionProgress = ModsManager.ModExecutionProgress(
+                    ModsManager.ModInstallPhase.FAILED,
+                    null,
+                    installResult.message
+                )
             }
         } catch (e: Exception) {
-            appendModLog("خطأ غير متوقع: ${e.message}")
-            modExecutionProgress = ModsManager.ModExecutionProgress(ModsManager.ModInstallPhase.FAILED, null, "تعذر إكمال التثبيت")
+            if (operationGeneration == null || operationGeneration == modOperationGeneration) {
+                appendModLog("خطأ غير متوقع: ${e.message}")
+                modExecutionProgress = ModsManager.ModExecutionProgress(
+                    ModsManager.ModInstallPhase.FAILED,
+                    null,
+                    "تعذر إكمال التثبيت"
+                )
+            } else {
+                appendModLog("تم تجاهل خطأ من عملية تثبيت قديمة.")
+            }
         } finally {
             isInstallingMod = false
+            modOperationMutex.unlock()
         }
     }
 
@@ -1621,14 +1723,16 @@ fun main() {
         title = "Near FutureVR - مثبت ألعاب Meta Quest",
         icon = painterResource("nfvr_logo.png")
     ) {
-    // WindowScope.window is the actual Compose native window.  Passing this
-    // owner explicitly prevents chooser focus from being stolen by an
-    // unrelated AWT/Swing window.
-    val chooserOwner = window
-
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
             NfvrTheme {
                 val pageScroll = rememberScrollState()
+                val focusManager = LocalFocusManager.current
+                DisposableEffect(focusManager) {
+                    val registration = focusClearRegistry.register {
+                        focusManager.clearFocus(force = true)
+                    }
+                    onDispose { registration.close() }
+                }
                 val fingerprint = remember { LicenseManager.fingerprint() }
                 val licenseState = remember { mutableStateOf(LocalLicenseStore.load(fingerprint)) }
                 val showSettings = remember { mutableStateOf(false) }
@@ -1676,7 +1780,12 @@ fun main() {
 
                             Spacer(Modifier.weight(1f))
 
-                            IconButton(onClick = { showSettings.value = true }) {
+                            IconButton(onClick = {
+                               focusTransition(
+                                   clearFocus = { focusManager.clearFocus(force = true) },
+                                   transition = { showSettings.value = true }
+                               )
+                            }) {
                                 Icon(Icons.Default.Settings, contentDescription = "الإعدادات")
                             }
                         }
@@ -1720,7 +1829,12 @@ fun main() {
                     // SETTINGS (LICENSE)
                     if (showSettings.value) {
                         DialogWindow(
-                            onCloseRequest = { showSettings.value = false },
+                            onCloseRequest = {
+                                focusTransition(
+                                    clearFocus = { focusManager.clearFocus(force = true) },
+                                    transition = { showSettings.value = false }
+                                )
+                            },
                             title = "الإعدادات",
                             state = rememberDialogState(size = DpSize(560.dp, 720.dp)),
                             resizable = false
@@ -1738,7 +1852,12 @@ fun main() {
                                     ) {
                                         Text("الإعدادات", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                         Spacer(Modifier.weight(1f))
-                                        OutlinedButton(onClick = { showSettings.value = false }) { Text("إغلاق") }
+                                        OutlinedButton(onClick = {
+                                            focusTransition(
+                                                clearFocus = { focusManager.clearFocus(force = true) },
+                                                transition = { showSettings.value = false }
+                                            )
+                                        }) { Text("إغلاق") }
                                     }
 
                                     Divider()
@@ -1951,6 +2070,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                                 if (ok) {
                                                                     activationUiMsg = "تم التفعيل بنجاح"
                                                                     licenseState.value = LocalLicenseStore.load(deviceHash)
+                                                                    focusManager.clearFocus(force = true)
                                                                     showSettings.value = false
                                                                 } else {
                                                                     activationUiMsg = "فشل حفظ التفعيل محليًا: ${msg ?: "غير معروف"}"
@@ -2023,7 +2143,12 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 )
 
                                 Button(
-                                    onClick = { showSettings.value = true },
+                                    onClick = {
+                                        focusTransition(
+                                            clearFocus = { focusManager.clearFocus(force = true) },
+                                            transition = { showSettings.value = true }
+                                        )
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     enabled = !isActivating
                                 ) {
@@ -2042,19 +2167,34 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     TabRow(selectedTabIndex = selectedTab) {
                         Tab(
                             selected = selectedTab == 0,
-                            onClick = { selectedTab = 0 },
+                            onClick = {
+                                focusTransition(
+                                    clearFocus = { focusManager.clearFocus(force = true) },
+                                    transition = { selectedTab = 0 }
+                                )
+                            },
                             text = { Text("تثبيت الألعاب") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 1,
-                            onClick = { selectedTab = 1 },
+                            onClick = {
+                                focusTransition(
+                                    clearFocus = { focusManager.clearFocus(force = true) },
+                                    transition = { selectedTab = 1 }
+                                )
+                            },
                             text = { Text("المودات") },
                             icon = { Icon(Icons.Default.Build, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 2,
-                            onClick = { selectedTab = 2 },
+                            onClick = {
+                                focusTransition(
+                                    clearFocus = { focusManager.clearFocus(force = true) },
+                                    transition = { selectedTab = 2 }
+                                )
+                            },
                             text = { Text("فحص جاهزية PCVR") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
@@ -2101,26 +2241,46 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Button(
                                                 onClick = {
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
-                                                     val chooserResult = chooseFolder(
-                                                         chooserOwner,
-                                                        savedPaths.lastGameFolder?.let(::File)
-                                                            ?: folders.lastOrNull()?.parentFile
-                                                    )
-                                                     if (chooserResult is DesktopChooserResult.Selected) {
-                                                         val f = chooserResult.file
-                                                        folders = folders + f
-                                                        uiScope.launch {
-                                                            withContext(Dispatchers.IO) {
-                                                                NfvrPathPreferences.saveGameFolders(folders)
+                                                    focusManager.clearFocus(force = true)
+                                                    uiScope.launch {
+                                                        when (val chooserResult = WindowsIsolatedPicker.chooseFolder(
+                                                            savedPaths.lastGameFolder?.let(::File)
+                                                                ?: folders.lastOrNull()?.parentFile
+                                                        )) {
+                                                            is DesktopChooserResult.Selected -> {
+                                                                val selected = chooserResult.file
+                                                                val inspection = withContext(Dispatchers.IO) {
+                                                                    inspectGameFolder(selected)
+                                                                }
+                                                                if (!inspection.installable || inspection.apk == null) {
+                                                                    warningText = inspection.reason
+                                                                        ?: "مجلد اللعبة لا يحتوي بنية قابلة للتثبيت."
+                                                                    appendLog(
+                                                                        "تم رفض مجلد اللعبة ${selected.name}: " +
+                                                                            (inspection.reason ?: "بنية غير مدعومة")
+                                                                    )
+                                                                    return@launch
+                                                                }
+                                                                folders = (folders + inspection.folder).distinctBy { it.absolutePath }
+                                                                savedPaths = savedPaths.copy(
+                                                                    gameFolders = folders.map { it.absolutePath },
+                                                                    lastGameFolder = inspection.folder.absolutePath
+                                                                )
+                                                                withContext(Dispatchers.IO) {
+                                                                    NfvrPathPreferences.saveGameFolders(folders)
+                                                                }
+                                                                rebuildQueueOnIo()
+                                                                warningText = null
+                                                                appendLog("تمت إضافة مجلد اللعبة: ${selected.name}")
                                                             }
-                                                            rebuildQueueOnIo()
+                                                            is DesktopChooserResult.Failed -> {
+                                                                warningText = chooserResult.userMessage
+                                                                appendLog("فشل اختيار مجلد اللعبة: ${chooserResult.technicalMessage}")
+                                                            }
+                                                            DesktopChooserResult.Busy ->
+                                                                warningText = "نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة."
+                                                            DesktopChooserResult.Cancelled -> Unit
                                                         }
-                                                        appendLog("تمت إضافة مجلد: ${f.absolutePath}")
-                                                     } else if (chooserResult is DesktopChooserResult.Failed) {
-                                                         warningText = chooserResult.userMessage
-                                                         appendLog("فشل اختيار مجلد اللعبة: ${chooserResult.technicalMessage}")
-                                                     } else if (chooserResult is DesktopChooserResult.Busy) {
-                                                         warningText = "نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة."
                                                     }
                                                 },
                                                 enabled = hasAuthorizedDevice && !isInstalling
@@ -2226,6 +2386,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                     IconButton(
                                                         onClick = {
                                                             if (isInstalling) return@IconButton
+                                                            focusManager.clearFocus(force = true)
                                                             val target = g.folder.absolutePath
                                                              folders = folders.filterNot { it.absolutePath == target }
                                                             uiScope.launch {
@@ -2353,64 +2514,90 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         startInstalledAppsScan()
                                     },
                                     onCancelScan = {
+                                       focusManager.clearFocus(force = true)
                                         cancelInstalledAppsScan()
                                     },
                                      onCancelActiveScanOnSelection = {
+                                       focusManager.clearFocus(force = true)
                                          cancelInstalledAppsScan(invalidatePendingCallbacks = true)
                                      },
                                     scanProgress = appScanProgress,
                                     showAllApps = showAllQuestApps,
                                     onShowAllAppsChange = { value ->
-                                        if (value != showAllQuestApps) {
+                                        if (value != showAllQuestApps && !isInstallingMod) {
+                                            focusManager.clearFocus(force = true)
                                             showAllQuestApps = value
                                             startInstalledAppsScan()
+                                        } else if (isInstallingMod && value != showAllQuestApps) {
+                                            appendModLog("لا يمكن تغيير اللعبة أثناء تثبيت المود.")
                                         }
                                     },
                                     onSelectApp = { app ->
-                                        selectedApp = app
-                                        modAnalysis = null
-                                        modExecutionProgress = null
+                                        if (isInstallingMod) {
+                                            appendModLog("لا يمكن تغيير اللعبة أثناء تثبيت المود.")
+                                        } else {
+                                            focusManager.clearFocus(force = true)
+                                            invalidateModOperation()
+                                            selectedApp = app
+                                        }
                                     },
                                      onChangeSelectedApp = {
                                          // Keep the cached Quest app snapshot and search query while
                                          // reopening the picker.  The selected target is no longer
                                          // valid for the reviewed package, but the package itself
                                          // can be reused for the next game.
-                                         selectedApp = null
-                                         modAnalysis = null
-                                         modExecutionProgress = null
+                                         if (isInstallingMod) {
+                                             appendModLog("لا يمكن تغيير اللعبة أثناء تثبيت المود.")
+                                         } else {
+                                             focusManager.clearFocus(force = true)
+                                             invalidateModOperation()
+                                             selectedApp = null
+                                         }
                                      },
                                      onClearSelectedApp = {
                                          // "مسح" starts the mod workflow over, without forcing a
                                          // rescan or losing the cached app list/search query.
-                                         selectedApp = null
-                                         modZipFile = null
-                                         modAnalysis = null
-                                         modExecutionProgress = null
+                                         if (isInstallingMod) {
+                                             appendModLog("لا يمكن تغيير اللعبة أو الحزمة أثناء تثبيت المود.")
+                                         } else {
+                                             focusManager.clearFocus(force = true)
+                                             invalidateModOperation()
+                                             selectedApp = null
+                                             modZipFile = null
+                                         }
                                      },
                                     selectedZipFilename = modZipFile?.name,
                                     onChooseFile = {
-                                         when (val chooserResult = chooseModFile(chooserOwner, lastModArchiveDirectory)) {
-                                             is DesktopChooserResult.Selected -> {
-                                                 val file = chooserResult.file
-                                                 modZipFile = file
-                                                 lastModArchiveDirectory = file.parentFile
-                                                 file.parentFile?.let { directory ->
-                                                     uiScope.launch {
-                                                         withContext(Dispatchers.IO) {
-                                                             NfvrPathPreferences.saveModArchiveDirectory(directory)
-                                                         }
-                                                     }
-                                                 }
-                                                 modAnalysis = null
-                                                 modExecutionProgress = null
-                                                 appendModLog("تم اختيار ملف المود: ${file.name}")
-                                             }
-                                             is DesktopChooserResult.Failed ->
-                                                 appendModLog(chooserResult.userMessage)
-                                             DesktopChooserResult.Busy ->
-                                                 appendModLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
-                                             DesktopChooserResult.Cancelled -> Unit
+                                        if (isInstallingMod) {
+                                            appendModLog("لا يمكن تغيير الحزمة أثناء تثبيت المود.")
+                                        } else {
+                                            focusManager.clearFocus(force = true)
+                                            uiScope.launch {
+                                            when (val chooserResult =
+                                                WindowsIsolatedPicker.chooseZipFile(lastModArchiveDirectory)) {
+                                                is DesktopChooserResult.Selected -> {
+                                                    if (isInstallingMod) {
+                                                        appendModLog("تم تجاهل اختيار حزمة وصل بعد بدء التثبيت.")
+                                                    } else {
+                                                        val file = chooserResult.file
+                                                        invalidateModOperation()
+                                                        modZipFile = file
+                                                        lastModArchiveDirectory = file.parentFile
+                                                        file.parentFile?.let { directory ->
+                                                            withContext(Dispatchers.IO) {
+                                                                NfvrPathPreferences.saveModArchiveDirectory(directory)
+                                                            }
+                                                        }
+                                                        appendModLog("تم اختيار ملف المود: ${file.name}")
+                                                    }
+                                                }
+                                                is DesktopChooserResult.Failed ->
+                                                    appendModLog(chooserResult.userMessage)
+                                                DesktopChooserResult.Busy ->
+                                                    appendModLog("نافذة اختيار أخرى مفتوحة. أغلقها ثم أعد المحاولة.")
+                                                DesktopChooserResult.Cancelled -> Unit
+                                            }
+                                            }
                                         }
                                     },
                                     analyzing = analyzingMod,

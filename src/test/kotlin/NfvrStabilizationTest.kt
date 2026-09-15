@@ -8,6 +8,40 @@ import java.io.File
 
 class NfvrStabilizationTest {
     @Test
+    fun uiFocusRegistryClearsOnlyThroughTheRegisteredOwner() {
+        val registry = UiFocusClearRegistry()
+        var clears = 0
+        val registration = registry.register { clears++ }
+        registry.clearBeforeUiMutation()
+        assertEquals(1, clears)
+        registration.close()
+        registry.clearBeforeUiMutation()
+        assertEquals(1, clears)
+    }
+
+    @Test
+    fun busyScanRequestsCoalesceUntilOneFollowUpRun() {
+        val requests = ScanRequestCoalescer()
+        requests.requestWhileBusy()
+        requests.requestWhileBusy()
+        assertTrue(requests.takePendingAfterCompletion())
+        assertTrue(!requests.takePendingAfterCompletion())
+        requests.requestWhileBusy()
+        requests.cancel()
+        assertTrue(!requests.takePendingAfterCompletion())
+    }
+
+    @Test
+    fun focusTransitionAlwaysClearsBeforeChangingState() {
+        val order = mutableListOf<String>()
+        focusTransition(
+            clearFocus = { order += "clear" },
+            transition = { order += "transition" }
+        )
+        assertEquals(listOf("clear", "transition"), order)
+    }
+
+    @Test
     fun parsesBoundedBatteryAndSafeOsValues() {
         val battery = parseQuestBatteryDump(
             "level: 87\nstatus: 2\nAC powered: false\nUSB powered: true\nWireless powered: false\n" +

@@ -207,7 +207,10 @@ data class ModInstallResult(
     val extractedRoot: File? = null
 )
 
-class ModsManager(private val adbClient: AdbClient) {
+class ModsManager(
+    private val adbClient: AdbClient,
+    private val loaderDetector: ModLoaderDetector = AdbModLoaderDetector(adbClient)
+) {
     companion object {
         private const val MAX_ENTRY_BYTES = ModPackageAnalyzer.MAX_ENTRY_BYTES
     }
@@ -223,6 +226,20 @@ class ModsManager(private val adbClient: AdbClient) {
         zipFile: File,
         installedApp: InstalledQuestApp? = null
     ): ModPackageAnalysis = ModPackageAnalyzer().analyze(zipFile, installedApp)
+
+    /**
+     * Device-aware analysis for callers that already selected a headset.  A
+     * loader result is captured in the plan, but execution still repeats the
+     * read-only check before the first write.
+     */
+    suspend fun analyzeModPackage(
+        serial: String,
+        zipFile: File,
+        installedApp: InstalledQuestApp
+    ): ModPackageAnalysis = withContext(Dispatchers.IO) {
+        val detection = loaderDetector.detect(serial, installedApp)
+        ModPackageAnalyzer().analyze(zipFile, installedApp, detection)
+    }
 
     suspend fun scanInstalledQuestApps(
         serial: String,
@@ -304,15 +321,25 @@ class ModsManager(private val adbClient: AdbClient) {
         if (!sameAppState(reviewedApp, currentApp)) {
             return ModInstallResult(false, "تغيرت حالة التطبيق المستهدف منذ التحليل؛ أعد تحليل الحزمة.")
         }
-        val freshAnalysis = ModPackageAnalyzer().analyze(zipFile, currentApp)
+        val loaderDetection = runCatching {
+            loaderDetector.detect(serial, currentApp)
+        }.getOrNull()
+        val freshAnalysis = ModPackageAnalyzer().analyze(zipFile, currentApp, loaderDetection)
         val freshPlan = freshAnalysis.installPlan
-        if (!freshAnalysis.installable || freshPlan.archiveIdentity != reviewedIdentity ||
-            freshPlan.mappings != plan.mappings ||
-            freshPlan.targetPackageId != plan.targetPackageId) {
+        if (freshAnalysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER) {
+            return ModInstallResult(
+                false,
+                freshAnalysis.message.ifBlank { "تحتاج هذه الحزمة إلى تجهيز محمّل المود قبل التثبيت." }
+            )
+        }
+        if (!freshAnalysis.installable ||
+            freshPlan.archiveIdentity != reviewedIdentity ||
+            !sameSecurityProjection(plan, freshPlan)
+        ) {
             return ModInstallResult(false, "تغير الأرشيف أو خطة التثبيت منذ التحليل؛ أعد التحليل قبل النقل.")
         }
         var executionPlan = freshPlan
-        val profile = plan.targetPackageId?.let(GameModProfileRegistry::findByPackageId)
+        val profile = executionProfile(executionPlan)
             ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
         if (executionPlan.destinationRoot != profile.destination) {
             return ModInstallResult(false, "وجهة الخطة لا تطابق ملف تعريف اللعبة الموثوق.")
@@ -337,10 +364,24 @@ class ModsManager(private val adbClient: AdbClient) {
             if (appBeforeTransfer == null || !sameAppState(reviewedApp, appBeforeTransfer)) {
                 return ModInstallResult(false, "تغيرت حالة التطبيق قبل النقل؛ أعد تحليل الحزمة.")
             }
+            executionPlan.loaderRequirement?.let { requirement ->
+                val beforeWriteDetection = runCatching {
+                    loaderDetector.detect(serial, appBeforeTransfer)
+                }.getOrNull()
+                if (beforeWriteDetection == null ||
+                    beforeWriteDetection.packageId != appBeforeTransfer.packageName ||
+                    !beforeWriteDetection.hasAny(requirement.requested)
+                ) {
+                    return ModInstallResult(
+                        false,
+                        "تعذر التحقق من محمّل المود المطلوب قبل النقل؛ أعد تحليل الحزمة."
+                    )
+                }
+            }
 
             for (mapping in executionPlan.mappings) {
                 val destination = mapping.destinationPath
-                if (!isApprovedDestination(destination, profile)) {
+                if (!isApprovedDestination(destination, profile, executionPlan)) {
                     return ModInstallResult(false, "تم رفض وجهة غير معتمدة: $destination")
                 }
                 val parent = destination.substringBeforeLast('/', profile.destination)
@@ -425,7 +466,7 @@ class ModsManager(private val adbClient: AdbClient) {
         val files = linkedMapOf<String, File>()
         ZipFile(zipFile).use { zip ->
             for (mapping in plan.mappings) {
-                val entry = zip.getEntry(mapping.sourcePath)
+                val entry = findNormalizedEntry(zip, mapping.sourcePath)
                     ?: error("الملف ${mapping.sourcePath} غير موجود داخل الحزمة.")
                 require(!entry.isDirectory) { "لا يمكن تثبيت مجلد كملف: ${mapping.sourcePath}" }
                 val outputPath = root.resolve(mapping.sourcePath).normalize()
@@ -464,9 +505,54 @@ class ModsManager(private val adbClient: AdbClient) {
         }
     }
 
-    private fun isApprovedDestination(path: String, profile: GameModProfile): Boolean =
-        AndroidPathValidator.isSafe(path) &&
-            (path == profile.destination || path.startsWith("${profile.destination}/"))
+    private fun isApprovedDestination(
+        path: String,
+        profile: GameModProfile,
+        plan: ModInstallPlan
+    ): Boolean {
+        if (!AndroidPathValidator.isSafe(path)) return false
+        if (plan.packageType == ModPackageType.ANDROID_DATA_LAYOUT ||
+            plan.packageType == ModPackageType.ANDROID_OBB_LAYOUT
+        ) {
+            val target = plan.targetPackageId ?: return false
+            return ModDestinationPolicy.isPackageBound(path, target)
+        }
+        if (plan.packageType == ModPackageType.QMOD ||
+            plan.packageType == ModPackageType.NFVR_MANIFEST
+        ) {
+            val target = plan.targetPackageId ?: return false
+            return ModDestinationPolicy.isPackageBound(path, target)
+        }
+        return path == profile.destination || path.startsWith("${profile.destination}/")
+    }
+
+    private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
+        val target = plan.targetPackageId ?: return null
+        GameModProfileRegistry.findByPackageId(target)?.let { return it }
+        val root = plan.destinationRoot ?: return null
+        return when (plan.packageType) {
+            ModPackageType.ANDROID_DATA_LAYOUT,
+            ModPackageType.ANDROID_OBB_LAYOUT ->
+                GameModProfile(target, "Android package layout", root)
+            ModPackageType.QMOD,
+            ModPackageType.NFVR_MANIFEST ->
+                GameModProfile(target, "Manifest package", root)
+            else -> null
+        }
+    }
+
+    private fun findNormalizedEntry(zip: ZipFile, normalizedName: String): ZipEntry? {
+        val direct = zip.getEntry(normalizedName)
+        if (direct != null) return direct
+        val iterator = zip.entries()
+        while (iterator.hasMoreElements()) {
+            val candidate = iterator.nextElement()
+            if (runCatching { ModArchivePath.normalize(candidate.name) }.getOrNull() == normalizedName) {
+                return candidate
+            }
+        }
+        return null
+    }
 
     private suspend fun verifyRemoteFile(serial: String, mapping: ModFileMapping): String? {
         val exists = adbClient.shell(serial, "test", "-f", mapping.destinationPath)
@@ -494,6 +580,23 @@ class ModsManager(private val adbClient: AdbClient) {
         expected.packageName == actual.packageName &&
             expected.versionName == actual.versionName &&
             expected.versionCode == actual.versionCode
+
+    private fun sameSecurityProjection(expected: ModInstallPlan, actual: ModInstallPlan): Boolean =
+        expected.installable == actual.installable &&
+            expected.outcome == actual.outcome &&
+            expected.packageType == actual.packageType &&
+            expected.targetPackageId == actual.targetPackageId &&
+            expected.destinationRoot == actual.destinationRoot &&
+            expected.strategy == actual.strategy &&
+            expected.mappings == actual.mappings &&
+            ((expected.reviewedApp == null && actual.reviewedApp == null) ||
+                (expected.reviewedApp != null && actual.reviewedApp != null &&
+                    sameAppState(expected.reviewedApp, actual.reviewedApp))) &&
+            expected.loaderRequirement?.requested == actual.loaderRequirement?.requested &&
+            expected.loaderRequirement?.status == actual.loaderRequirement?.status &&
+            expected.preconditions.map { it.code to it.satisfied } ==
+                actual.preconditions.map { it.code to it.satisfied } &&
+            expected.diagnostics == actual.diagnostics
 
     private fun archiveIdentityMatches(file: File, identity: ModArchiveIdentity): Boolean =
         runCatching {

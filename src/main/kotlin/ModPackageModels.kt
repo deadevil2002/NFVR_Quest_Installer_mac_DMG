@@ -16,9 +16,13 @@ data class InstalledQuestApp(
 }
 
 enum class ModPackageType {
+    BONELAB_NATIVE_CONTENT,
+    BONELAB_CODE_MOD,
     QMOD,
     GORILLA_TAG_VIRTUAL_STUMP,
     NFVR_MANIFEST,
+    ANDROID_DATA_LAYOUT,
+    ANDROID_OBB_LAYOUT,
     KNOWN_GAME_PROFILE,
     GENERIC_DATA,
     UNKNOWN;
@@ -34,8 +38,24 @@ enum class ModPackageType {
 enum class ModInstallStrategy {
     DECLARATIVE_COPY,
     PROFILE_COPY,
+    BONELAB_CONTENT_COPY,
+    ANDROID_DATA_COPY,
+    ANDROID_OBB_COPY,
     MOD_IO_MANAGED,
     NONE
+}
+
+/**
+ * The result is deliberately separate from [ModPackageType].  A package can
+ * be understood (for example, a code mod or built-in game content) without
+ * being directly writable by NFVR.
+ */
+enum class ModInstallOutcome {
+    DIRECT_INSTALL_READY,
+    REQUIRES_MOD_LOADER,
+    BUILT_IN_GAME_CONTENT,
+    UNSUPPORTED,
+    UNSAFE_ARCHIVE
 }
 
 /**
@@ -146,11 +166,36 @@ data class ModInstallPrecondition(
 )
 
 /**
+ * A loader check is always represented in the plan, even when it could not be
+ * performed during offline analysis.  The manager performs the same check
+ * again immediately before the first write.
+ */
+data class ModLoaderRequirement(
+    val requested: Set<ModLoaderKind>,
+    val detection: ModLoaderDetection? = null,
+    val message: String = "",
+    val targetPackageId: String? = null
+) {
+    val satisfied: Boolean
+        get() = detection != null &&
+            (targetPackageId == null || detection.packageId == targetPackageId) &&
+            detection.hasAny(requested)
+
+    val status: ModLoaderStatus
+        get() = when {
+            detection == null -> ModLoaderStatus.UNKNOWN
+            targetPackageId != null && detection.packageId != targetPackageId -> ModLoaderStatus.UNKNOWN
+            else -> detection.statusFor(requested)
+        }
+}
+
+/**
  * This is a plan, not an instruction to execute.  In particular, no shell
  * command or executable action can be represented by this model.
  */
 data class ModInstallPlan(
     val installable: Boolean = false,
+    val outcome: ModInstallOutcome = ModInstallOutcome.UNSUPPORTED,
     val packageType: ModPackageType = ModPackageType.UNKNOWN,
     val targetPackageId: String? = null,
     val destinationRoot: String? = null,
@@ -160,7 +205,9 @@ data class ModInstallPlan(
     val totalBytes: Long = mappings.sumOf { it.sizeBytes },
     val totalFiles: Int = mappings.size,
     val archiveIdentity: ModArchiveIdentity? = null,
-    val reviewedApp: InstalledQuestApp? = null
+    val reviewedApp: InstalledQuestApp? = null,
+    val loaderRequirement: ModLoaderRequirement? = null,
+    val diagnostics: List<String> = emptyList()
 ) {
     val fileMappings: List<ModFileMapping>
         get() = mappings
@@ -206,7 +253,8 @@ data class ModPackageAnalysis(
     val installPlan: ModInstallPlan,
     val metadata: Map<String, Any?> = emptyMap(),
     val entries: List<String> = emptyList(),
-    val externalWorkflow: ModExternalWorkflow? = null
+    val externalWorkflow: ModExternalWorkflow? = null,
+    val diagnostics: List<String> = emptyList()
 ) {
     val installable: Boolean
         get() = installPlan.installable
@@ -219,7 +267,16 @@ data class ModPackageAnalysis(
         get() = classifyModWorkflow(packageType, externalWorkflow)
 
     val isExternalWorkflow: Boolean
-        get() = workflow == ModWorkflowKind.SUPPORTED_EXTERNAL_WORKFLOW
+        get() = externalWorkflow != null
+
+    val outcome: ModInstallOutcome
+        get() = installPlan.outcome
+
+    val requiresModLoader: Boolean
+        get() = outcome == ModInstallOutcome.REQUIRES_MOD_LOADER
+
+    val isBuiltInGameContent: Boolean
+        get() = outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT
 
     val externalSourceUrl: String?
         get() = externalWorkflow?.sourceUrl
@@ -237,7 +294,10 @@ data class GameModProfile(
         ModPackageType.NFVR_MANIFEST
     ),
     val minimumGameVersion: String? = null,
-    val maximumGameVersion: String? = null
+    val maximumGameVersion: String? = null,
+    val knownContentDirectories: Set<String> = emptySet(),
+    val recognizedArchiveSignatures: Set<String> = emptySet(),
+    val loaderRequirements: Set<ModLoaderKind> = emptySet()
 )
 
 /**
@@ -247,8 +307,23 @@ data class GameModProfile(
  */
 object GameModProfileRegistry {
     private val registeredProfiles = listOf(
-        profile("com.StressLevelZero.BONELAB", "BONELAB"),
-        profile("com.beatgames.beatsaber", "Beat Saber", "/sdcard/ModData/com.beatgames.beatsaber/Mods")
+        profile(
+            "com.StressLevelZero.BONELAB",
+            "BONELAB",
+            supportedPackageTypes = setOf(
+                ModPackageType.BONELAB_NATIVE_CONTENT,
+                ModPackageType.BONELAB_CODE_MOD,
+                ModPackageType.QMOD,
+                ModPackageType.NFVR_MANIFEST
+            ),
+            knownContentDirectories = setOf("Mods")
+        ),
+        profile(
+            "com.beatgames.beatsaber",
+            "Beat Saber",
+            "/sdcard/ModData/com.beatgames.beatsaber/Mods",
+            loaderRequirements = setOf(ModLoaderKind.QUEST_LOADER, ModLoaderKind.SCOTLAND2)
+        )
     )
 
     val profiles: List<GameModProfile>
@@ -262,11 +337,21 @@ object GameModProfileRegistry {
     private fun profile(
         packageId: String,
         name: String,
-        destination: String = "/sdcard/Android/data/$packageId/files/Mods"
+        destination: String = "/sdcard/Android/data/$packageId/files/Mods",
+        supportedPackageTypes: Set<ModPackageType> = setOf(
+            ModPackageType.QMOD,
+            ModPackageType.NFVR_MANIFEST
+        ),
+        knownContentDirectories: Set<String> = setOf("Mods"),
+        loaderRequirements: Set<ModLoaderKind> = emptySet()
     ): GameModProfile =
         GameModProfile(
             packageId = packageId,
             displayName = name,
-            destination = destination
+            destination = destination,
+            supportedPackageTypes = supportedPackageTypes,
+            knownContentDirectories = knownContentDirectories,
+            recognizedArchiveSignatures = setOf("mod.json", "nfvr-mod.json"),
+            loaderRequirements = loaderRequirements
         )
 }

@@ -4,6 +4,7 @@ import java.nio.channels.FileChannel
 import java.nio.channels.FileLock
 import java.nio.channels.OverlappingFileLockException
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipFile
 
 /**
@@ -11,6 +12,55 @@ import java.util.zip.ZipFile
  * decisions outside Compose makes the Windows client deterministic and easy to
  * test without a Quest attached.
  */
+fun focusTransition(clearFocus: () -> Unit, transition: () -> Unit) {
+    clearFocus()
+    transition()
+}
+
+/**
+ * The Compose owner installs the callback while its focus manager is alive.
+ * Workflow state helpers may then clear the focused subtree before changing
+ * selected targets, but never create or discover a focus manager themselves.
+ */
+class UiFocusClearRegistry {
+    private val callback = AtomicReference<(() -> Unit)?>(null)
+
+    fun register(clearFocus: () -> Unit): AutoCloseable {
+        callback.set(clearFocus)
+        return object : AutoCloseable {
+            override fun close() {
+                callback.compareAndSet(clearFocus, null)
+            }
+        }
+    }
+
+    fun clearBeforeUiMutation() {
+        callback.get()?.invoke()
+    }
+}
+
+/**
+ * A refresh request made while an ADB scan is active is coalesced into one
+ * follow-up scan. Explicit cancellation drops the pending request.
+ */
+class ScanRequestCoalescer {
+    private var pending = false
+
+    fun requestWhileBusy() {
+        pending = true
+    }
+
+    fun takePendingAfterCompletion(): Boolean {
+        val rerun = pending
+        pending = false
+        return rerun
+    }
+
+    fun cancel() {
+        pending = false
+    }
+}
+
 enum class AdbDeviceState {
     DEVICE,
     OFFLINE,

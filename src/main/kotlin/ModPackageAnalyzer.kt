@@ -16,6 +16,7 @@ class ModPackageAnalyzer(
     private val profileRegistry: GameModProfileRegistry = GameModProfileRegistry
 ) {
     companion object {
+        const val BONELAB_PACKAGE_ID = "com.StressLevelZero.BONELAB"
         const val MAX_ZIP_ENTRIES = 5_000
         const val MAX_ENTRY_NAME_BYTES = 1_000
         const val MAX_METADATA_BYTES = 1L * 1024L * 1024L
@@ -25,14 +26,15 @@ class ModPackageAnalyzer(
         private val ROOT_MANIFEST_NAMES = ROOT_METADATA_NAMES
         private val SHA256 = Regex("[0-9a-fA-F]{64}")
         private val QMOD_METADATA_KEYS = setOf(
-            "name", "id", "author", "version", "description", "coverImage"
+            "_QPVersion", "name", "id", "author", "version", "description", "coverImage",
+            "isLibrary"
         )
         private val QMOD_IMPLEMENTED_KEYS = setOf(
-            "packageId", "modloader", "modFiles", "lateModFiles",
-            "libraryFiles", "fileCopies", "dependencies"
+            "packageId", "packageVersion", "modloader", "modFiles", "lateModFiles",
+            "libraryFiles", "fileCopies", "copyExtensions", "dependencies"
         )
         private val QMOD_UNIMPLEMENTED_KEYS = setOf(
-            "packageVersion", "copyExtensions", "actions", "hooks", "postInstall",
+            "actions", "hooks", "postInstall",
             "patcher", "patching", "apkPatching", "requiresPatching",
             "requiredModLoader", "loader", "commands", "scripts", "shell",
             "powershell", "exec", "executable"
@@ -48,9 +50,22 @@ class ModPackageAnalyzer(
             ".py", ".pyc", ".rb", ".php", ".lua", ".class", ".dex",
             ".elf", ".wasm"
         )
+        private val NATIVE_PAYLOAD_EXTENSIONS = setOf(".dll", ".so")
+        private val PACKAGE_ID = Regex("""[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+""")
+        private val PC_ONLY_ROOTS = setOf(
+            "pc", "windows", "standalonewindows", "standalonewindows64",
+            "standalone", "win64", "desktop"
+        )
+        private val QUEST_ROOTS = setOf(
+            "android", "quest", "quest2", "quest3", "android64", "arm64"
+        )
     }
 
-    fun analyze(zipFile: File, installedApp: InstalledQuestApp? = null): ModPackageAnalysis {
+    fun analyze(
+        zipFile: File,
+        installedApp: InstalledQuestApp? = null,
+        loaderDetection: ModLoaderDetection? = null
+    ): ModPackageAnalysis {
         return try {
             val archive = inspectArchive(zipFile)
             val rootManifestCandidates = ROOT_MANIFEST_NAMES.filter(archive.metadata::containsKey)
@@ -64,15 +79,26 @@ class ModPackageAnalyzer(
             val rootNfvr = archive.metadata["nfvr-mod.json"]
 
             when {
-                rootMod != null -> analyzeQmod(archive, rootMod, installedApp)
+                rootMod != null -> analyzeQmod(archive, rootMod, installedApp, loaderDetection)
                 rootPackage != null && isVirtualStump(rootPackage) ->
                     analyzeVirtualStump(archive, rootPackage)
-                rootNfvr != null -> analyzeNfvr(archive, rootNfvr, installedApp)
+                rootNfvr != null -> analyzeNfvr(archive, rootNfvr, installedApp, loaderDetection)
+                isAndroidDataLayout(archive) ->
+                    analyzeAndroidLayout(archive, installedApp, obb = false)
+                isAndroidObbLayout(archive) ->
+                    analyzeAndroidLayout(archive, installedApp, obb = true)
+                isBonelabPayload(archive) ->
+                    analyzeBonelabPayload(archive, installedApp, loaderDetection)
+                isKnownGameProfilePayload(archive, installedApp) ->
+                    analyzeKnownGameProfile(archive, installedApp, loaderDetection)
                 archive.entries.any(::looksLikeGenericModPayload) -> analyzeGeneric(archive)
                 else -> unknown(archive)
             }
         } catch (e: ModPackageException) {
-            failed(e.message ?: "Package metadata is invalid.")
+            e.diagnosticEntry?.let { entry ->
+                DiagnosticLogger.error("ZIP rejected entry '$entry': ${e.message.orEmpty()}")
+            }
+            failed(e.message ?: "Package metadata is invalid.", e.diagnosticEntry)
         } catch (e: Exception) {
             failed("Unable to inspect ZIP metadata: ${e.message ?: "invalid archive"}.")
         }
@@ -88,6 +114,7 @@ class ModPackageAnalyzer(
         val entries = mutableListOf<String>()
         val sizes = linkedMapOf<String, Long>()
         val hashes = linkedMapOf<String, String>()
+        val prefixes = linkedMapOf<String, ByteArray>()
         val directories = linkedSetOf<String>()
         val collisionKeys = mutableSetOf<String>()
         var declaredBytes = 0L
@@ -102,8 +129,14 @@ class ModPackageAnalyzer(
                     throw ModPackageException("ZIP contains more than $MAX_ZIP_ENTRIES entries.")
                 }
                 val safeName = validateEntryName(entry.name)
+                // "./" is a valid directory marker but has no installable
+                // path of its own.  Keep inspecting the rest of the archive.
+                if (safeName.isBlank()) continue
                 if (!collisionKeys.add(collisionKey(safeName))) {
-                    throw ModPackageException("ZIP contains duplicate entry '$safeName'.")
+                    throw ModPackageException(
+                        "ZIP contains a normalized path collision at '$safeName'.",
+                        entry.name
+                    )
                 }
                 entries += safeName
                 sizes[safeName] = entry.size.coerceAtLeast(0L)
@@ -134,6 +167,7 @@ class ModPackageAnalyzer(
             for (entry in zip.entries().asSequence()) {
                 if (entry.isDirectory) continue
                 val safeName = validateEntryName(entry.name)
+                if (safeName.isBlank()) continue
                 val digest = MessageDigest.getInstance("SHA-256")
                 var bytes = 0L
                 zip.getInputStream(entry).use { input ->
@@ -147,6 +181,9 @@ class ModPackageAnalyzer(
                             throw ModPackageException("ZIP expands beyond the safe inspection limit.")
                         }
                         digest.update(buffer, 0, read)
+                        if ((prefixes[safeName]?.size ?: 0) < 4_096) {
+                            prefixes[safeName] = digestPrefix(prefixes[safeName], buffer, read)
+                        }
                     }
                 }
                 sizes[safeName] = bytes
@@ -159,7 +196,14 @@ class ModPackageAnalyzer(
             lastModifiedMillis = zipFile.lastModified(),
             sha256 = sha256File(zipFile)
         )
-        return ArchiveMetadata(entries, metadata, sizes, hashes, directories, identity)
+        return ArchiveMetadata(entries, metadata, sizes, hashes, directories, prefixes, identity)
+    }
+
+    private fun digestPrefix(existing: ByteArray?, buffer: ByteArray, read: Int): ByteArray {
+        val old = existing ?: ByteArray(0)
+        val remaining = (4_096 - old.size).coerceAtLeast(0)
+        if (remaining == 0) return old
+        return old + buffer.copyOfRange(0, minOf(read, remaining))
     }
 
     private fun readBoundedMetadata(zip: ZipFile, entry: java.util.zip.ZipEntry, name: String): String {
@@ -181,7 +225,8 @@ class ModPackageAnalyzer(
     private fun analyzeQmod(
         archive: ArchiveMetadata,
         json: JSONObject,
-        installedApp: InstalledQuestApp?
+        installedApp: InstalledQuestApp?,
+        loaderDetection: ModLoaderDetection?
     ): ModPackageAnalysis {
         val target = json.optString("packageId", "").trim().ifBlank { null }
         val profile = target?.let(profileRegistry::findByPackageId)
@@ -198,17 +243,53 @@ class ModPackageAnalyzer(
         } else {
             preconditions += satisfied("TARGET_PACKAGE_MATCH", "QMOD target package matches the selected app.")
         }
-        if (profile == null && target != null) {
-            preconditions += blocked("UNKNOWN_GAME_PROFILE", "No vetted destination is registered for '$target'.")
-        }
-
-        val loader = json.optString("modloader", "").trim()
-        if (loader.isNotEmpty()) {
+        val loaderValue = json.optString("modloader", "").trim()
+        val loader = ModLoaderKind.parse(loaderValue)
+        if (loaderValue.isNotEmpty() &&
+            (loader == null || loader !in setOf(ModLoaderKind.QUEST_LOADER, ModLoaderKind.SCOTLAND2))
+        ) {
             preconditions += blocked(
                 "UNSUPPORTED_MOD_LOADER",
-                "QMOD requires modloader '$loader', which NFVR does not install or configure."
+                "QMOD requires unsupported modloader '$loaderValue'."
             )
         }
+        // QMOD's schema default is QuestLoader even when a legacy manifest
+        // omitted `_QPVersion` and `modloader`.  Never let the old spelling
+        // bypass loader evidence or install into the profile's generic Mods
+        // directory.
+        val containsLoaderFiles = listOf("modFiles", "lateModFiles", "libraryFiles")
+            .any { json.optJSONArray(it)?.length()?.let { length -> length > 0 } == true }
+        val effectiveLoader = loader ?: if (containsLoaderFiles) ModLoaderKind.QUEST_LOADER else null
+        if (profile == null && target != null && effectiveLoader == null) {
+            // Explicit loader-relative fields derive their standardized root
+            // from target+loader; unregistered packages remain limited to
+            // profile-bound fileCopies.
+            val hasRelativeFiles = listOf("modFiles", "lateModFiles", "libraryFiles")
+                .any { json.optJSONArray(it)?.length()?.let { length -> length > 0 } == true }
+            if (hasRelativeFiles) {
+                preconditions += blocked("UNKNOWN_GAME_PROFILE", "No vetted destination is registered for '$target'.")
+            }
+        }
+        val requiresLoader = when {
+            effectiveLoader != null -> setOf(effectiveLoader)
+            else -> emptySet()
+        }
+        val loaderRequirement = loaderRequirement(
+            requiresLoader,
+            loaderDetection,
+            preconditions,
+            enforceWhenUnknown = requiresLoader.isNotEmpty(),
+            targetPackageId = target
+        )
+        if (json.optJSONArray("lateModFiles")?.length()?.let { it > 0 } == true &&
+            loader != ModLoaderKind.SCOTLAND2
+        ) {
+            preconditions += blocked(
+                "UNSUPPORTED_LATE_MOD_FILES",
+                "QMOD lateModFiles is supported only for Scotland2."
+            )
+        }
+        checkQmodPackageVersion(json, installedApp, preconditions)
         if (hasPatchingRequirement(json)) {
             preconditions += blocked(
                 "UNSUPPORTED_PATCHING",
@@ -218,26 +299,42 @@ class ModPackageAnalyzer(
         val dependencies = json.opt("dependencies")
         if (dependencies != null && dependencies != JSONObject.NULL && hasEntries(dependencies)) {
             preconditions += blocked(
-                "UNSUPPORTED_DEPENDENCIES",
-                "This QMOD declares dependencies; NFVR does not download or install dependencies automatically."
+                "DEPENDENCIES_REQUIREMENT",
+                "This QMOD declares dependencies; NFVR will not download or install dependencies automatically."
             )
         }
         addStrictQmodSchemaPreconditions(json, preconditions)
         addDangerousPayloadPrecondition(archive, preconditions)
 
-        val mappings = parseQmodMappings(archive, json, profile, preconditions)
+        val mappings = parseQmodMappings(
+            archive,
+            json,
+            profile,
+            target,
+            effectiveLoader,
+            preconditions
+        )
         if (mappings.isEmpty()) {
             preconditions += blocked("NO_COPY_MAPPINGS", "QMOD contains no safe declarative files to copy.")
         }
+        addQmodNativePayloadPreconditions(
+            archive,
+            json,
+            mappings,
+            effectiveLoader,
+            target,
+            preconditions
+        )
         val plan = plan(
             type = ModPackageType.QMOD,
             target = target,
             profile = profile,
             mappings = mappings,
-            strategy = ModInstallStrategy.PROFILE_COPY,
+            strategy = ModInstallStrategy.DECLARATIVE_COPY,
             preconditions = preconditions,
             archiveIdentity = archive.identity,
-            reviewedApp = installedApp
+            reviewedApp = installedApp,
+            loaderRequirement = loaderRequirement
         )
         return result(
             type = ModPackageType.QMOD,
@@ -252,9 +349,13 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         json: JSONObject,
         profile: GameModProfile?,
+        target: String?,
+        loader: ModLoaderKind?,
         preconditions: MutableList<ModInstallPrecondition>
     ): List<ModFileMapping> {
-        if (profile == null) return emptyList()
+        val hasLoaderFields = listOf("modFiles", "lateModFiles", "libraryFiles")
+            .any { json.optJSONArray(it)?.length()?.let { length -> length > 0 } == true }
+        if (profile == null && json.opt("fileCopies") == null && !hasLoaderFields) return emptyList()
         val mappings = mutableListOf<ModFileMapping>()
         val copies = json.opt("fileCopies")
         if (copies != null && copies != JSONObject.NULL) {
@@ -263,23 +364,30 @@ class ModPackageAnalyzer(
                     is JSONArray -> {
                         for (i in 0 until copies.length()) {
                             val item = copies.getJSONObject(i)
-                            if (item.keys().asSequence().any { it !in setOf("source", "destination") }) {
+                            val allowed = setOf("name", "source", "destination")
+                            if (item.keys().asSequence().any { it !in allowed } ||
+                                !item.has("destination") ||
+                                (!item.has("name") && !item.has("source"))
+                            ) {
                                 preconditions += blocked(
-                                    "DANGEROUS_MANIFEST_KEY",
-                                    "QMOD fileCopies may contain only source and destination."
+                                    "INVALID_FILE_COPIES",
+                                    "QMOD fileCopies requires name/source and destination only."
                                 )
                                 continue
                             }
-                            val source = item.getString("source")
+                            val source = item.optString("name", item.optString("source", ""))
                             val destination = item.getString("destination")
-                            addMapping(archive, profile, mappings, source, destination, null, preconditions)
+                            addQmodMapping(
+                                archive, profile, mappings, target, source, destination,
+                                null, preconditions
+                            )
                         }
                     }
                     is JSONObject -> {
                         for (source in copies.keys()) {
-                            addMapping(
-                                archive, profile, mappings, source, copies.getString(source),
-                                null, preconditions
+                            addQmodMapping(
+                                archive, profile, mappings, target, source,
+                                copies.getString(source), null, preconditions
                             )
                         }
                     }
@@ -302,73 +410,557 @@ class ModPackageAnalyzer(
                     )
                 } else {
                     val source = raw.trim()
-                    addMapping(archive, profile, mappings, source, source, null, preconditions)
+                    val destinationRoot = qmodDestination(profile, target, loader, field)
+                    if (destinationRoot == null) {
+                        preconditions += blocked(
+                            "DESTINATION_UNAVAILABLE",
+                            "No safe destination is known for QMOD field '$field'."
+                        )
+                    } else {
+                        val destinationName = source.substringAfterLast('/')
+                        addMapping(
+                            archive,
+                            profile,
+                            mappings,
+                            source,
+                            "${destinationRoot.trimEnd('/')}/$destinationName",
+                            null,
+                            preconditions,
+                            allowFullDestination = true,
+                            targetPackageId = target
+                        )
+                    }
                 }
             }
         }
+        parseQmodCopyExtensions(
+            archive,
+            json,
+            profile,
+            target,
+            mappings,
+            preconditions
+        )
         // Never infer a destination or copy every archive entry.  QMODs must
         // explicitly declare modFiles, lateModFiles, libraryFiles, or
         // fileCopies.
         return mappings.distinctBy { it.sourcePath to it.destinationPath }
     }
 
+    private fun parseQmodCopyExtensions(
+        archive: ArchiveMetadata,
+        json: JSONObject,
+        profile: GameModProfile?,
+        target: String?,
+        mappings: MutableList<ModFileMapping>,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        val extensions = json.optJSONArray("copyExtensions") ?: return
+        for (i in 0 until extensions.length()) {
+            val item = extensions.optJSONObject(i)
+            if (item == null || item.keys().asSequence().any { it !in setOf("extension", "destination") } ||
+                item.optString("extension").isBlank() || item.optString("destination").isBlank()
+            ) {
+                preconditions += blocked(
+                    "INVALID_COPY_EXTENSIONS",
+                    "QMOD copyExtensions requires extension and destination."
+                )
+                continue
+            }
+            val extension = item.getString("extension").removePrefix(".").lowercase(Locale.ROOT)
+            val destination = item.getString("destination").trimEnd('/')
+            val sources = archive.entries.filter {
+                it !in archive.directories &&
+                    it.substringAfterLast('/', "").substringAfterLast('.', "").lowercase(Locale.ROOT) == extension
+            }
+            if (sources.isEmpty()) {
+                preconditions += blocked(
+                    "COPY_EXTENSION_NO_MATCH",
+                    "QMOD copyExtensions did not match any '$extension' file."
+                )
+            }
+            for (source in sources) {
+                addQmodMapping(
+                    archive,
+                    profile,
+                    mappings,
+                    target,
+                    source,
+                    "$destination/${source.substringAfterLast('/')}",
+                    null,
+                    preconditions
+                )
+            }
+        }
+    }
+
+    private fun addQmodMapping(
+        archive: ArchiveMetadata,
+        profile: GameModProfile?,
+        mappings: MutableList<ModFileMapping>,
+        target: String?,
+        source: String,
+        destination: String,
+        sha256: String?,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        addMapping(
+            archive,
+            profile,
+            mappings,
+            source,
+            destination,
+            sha256,
+            preconditions,
+            allowFullDestination = true,
+            targetPackageId = target
+        )
+    }
+
+    private fun qmodDestination(
+        profile: GameModProfile?,
+        target: String?,
+        loader: ModLoaderKind?,
+        field: String
+    ): String? {
+        if (target == null || !PACKAGE_ID.matches(target)) return null
+        if (loader == null) return profile?.destination
+        val data = "/sdcard/Android/data/$target/files"
+        return when (loader) {
+            ModLoaderKind.QUEST_LOADER -> when (field) {
+                "libraryFiles" -> "$data/libs"
+                else -> "$data/mods"
+            }
+            ModLoaderKind.SCOTLAND2 -> when (field) {
+                "libraryFiles" -> "/sdcard/ModData/$target/Modloader/libs"
+                "lateModFiles" -> "/sdcard/ModData/$target/Modloader/mods"
+                else -> "/sdcard/ModData/$target/Modloader/early_mods"
+            }
+            ModLoaderKind.LEMON_LOADER, ModLoaderKind.MELON_LOADER ->
+                "$data/Mods"
+        }
+    }
+
+    private fun isAndroidDataLayout(archive: ArchiveMetadata): Boolean =
+        archive.entries.any { it.startsWith("Android/data/") }
+
+    private fun isAndroidObbLayout(archive: ArchiveMetadata): Boolean =
+        archive.entries.any { it.startsWith("Android/obb/") }
+
+    private fun analyzeAndroidLayout(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?,
+        obb: Boolean
+    ): ModPackageAnalysis {
+        val dataPackages = archive.entries
+            .filter { it.startsWith("Android/data/") }
+            .mapNotNull { it.removePrefix("Android/data/").substringBefore('/').takeIf(PACKAGE_ID::matches) }
+            .toSet()
+        val obbPackages = archive.entries
+            .filter { it.startsWith("Android/obb/") }
+            .mapNotNull { it.removePrefix("Android/obb/").substringBefore('/').takeIf(PACKAGE_ID::matches) }
+            .toSet()
+        val packages = dataPackages + obbPackages
+        val target = packages.singleOrNull()
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        if (packages.isEmpty()) {
+            preconditions += blocked("PACKAGE_ID_MISSING", "Android layout does not contain a valid package ID.")
+        } else if (packages.size > 1) {
+            preconditions += blocked(
+                "MULTIPLE_TARGET_PACKAGES",
+                "Android layout contains multiple package IDs; NFVR will not cross-install them."
+            )
+        } else if (installedApp == null) {
+            preconditions += blocked("TARGET_APP_REQUIRED", "Select the installed Quest app before installing this Android layout.")
+        } else if (installedApp.packageName != target) {
+            preconditions += blocked(
+                "TARGET_PACKAGE_MISMATCH",
+                "Android layout targets '$target', but the selected app is '${installedApp.packageName}'."
+            )
+        } else {
+            preconditions += satisfied("TARGET_PACKAGE_MATCH", "Android layout package matches the selected app.")
+        }
+
+        val hasData = dataPackages.isNotEmpty()
+        val hasObb = obbPackages.isNotEmpty()
+        val type = if (hasData && hasObb) {
+            // A combined archive is safe when both roots bind to the same
+            // selected package; preserve both mappings rather than silently
+            // dropping one half of the package.
+            ModPackageType.ANDROID_DATA_LAYOUT
+        } else if (obb || hasObb) {
+            ModPackageType.ANDROID_OBB_LAYOUT
+        } else {
+            ModPackageType.ANDROID_DATA_LAYOUT
+        }
+        addDangerousPayloadPrecondition(archive, preconditions)
+        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        val mappings = mutableListOf<ModFileMapping>()
+        if (target != null && packages.size == 1) {
+            val dataProfile = GameModProfile(
+                target,
+                "Android data",
+                "/sdcard/Android/data/$target"
+            )
+            val obbProfile = GameModProfile(
+                target,
+                "Android OBB",
+                "/sdcard/Android/obb/$target"
+            )
+            for (entry in archive.entries) {
+                if (entry in archive.directories) continue
+                when {
+                    entry.startsWith("Android/data/$target/") ->
+                        addMapping(
+                            archive, dataProfile, mappings,
+                            entry, entry.removePrefix("Android/data/$target/"),
+                            null, preconditions,
+                            allowFullDestination = false
+                        )
+                    entry.startsWith("Android/obb/$target/") ->
+                        addMapping(
+                            archive, obbProfile, mappings,
+                            entry, entry.removePrefix("Android/obb/$target/"),
+                            null, preconditions,
+                            allowFullDestination = false
+                        )
+                }
+            }
+        }
+        if (mappings.isEmpty()) {
+            preconditions += blocked("NO_COPY_MAPPINGS", "Android layout contains no files to copy.")
+        }
+        val destinationProfile = target?.let {
+            if (hasData) GameModProfile(it, "Android data", "/sdcard/Android/data/$it")
+            else GameModProfile(it, "Android OBB", "/sdcard/Android/obb/$it")
+        }
+        val plan = plan(
+            type = type,
+            target = target,
+            profile = destinationProfile,
+            mappings = mappings,
+            strategy = if (hasObb && !hasData) ModInstallStrategy.ANDROID_OBB_COPY
+            else ModInstallStrategy.ANDROID_DATA_COPY,
+            preconditions = preconditions,
+            archiveIdentity = archive.identity,
+            reviewedApp = installedApp
+        )
+        return result(
+            type,
+            if (plan.installable) "Recognized package-bound Android layout." else blockingMessage(plan),
+            plan,
+            archive,
+            metadata = mapOf(
+                "dataPackages" to dataPackages,
+                "obbPackages" to obbPackages
+            )
+        )
+    }
+
+    private fun isBonelabPayload(archive: ArchiveMetadata): Boolean {
+        val roots = archive.entries.mapNotNull { it.substringBefore('/').takeIf { root -> root.isNotBlank() } }.toSet()
+        if (roots.isEmpty()) return false
+        if (archive.entries.any(::looksLikeCodeModPayload)) return true
+        return archive.entries.any { path ->
+            val lower = path.lowercase(Locale.ROOT)
+            lower.endsWith(".pallet") ||
+                lower.endsWith(".marrow") ||
+                lower.endsWith(".assetbundle") ||
+                lower.endsWith(".bundle") ||
+                lower.endsWith(".asset") ||
+                lower.endsWith("/manifest.json") ||
+                lower.endsWith("/pallet.json") ||
+                lower.endsWith("/catalog.json")
+        }
+    }
+
+    private fun analyzeBonelabPayload(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?,
+        loaderDetection: ModLoaderDetection?
+    ): ModPackageAnalysis {
+        val profile = profileRegistry.findByPackageId(BONELAB_PACKAGE_ID)
+            ?: GameModProfile(BONELAB_PACKAGE_ID, "BONELAB", "/sdcard/Android/data/$BONELAB_PACKAGE_ID/files/Mods")
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        checkTarget(BONELAB_PACKAGE_ID, installedApp, "BONELAB", preconditions)
+        val roots = archive.entries
+            .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
+            .toMutableSet()
+        val pcRoots = roots.filter { it.lowercase(Locale.ROOT) in PC_ONLY_ROOTS }
+        val questRoots = roots.filter { it.lowercase(Locale.ROOT) in QUEST_ROOTS }
+        val questWrapper = questRoots.firstOrNull()
+        val androidPrefix = archive.entries.firstOrNull { entry ->
+            entry.startsWith("Android/data/$BONELAB_PACKAGE_ID/files/Mods/")
+        }?.substringBeforeLast("/Mods/")?.plus("/Mods")
+        val platformPrefix = androidPrefix ?: questWrapper
+        val selectedEntries = archive.entries.filter {
+            platformPrefix == null || it.startsWith("$platformPrefix/")
+        }
+        // Choose the Quest/Android subset before classifying code or applying
+        // payload policy. A desktop DLL/EXE/SO in a mixed archive must not
+        // poison an otherwise valid Quest native-content branch.
+        val codeMod = selectedEntries.any(::looksLikeCodeModPayload)
+        val loaderRequirement = if (codeMod) {
+            loaderRequirement(
+                setOf(ModLoaderKind.LEMON_LOADER, ModLoaderKind.MELON_LOADER),
+                loaderDetection,
+                preconditions,
+                enforceWhenUnknown = true,
+                targetPackageId = BONELAB_PACKAGE_ID
+            )
+        } else null
+        val type = if (codeMod) ModPackageType.BONELAB_CODE_MOD else ModPackageType.BONELAB_NATIVE_CONTENT
+        if (codeMod) {
+            addDangerousPayloadPrecondition(
+                archive,
+                preconditions,
+                allowCodeDll = true,
+                payloadEntries = selectedEntries
+            )
+            addBonelabCodePayloadPreconditions(archive, preconditions, selectedEntries)
+        } else {
+            addDangerousPayloadPrecondition(
+                archive,
+                preconditions,
+                payloadEntries = selectedEntries
+            )
+            addDefaultDeniedNativePayloadPrecondition(archive, preconditions, selectedEntries)
+        }
+
+        val hasQuestBranch = platformPrefix != null
+        if (pcRoots.isNotEmpty() && !hasQuestBranch) {
+            preconditions += blocked(
+                "PC_ONLY_PAYLOAD",
+                "هذه حزمة BONELAB مخصصة للكمبيوتر وليست محتوى Quest قابلًا للتثبيت."
+            )
+        }
+        if (selectedEntries.any { isPcOnlyFile(it) }) {
+            preconditions += blocked(
+                "PC_ONLY_PAYLOAD",
+                "هذه الحزمة تحتوي ملفات BONELAB مخصصة للكمبيوتر فقط."
+            )
+        }
+        val mappings = mutableListOf<ModFileMapping>()
+        if (roots.isEmpty()) {
+            preconditions += blocked("MOD_FOLDER_REQUIRED", "BONELAB pallet content must contain a complete mod folder.")
+        } else if (archive.entries.any { it.substringBefore('/').isBlank() }) {
+            preconditions += blocked("MOD_FOLDER_REQUIRED", "BONELAB content files must be inside a mod folder.")
+        } else {
+            for (entry in archive.entries) {
+                if (entry in archive.directories) continue
+                if (platformPrefix != null && !entry.startsWith("$platformPrefix/")) {
+                    // A mixed PC/Quest archive is handled by the Quest/Android
+                    // branch only; never copy the desktop half silently.
+                    continue
+                }
+                val platformRelative = platformPrefix?.let {
+                    entry.removePrefix("$it/")
+                } ?: entry
+                val relative = stripBonelabWrappers(platformRelative)
+                if (relative.isBlank() || !relative.contains('/')) {
+                    preconditions += blocked("MOD_FOLDER_REQUIRED", "BONELAB content files must be inside a complete mod folder.")
+                    continue
+                }
+                val destination = "${profile.destination}/${relative}"
+                addMapping(
+                    archive,
+                    profile,
+                    mappings,
+                    entry,
+                    destination,
+                    null,
+                    preconditions,
+                    allowFullDestination = true,
+                    targetPackageId = BONELAB_PACKAGE_ID
+                )
+            }
+        }
+        if (mappings.isEmpty()) {
+            preconditions += blocked("NO_COPY_MAPPINGS", "BONELAB content contains no safe files to install.")
+        }
+        val plan = plan(
+            type,
+            BONELAB_PACKAGE_ID,
+            profile,
+            mappings,
+            if (codeMod) ModInstallStrategy.PROFILE_COPY else ModInstallStrategy.BONELAB_CONTENT_COPY,
+            preconditions,
+            archive.identity,
+            installedApp,
+            loaderRequirement
+        )
+        return result(
+            type,
+            if (plan.installable) {
+                if (codeMod) "Recognized BONELAB code mod with a verified loader."
+                else "Recognized BONELAB native Marrow content."
+            } else blockingMessage(plan),
+            plan,
+            archive,
+            metadata = mapOf("platform" to if (codeMod) "Quest loader code" else "Quest native content")
+        )
+    }
+
+    private fun stripBonelabWrappers(raw: String): String {
+        var value = raw
+        while (value.substringBefore('/').equals("Mods", ignoreCase = true)) {
+            value = value.substringAfter('/', "")
+            if (value.isBlank()) return ""
+        }
+        return value
+    }
+
+    private fun checkTarget(
+        target: String,
+        installedApp: InstalledQuestApp?,
+        name: String,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        when {
+            installedApp == null ->
+                preconditions += blocked("TARGET_APP_REQUIRED", "Select the installed $name app before installing this package.")
+            installedApp.packageName != target ->
+                preconditions += blocked(
+                    "TARGET_PACKAGE_MISMATCH",
+                    "Package targets '$target', but the selected app is '${installedApp.packageName}'."
+                )
+            else -> preconditions += satisfied("TARGET_PACKAGE_MATCH", "$name package matches the selected app.")
+        }
+    }
+
+    private fun isKnownGameProfilePayload(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?
+    ): Boolean {
+        val profile = installedApp?.let { profileRegistry.findByPackageId(it.packageName) }
+            ?: return false
+        if (profile.packageId == BONELAB_PACKAGE_ID) return false
+        return archive.entries.any { entry ->
+            profile.knownContentDirectories.any { root ->
+                entry == root || entry.startsWith("$root/")
+            }
+        }
+    }
+
+    private fun analyzeKnownGameProfile(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?,
+        loaderDetection: ModLoaderDetection?
+    ): ModPackageAnalysis {
+        val target = installedApp?.packageName
+        val profile = target?.let(profileRegistry::findByPackageId)
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        if (target == null || profile == null) {
+            preconditions += blocked("TARGET_APP_REQUIRED", "Select a supported installed game before installing this package.")
+        } else {
+            preconditions += satisfied("TARGET_PACKAGE_MATCH", "Known game profile matches the selected app.")
+        }
+        val loaderRequirement = profile?.let {
+            loaderRequirement(
+                it.loaderRequirements,
+                loaderDetection,
+                preconditions,
+                enforceWhenUnknown = it.loaderRequirements.isNotEmpty(),
+                targetPackageId = target
+            )
+        }
+        addDangerousPayloadPrecondition(archive, preconditions)
+        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        val mappings = mutableListOf<ModFileMapping>()
+        if (profile != null) {
+            for (entry in archive.entries) {
+                if (entry in archive.directories) continue
+                val root = profile.knownContentDirectories.firstOrNull {
+                    entry.startsWith("$it/")
+                } ?: continue
+                val relative = entry.removePrefix("$root/")
+                if (relative.isBlank()) continue
+                addMapping(
+                    archive,
+                    profile,
+                    mappings,
+                    entry,
+                    "${profile.destination}/$relative",
+                    null,
+                    preconditions,
+                    allowFullDestination = true,
+                    targetPackageId = target
+                )
+            }
+        }
+        if (mappings.isEmpty()) {
+            preconditions += blocked("NO_COPY_MAPPINGS", "Known profile package contains no safe content files.")
+        }
+        val plan = plan(
+            ModPackageType.KNOWN_GAME_PROFILE,
+            target,
+            profile,
+            mappings,
+            ModInstallStrategy.PROFILE_COPY,
+            preconditions,
+            archive.identity,
+            installedApp,
+            loaderRequirement
+        )
+        return result(
+            ModPackageType.KNOWN_GAME_PROFILE,
+            if (plan.installable) "Recognized package using the vetted game profile '${profile?.displayName}'."
+            else blockingMessage(plan),
+            plan,
+            archive
+        )
+    }
+
+    private fun looksLikeCodeModPayload(path: String): Boolean =
+        path.lowercase(Locale.ROOT).endsWith(".dll") ||
+            path.lowercase(Locale.ROOT).contains("/melonloader/") ||
+            path.lowercase(Locale.ROOT).contains("/lemonloader/")
+
+    private fun isPcOnlyFile(path: String): Boolean {
+        val lower = path.lowercase(Locale.ROOT)
+        return lower.endsWith(".exe") || lower.endsWith(".pdb") || lower.endsWith(".lib")
+    }
+
     private fun analyzeVirtualStump(
         archive: ArchiveMetadata,
         json: JSONObject
     ): ModPackageAnalysis {
-        val sourceUrl = virtualStumpSourceUrl(json)
-        val externalWorkflow = ModExternalWorkflow(
-            sourceUrl = sourceUrl,
-            actionUrl = sourceUrl ?: GORILLA_TAG_MOD_IO_URL,
-            guidance = if (sourceUrl != null) {
-                "افتح صفحة mod.io الموثوقة في المتصفح لإدارة محتوى Gorilla Tag. لا ينفذ NFVR تثبيتًا مباشرًا لهذا النوع."
-            } else {
-                "افتح صفحة Gorilla Tag على mod.io في المتصفح وابحث عن المحتوى المطلوب. لا يخمّن NFVR رابطًا أو وجهة تثبيت."
-            }
-        )
         val plan = ModInstallPlan(
+            outcome = ModInstallOutcome.BUILT_IN_GAME_CONTENT,
             packageType = ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
-            strategy = ModInstallStrategy.MOD_IO_MANAGED,
+            strategy = ModInstallStrategy.NONE,
             archiveIdentity = archive.identity,
             preconditions = listOf(
                 satisfied(
-                    "MOD_IO_MANAGED",
-                    "Gorilla Tag Virtual Stump content is managed by Gorilla Tag/mod.io; NFVR has no safe direct destination."
-                )
+                    "BUILT_IN_GAME_CONTENT",
+                    "Virtual Stump content is managed by Gorilla Tag's built-in custom-content system; NFVR has no safe direct destination."
+                ),
+                // Kept as a stable compatibility code for existing callers;
+                // it no longer implies a browser or external URL workflow.
+                satisfied("MOD_IO_MANAGED", "The package is managed by the game's built-in content system.")
             )
         )
         return result(
             ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
-            "Recognized Gorilla Tag Virtual Stump map/gamemode package; it is not directly installable by NFVR.",
+            "Recognized Gorilla Tag Virtual Stump content; manage it through the game's built-in custom-content system.",
             plan,
             archive,
-            json.toMap() + mapOf(
-                "externalWorkflow" to "SUPPORTED_EXTERNAL_WORKFLOW",
-                "modIoUrl" to sourceUrl
-            ),
-            externalWorkflow = externalWorkflow
+            json.toMap()
         )
     }
 
-    private fun virtualStumpSourceUrl(json: JSONObject): String? {
-        val keys = listOf("modIoUrl", "modioUrl", "modio_url", "modio", "mod.io", "sourceUrl", "website", "url")
-        return keys.asSequence()
-            .mapNotNull { key -> json.optString(key, "").trim().ifBlank { null } }
-            .mapNotNull(::validatedHttpsModIoUrl)
-            .firstOrNull()
-    }
-
     private fun analyzeGeneric(archive: ArchiveMetadata): ModPackageAnalysis {
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        preconditions += blocked(
+            "DESTINATION_UNDECLARED",
+            "Generic mod data has no declarative destination; NFVR will not guess where to copy it."
+        )
         val plan = ModInstallPlan(
             packageType = ModPackageType.GENERIC_DATA,
             strategy = ModInstallStrategy.NONE,
             archiveIdentity = archive.identity,
-            preconditions = listOf(
-                blocked(
-                    "DESTINATION_UNDECLARED",
-                    "Generic mod data has no declarative destination; NFVR will not guess where to copy it."
-                )
-            )
+            preconditions = preconditions
         )
         return result(
             ModPackageType.GENERIC_DATA,
@@ -381,7 +973,8 @@ class ModPackageAnalyzer(
     private fun analyzeNfvr(
         archive: ArchiveMetadata,
         json: JSONObject,
-        installedApp: InstalledQuestApp?
+        installedApp: InstalledQuestApp?,
+        loaderDetection: ModLoaderDetection?
     ): ModPackageAnalysis {
         val preconditions = mutableListOf<ModInstallPrecondition>()
         val schema = json.opt("schemaVersion")
@@ -429,10 +1022,20 @@ class ModPackageAnalyzer(
             preconditions += blocked("UNKNOWN_GAME_PROFILE", "No vetted destination is registered for '$target'.")
         }
         checkVersionConstraints(json, installedApp, preconditions)
-        val loader = json.optString("requiredModLoader", "").trim()
-        if (loader.isNotEmpty()) {
-            preconditions += blocked("UNSUPPORTED_MOD_LOADER", "NFVR does not install or configure required modloader '$loader'.")
+        val loaderValue = json.optString("requiredModLoader", "").trim()
+        val loader = ModLoaderKind.parse(loaderValue)
+        if (loaderValue.isNotEmpty() &&
+            (loader == null || loader !in setOf(ModLoaderKind.QUEST_LOADER, ModLoaderKind.SCOTLAND2))
+        ) {
+            preconditions += blocked("UNSUPPORTED_MOD_LOADER", "Unsupported required modloader '$loaderValue'.")
         }
+        val loaderRequirement = loaderRequirement(
+            if (loader == null) emptySet() else setOf(loader),
+            loaderDetection,
+            preconditions,
+            enforceWhenUnknown = loader != null,
+            targetPackageId = target
+        )
         if (json.optString("modType", "").equals("apk-patch", true)) {
             preconditions += blocked("UNSUPPORTED_PATCHING", "NFVR manifests may not request APK patching.")
         }
@@ -443,10 +1046,19 @@ class ModPackageAnalyzer(
         if (mappings.isEmpty()) {
             preconditions += blocked("NO_COPY_MAPPINGS", "NFVR manifest must contain at least one safe file copy.")
         }
+        addNfvrNativePayloadPreconditions(
+            archive,
+            mappings,
+            loader,
+            target,
+            preconditions
+        )
         val plan = plan(
             ModPackageType.NFVR_MANIFEST, target, profile, mappings,
             ModInstallStrategy.DECLARATIVE_COPY, preconditions,
-            archive.identity, installedApp
+            archive.identity,
+            installedApp,
+            loaderRequirement
         )
         return result(
             ModPackageType.NFVR_MANIFEST,
@@ -500,18 +1112,23 @@ class ModPackageAnalyzer(
 
     private fun addMapping(
         archive: ArchiveMetadata,
-        profile: GameModProfile,
+        profile: GameModProfile?,
         mappings: MutableList<ModFileMapping>,
         source: String,
         destination: String,
         sha256: String?,
-        preconditions: MutableList<ModInstallPrecondition>
+        preconditions: MutableList<ModInstallPrecondition>,
+        allowFullDestination: Boolean = false,
+        targetPackageId: String? = null
     ) {
         val sourcePath = safeRelativePath(source)
-        val destinationPath = safeRelativePath(destination)
         val normalizedDestination = destination.trim().replace('\\', '/')
-        val explicitFullDestination = normalizedDestination == profile.destination ||
-            normalizedDestination.startsWith("${profile.destination}/")
+        val destinationPath = safeRelativePath(destination)
+        val explicitFullDestination = profile?.let {
+            normalizedDestination == it.destination ||
+                normalizedDestination.startsWith("${it.destination}/")
+        } == true ||
+            (allowFullDestination && isApprovedManifestDestination(normalizedDestination, targetPackageId))
         if (sourcePath == null || (destinationPath == null && !explicitFullDestination)) {
             preconditions += blocked("UNSAFE_PATH", "File mappings may not contain absolute, traversal, or unsafe paths.")
             return
@@ -528,10 +1145,19 @@ class ModPackageAnalyzer(
         val fullDestination = if (explicitFullDestination) {
             normalizedDestination
         } else {
-            "${profile.destination}/${destinationPath!!}"
+            val profileDestination = profile?.destination
+            if (profileDestination == null) {
+                preconditions += blocked(
+                    "DESTINATION_UNAVAILABLE",
+                    "A relative destination requires a vetted game profile."
+                )
+                return
+            }
+            "${profileDestination.trimEnd('/')}/${destinationPath!!}"
         }
         if (!AndroidPathValidator.isSafe(fullDestination) ||
-            !fullDestination.startsWith("${profile.destination}/")
+            (!fullDestinationCandidate(fullDestination, profile?.destination) &&
+                !(allowFullDestination && isApprovedManifestDestination(fullDestination, targetPackageId)))
         ) {
             preconditions += blocked("UNSAFE_DESTINATION", "Destination '$destination' is outside the vetted game mod directory.")
             return
@@ -562,6 +1188,17 @@ class ModPackageAnalyzer(
             return
         }
         mappings += ModFileMapping(sourcePath, fullDestination, actualSha256, size)
+    }
+
+    private fun fullDestinationCandidate(destination: String, profileDestination: String?): Boolean =
+        profileDestination != null &&
+            (destination == profileDestination || destination.startsWith("${profileDestination.trimEnd('/')}/"))
+
+    private fun isApprovedManifestDestination(destination: String, targetPackageId: String?): Boolean {
+        val target = targetPackageId?.takeIf { PACKAGE_ID.matches(it) } ?: return false
+        return ModDestinationPolicy.isPackageBound(destination, target) &&
+            !destination.contains("/../") &&
+            AndroidPathValidator.isSafe(destination)
     }
 
     private fun checkVersionConstraints(
@@ -598,18 +1235,123 @@ class ModPackageAnalyzer(
         strategy: ModInstallStrategy,
         preconditions: List<ModInstallPrecondition>,
         archiveIdentity: ModArchiveIdentity? = null,
-        reviewedApp: InstalledQuestApp? = null
-    ): ModInstallPlan = ModInstallPlan(
-        installable = mappings.isNotEmpty() && preconditions.none { !it.satisfied },
+        reviewedApp: InstalledQuestApp? = null,
+        loaderRequirement: ModLoaderRequirement? = null
+    ): ModInstallPlan {
+        val installable = mappings.isNotEmpty() && preconditions.none { !it.satisfied }
+        val unsupportedLoader = preconditions.any { it.code == "UNSUPPORTED_MOD_LOADER" }
+        val requiresLoader = preconditions.any {
+            !it.satisfied && (
+                it.code == "MOD_LOADER_NOT_DETECTED" ||
+                    it.code == "MOD_LOADER_UNKNOWN"
+                )
+        }
+        val hardPayloadBlock = preconditions.any {
+            !it.satisfied && it.code in setOf(
+                "DANGEROUS_PAYLOAD",
+                "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
+                "INVALID_MANAGED_CODE",
+                "PC_ONLY_PAYLOAD",
+                "MIXED_PLATFORM_PAYLOAD",
+                "UNSUPPORTED_LATE_MOD_FILES"
+            )
+        }
+        val outcome = when {
+            type == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ->
+                ModInstallOutcome.BUILT_IN_GAME_CONTENT
+            type == ModPackageType.UNKNOWN || type == ModPackageType.GENERIC_DATA ->
+                ModInstallOutcome.UNSUPPORTED
+            unsupportedLoader -> ModInstallOutcome.UNSUPPORTED
+            hardPayloadBlock -> ModInstallOutcome.UNSUPPORTED
+            requiresLoader -> ModInstallOutcome.REQUIRES_MOD_LOADER
+            installable -> ModInstallOutcome.DIRECT_INSTALL_READY
+            else -> ModInstallOutcome.UNSUPPORTED
+        }
+        return ModInstallPlan(
+        installable = installable,
+        outcome = outcome,
         packageType = type,
         targetPackageId = target,
-        destinationRoot = profile?.destination,
+        destinationRoot = profile?.destination ?: inferDestinationRoot(target, mappings),
         mappings = mappings,
         preconditions = preconditions,
         strategy = strategy,
         archiveIdentity = archiveIdentity,
-        reviewedApp = reviewedApp
+        reviewedApp = reviewedApp,
+        loaderRequirement = loaderRequirement
     )
+    }
+
+    private fun inferDestinationRoot(
+        target: String?,
+        mappings: List<ModFileMapping>
+    ): String? {
+        val packageId = target?.takeIf(PACKAGE_ID::matches) ?: return null
+        val roots = listOf(
+            "/sdcard/Android/data/$packageId",
+            "/sdcard/Android/obb/$packageId",
+            "/sdcard/ModData/$packageId"
+        )
+        val matchingRoots = mappings.asSequence()
+            .mapNotNull { mapping -> roots.firstOrNull { mapping.destinationPath == it || mapping.destinationPath.startsWith("$it/") } }
+            .distinct()
+            .toList()
+        return when {
+            matchingRoots.size == 1 -> matchingRoots.single()
+            matchingRoots.size > 1 -> "/sdcard/"
+            else -> null
+        }
+    }
+
+    private fun loaderRequirement(
+        required: Set<ModLoaderKind>,
+        detection: ModLoaderDetection?,
+        preconditions: MutableList<ModInstallPrecondition>,
+        enforceWhenUnknown: Boolean,
+        targetPackageId: String? = null
+    ): ModLoaderRequirement? {
+        if (required.isEmpty()) return null
+        val requirement = ModLoaderRequirement(
+            requested = required,
+            detection = detection,
+            targetPackageId = targetPackageId
+        )
+        when (requirement.status) {
+            ModLoaderStatus.DETECTED ->
+                preconditions += satisfied("MOD_LOADER_DETECTED", requirement.message.ifBlank {
+                    detection?.summary(required) ?: "Required modloader detected."
+                })
+            ModLoaderStatus.NOT_DETECTED ->
+                preconditions += blocked("MOD_LOADER_NOT_DETECTED", requirement.message.ifBlank {
+                    detection?.summary(required) ?: "Required modloader was not detected."
+                })
+            ModLoaderStatus.UNKNOWN -> if (enforceWhenUnknown) {
+                preconditions += blocked("MOD_LOADER_UNKNOWN", requirement.message.ifBlank {
+                    detection?.summary(required) ?: "Required modloader could not be verified."
+                })
+            }
+        }
+        return requirement
+    }
+
+    private fun checkQmodPackageVersion(
+        json: JSONObject,
+        app: InstalledQuestApp?,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        if (!json.has("packageVersion")) return
+        val requested = json.optString("packageVersion", "").trim()
+        if (requested.isBlank()) {
+            preconditions += blocked("INVALID_PACKAGE_VERSION", "QMOD packageVersion must be a non-empty version.")
+        } else if (app?.versionName == null) {
+            preconditions += blocked("GAME_VERSION_REQUIRED", "QMOD declares packageVersion but the installed version is unavailable.")
+        } else if (compareVersions(app.versionName, requested) != 0) {
+            preconditions += blocked(
+                "GAME_VERSION_UNSUPPORTED",
+                "QMOD targets game version '$requested', but the installed version is '${app.versionName}'."
+            )
+        }
+    }
 
     private fun isVirtualStump(json: JSONObject): Boolean =
         json.optString("packageId", "").equals(GORILLA_TAG_VIRTUAL_STUMP_PACKAGE_ID, true) ||
@@ -669,7 +1411,12 @@ class ModPackageAnalyzer(
                 "QMOD mod.json contains unsupported top-level fields: ${unknown.joinToString()}."
             )
         }
-        val unimplemented = json.keys().asSequence().filter(QMOD_UNIMPLEMENTED_KEYS::contains).toList()
+        val legacyPackageVersion = if (json.has("packageVersion") && !json.has("_QPVersion")) {
+            listOf("packageVersion")
+        } else {
+            emptyList()
+        }
+        val unimplemented = json.keys().asSequence().filter(QMOD_UNIMPLEMENTED_KEYS::contains).toList() + legacyPackageVersion
         if (unimplemented.isNotEmpty()) {
             preconditions += blocked(
                 "UNSUPPORTED_QMOD_FIELD",
@@ -680,10 +1427,13 @@ class ModPackageAnalyzer(
 
     private fun addDangerousPayloadPrecondition(
         archive: ArchiveMetadata,
-        preconditions: MutableList<ModInstallPrecondition>
+        preconditions: MutableList<ModInstallPrecondition>,
+        allowCodeDll: Boolean = false,
+        payloadEntries: Collection<String> = archive.entries
     ) {
-        val dangerous = archive.entries.filter { path ->
-            DANGEROUS_PAYLOAD_EXTENSIONS.any { path.lowercase(Locale.ROOT).endsWith(it) }
+        val dangerous = payloadEntries.filter { path ->
+            DANGEROUS_PAYLOAD_EXTENSIONS.any { path.lowercase(Locale.ROOT).endsWith(it) } &&
+                !(allowCodeDll && path.lowercase(Locale.ROOT).endsWith(".dll"))
         }
         if (dangerous.isNotEmpty()) {
             preconditions += blocked(
@@ -693,13 +1443,171 @@ class ModPackageAnalyzer(
         }
     }
 
-    private fun collisionKey(path: String): String =
-        Normalizer.normalize(path.replace('\\', '/'), Normalizer.Form.NFC)
-            .split('/')
-            .filter { it.isNotBlank() && it != "." }
-            .map { it.trimEnd(' ', '.') }
-            .joinToString("/")
-            .lowercase(Locale.ROOT)
+    private fun addDefaultDeniedNativePayloadPrecondition(
+        archive: ArchiveMetadata,
+        preconditions: MutableList<ModInstallPrecondition>,
+        payloadEntries: Collection<String> = archive.entries
+    ) {
+        val native = payloadEntries.filter { path ->
+            NATIVE_PAYLOAD_EXTENSIONS.any {
+                path.lowercase(Locale.ROOT).endsWith(it)
+            }
+        }
+        if (native.isNotEmpty()) {
+            preconditions += blocked(
+                "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
+                "DLL/SO payloads are denied unless a validated loader mapping and architecture proof are present: ${native.take(5).joinToString()}."
+            )
+        }
+    }
+
+    private fun addBonelabCodePayloadPreconditions(
+        archive: ArchiveMetadata,
+        preconditions: MutableList<ModInstallPrecondition>,
+        payloadEntries: Collection<String> = archive.entries
+    ) {
+        val dlls = payloadEntries.filter {
+            it.lowercase(Locale.ROOT).endsWith(".dll")
+        }
+        if (dlls.any { !isManagedPeCli(archive, it) }) {
+            preconditions += blocked(
+                "INVALID_MANAGED_CODE",
+                "BONELAB code mods must be validated managed PE/CLI assemblies."
+            )
+        }
+        if (payloadEntries.any {
+                it.lowercase(Locale.ROOT).endsWith(".so")
+            }) {
+            preconditions += blocked(
+                "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
+                "BONELAB code plans do not accept unvalidated native SO payloads."
+            )
+        }
+    }
+
+    private fun addQmodNativePayloadPreconditions(
+        archive: ArchiveMetadata,
+        json: JSONObject,
+        mappings: List<ModFileMapping>,
+        loader: ModLoaderKind?,
+        target: String?,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        val nativeSources = archive.entries.filter {
+            NATIVE_PAYLOAD_EXTENSIONS.any { extension ->
+                it.lowercase(Locale.ROOT).endsWith(extension)
+            }
+        }
+        if (nativeSources.isEmpty()) return
+        val allowedLoader = loader == ModLoaderKind.QUEST_LOADER ||
+            loader == ModLoaderKind.SCOTLAND2
+        val loaderSources = listOf("modFiles", "lateModFiles", "libraryFiles")
+            .flatMap { field ->
+                (json.optJSONArray(field)?.let { array ->
+                    (0 until array.length()).mapNotNull { array.optString(it).trim().ifBlank { null } }
+                } ?: emptyList())
+            }
+            .mapNotNull { safeRelativePath(it) }
+            .toSet()
+        val allValid = allowedLoader &&
+            target != null &&
+            nativeSources.all { source ->
+                val mapping = mappings.firstOrNull { it.sourcePath == source } ?: return@all false
+                val lower = source.lowercase(Locale.ROOT)
+                source in loaderSources &&
+                    lower.endsWith(".so") &&
+                    isArm64Elf(archive, source) &&
+                    isLoaderRoot(mapping.destinationPath, target, loader)
+            }
+        if (!allValid) {
+            preconditions += blocked(
+                "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
+                "QMOD DLL/SO payloads require an explicit QuestLoader/Scotland2 root and validated ARM64 ELF files."
+            )
+        }
+    }
+
+    private fun addNfvrNativePayloadPreconditions(
+        archive: ArchiveMetadata,
+        mappings: List<ModFileMapping>,
+        loader: ModLoaderKind?,
+        target: String?,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        val nativeSources = archive.entries.filter {
+            NATIVE_PAYLOAD_EXTENSIONS.any { extension ->
+                it.lowercase(Locale.ROOT).endsWith(extension)
+            }
+        }
+        if (nativeSources.isEmpty()) return
+        val allValid = loader != null &&
+            target != null &&
+            nativeSources.all { source ->
+                val mapping = mappings.firstOrNull { it.sourcePath == source } ?: return@all false
+                source.lowercase(Locale.ROOT).endsWith(".so") &&
+                    isArm64Elf(archive, source) &&
+                    isLoaderRoot(mapping.destinationPath, target, loader)
+            }
+        if (!allValid) {
+            preconditions += blocked(
+                "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
+                "NFVR DLL/SO payloads require a declared supported loader, loader root, and validated ARM64 ELF file."
+            )
+        }
+    }
+
+    private fun isLoaderRoot(path: String, target: String, loader: ModLoaderKind?): Boolean {
+        return ModDestinationPolicy.isLoaderRoot(path, target, loader)
+    }
+
+    private fun isArm64Elf(archive: ArchiveMetadata, source: String): Boolean {
+        val bytes = archive.prefixes[source] ?: return false
+        return bytes.size >= 20 &&
+            bytes[0] == 0x7f.toByte() &&
+            bytes[1] == 'E'.code.toByte() &&
+            bytes[2] == 'L'.code.toByte() &&
+            bytes[3] == 'F'.code.toByte() &&
+            bytes[4].toInt() == 2 &&
+            bytes[5].toInt() == 1 &&
+            (bytes[18].toInt() and 0xff) == 0xb7 &&
+            bytes[19].toInt() == 0
+    }
+
+    private fun isManagedPeCli(archive: ArchiveMetadata, source: String): Boolean {
+        val bytes = archive.prefixes[source] ?: return false
+        if (bytes.size < 64 || bytes[0] != 'M'.code.toByte() || bytes[1] != 'Z'.code.toByte()) return false
+        val peOffset = littleEndianInt(bytes, 0x3c)
+        if (peOffset < 0 || peOffset + 24 > bytes.size) return false
+        if (bytes[peOffset] != 'P'.code.toByte() ||
+            bytes[peOffset + 1] != 'E'.code.toByte() ||
+            bytes[peOffset + 2] != 0.toByte() ||
+            bytes[peOffset + 3] != 0.toByte()
+        ) return false
+        val optional = peOffset + 24
+        if (optional + 2 > bytes.size) return false
+        val magic = littleEndianShort(bytes, optional)
+        val directory = when (magic) {
+            0x10b -> optional + 96
+            0x20b -> optional + 112
+            else -> return false
+        }
+        val cliDirectory = directory + (14 * 8)
+        return cliDirectory + 8 <= bytes.size &&
+            littleEndianInt(bytes, cliDirectory) != 0 &&
+            littleEndianInt(bytes, cliDirectory + 4) != 0
+    }
+
+    private fun littleEndianShort(bytes: ByteArray, offset: Int): Int =
+        (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8)
+
+    private fun littleEndianInt(bytes: ByteArray, offset: Int): Int =
+        (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8) or
+            ((bytes[offset + 2].toInt() and 0xff) shl 16) or
+            ((bytes[offset + 3].toInt() and 0xff) shl 24)
+
+    private fun collisionKey(path: String): String = ModArchivePath.collisionKey(path)
 
     private fun unknown(archive: ArchiveMetadata): ModPackageAnalysis {
         val plan = ModInstallPlan(
@@ -715,16 +1623,24 @@ class ModPackageAnalyzer(
         )
     }
 
-    private fun failed(message: String): ModPackageAnalysis =
+    private fun failed(message: String, diagnosticEntry: String? = null): ModPackageAnalysis =
         ModPackageAnalysis(
             ModPackageType.UNKNOWN,
             recognized = false,
             message = message,
             compatibility = ModCompatibility(false, listOf(message)),
             installPlan = ModInstallPlan(
+                outcome = ModInstallOutcome.UNSAFE_ARCHIVE,
                 archiveIdentity = null,
-                preconditions = listOf(blocked("INVALID_ARCHIVE", message))
-            )
+                preconditions = listOf(
+                    blocked(
+                        "UNSAFE_ARCHIVE",
+                        if (diagnosticEntry == null) message else "$message (entry '$diagnosticEntry')"
+                    )
+                ),
+                diagnostics = listOfNotNull(diagnosticEntry)
+            ),
+            diagnostics = listOfNotNull(diagnosticEntry)
         )
 
     private fun result(
@@ -757,27 +1673,22 @@ class ModPackageAnalyzer(
     private fun satisfied(code: String, message: String) = ModInstallPrecondition(code, message, true)
 
     private fun validateEntryName(name: String): String {
-        require(name.isNotBlank()) { "ZIP contains an empty entry name." }
-        require(!name.contains('\u0000')) { "ZIP contains a NUL entry name." }
-        require(name.toByteArray(StandardCharsets.UTF_8).size <= MAX_ENTRY_NAME_BYTES) {
-            "ZIP entry name exceeds the safe limit."
+        return try {
+            ModArchivePath.normalize(name)
+        } catch (e: IllegalArgumentException) {
+            throw ModPackageException(
+                "ZIP rejected entry '$name': ${e.message ?: "unsafe path"}.",
+                name
+            )
         }
-        val normalized = name.replace('\\', '/')
-        require(!normalized.startsWith("/") && !normalized.startsWith("~")) { "ZIP contains an absolute entry path." }
-        require(!normalized.substringBefore('/').contains(':')) { "ZIP contains an unsafe entry path." }
-        val pieces = normalized.split('/')
-        require(pieces.none { it.isEmpty() || it == "." || it == ".." }) { "ZIP contains a traversal entry path." }
-        return pieces.joinToString("/")
     }
 
     private fun safeRelativePath(value: String): String? {
-        val normalized = value.trim().replace('\\', '/')
-        if (normalized.isBlank() || normalized.startsWith("/") || normalized.startsWith("~")) return null
-        if (normalized.substringBefore('/').contains(':')) return null
-        val pieces = normalized.split('/')
-        if (pieces.any { it.isBlank() || it == "." || it == ".." }) return null
-        if (pieces.any { it.any { char -> char == '\u0000' || char == ';' || char == '|' || char == '`' } }) return null
-        return pieces.joinToString("/")
+        val normalized = runCatching { ModArchivePath.normalize(value.trim()) }.getOrNull() ?: return null
+        if (normalized.isBlank()) return null
+        if (normalized.split('/').any { it.isBlank() || it == "." || it == ".." }) return null
+        if (normalized.any { it == '\u0000' || it == ';' || it == '|' || it == '`' }) return null
+        return normalized
     }
 
     private fun looksLikeGenericModPayload(path: String): Boolean {
@@ -808,14 +1719,18 @@ class ModPackageAnalyzer(
         val sizes: Map<String, Long> = emptyMap(),
         val hashes: Map<String, String> = emptyMap(),
         val directories: Set<String> = emptySet(),
+        val prefixes: Map<String, ByteArray> = emptyMap(),
         val identity: ModArchiveIdentity? = null
     )
 
-    private class ModPackageException(message: String) : Exception(message)
+    private class ModPackageException(
+        message: String,
+        val diagnosticEntry: String? = null
+    ) : Exception(message)
 
 }
 
-private fun sha256File(file: File): String {
+internal fun sha256File(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
