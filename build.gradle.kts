@@ -62,6 +62,7 @@ compose.desktop {
                 iconFile.set(project.file("NFVR_Quest_Installer.ico"))
                 menuGroup = "Near FutureVR"
                 shortcut = true
+                upgradeUuid = "7cb46291-dd03-47c9-9be0-b06a73b3f132"
             }
 
             macOS {
