@@ -673,6 +673,19 @@ private fun showSecondInstanceMessage() {
 }
 
 fun main() {
+    val previousUncaughtHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+        DiagnosticLogger.error(
+            "استثناء غير معالج في ${thread.name} أثناء تشغيل NFVR ${AppInfo.version}",
+            error
+        )
+        if (previousUncaughtHandler != null) {
+            previousUncaughtHandler.uncaughtException(thread, error)
+        } else {
+            error.printStackTrace()
+        }
+    }
+
     // Acquire before Compose creates any native windows. The lock is held by
     // the application closure and is released on normal composition disposal.
     val instanceLock = NfvrSingleInstanceLock.forCurrentUser()

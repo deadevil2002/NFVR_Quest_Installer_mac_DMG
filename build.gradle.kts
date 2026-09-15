@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.nearfuturevr"
-version = "2.1.1"
+version = "2.1.2"
 
 kotlin {
     jvmToolchain(17)
@@ -31,6 +31,7 @@ dependencies {
     implementation(compose.foundation)
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
     implementation("org.json:json:20240303")
 
     testImplementation(kotlin("test"))
