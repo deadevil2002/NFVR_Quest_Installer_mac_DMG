@@ -46,7 +46,7 @@ class ModPackageAnalyzerTest {
             "mod.json" to """{"packageId":"com.StressLevelZero.BONELAB","modFiles":["a.so"]}""",
             "a.so" to "x"
         )
-        val analysis = analyzer.analyze(zip, InstalledQuestApp("com.WarpFrog.BNS", "1.0"))
+        val analysis = analyzer.analyze(zip, InstalledQuestApp("com.example.other", "1.0"))
         assertFalse(analysis.installable)
         assertTrue(analysis.installPlan.preconditions.any { it.code == "TARGET_PACKAGE_MISMATCH" })
         zip.delete()
@@ -239,7 +239,11 @@ class ModPackageAnalyzerTest {
             assertTrue(analysis.installable)
             zip.appendText("changed-after-review")
             val adb = FakeAdb()
-            val result = ModsManager(adb).executeInstallPlan("SERIAL", zip, analysis.installPlan)
+            val result = ModsManager(adb).executeInstallPlan(
+                "SERIAL",
+                zip,
+                analysis.installPlan.bindToDevice("SERIAL")
+            )
             assertFalse(result.success)
             assertTrue(result.message.contains("تغير") || result.message.contains("تحليل"))
             assertEquals(0, adb.pushCalls)
@@ -260,11 +264,37 @@ class ModPackageAnalyzerTest {
             val analysis = analyzer.analyze(zip, bonelab)
             assertTrue(analysis.installable)
             val adb = FakeAdb()
-            val result = ModsManager(adb).executeInstallPlan("SERIAL", zip, analysis.installPlan)
+            val result = ModsManager(adb).executeInstallPlan(
+                "SERIAL",
+                zip,
+                analysis.installPlan.bindToDevice("SERIAL")
+            )
             assertFalse(result.success)
             assertTrue(result.message.contains("التحقق"))
             assertEquals(1, adb.pushCalls)
             assertTrue(zip.delete())
+        }
+    }
+
+    @Test
+    fun executorRejectsUnboundPlanBeforeDeviceScanOrWrite() {
+        runBlocking {
+            val zip = zipOf(
+                "nfvr-mod.json" to """
+                    {"schemaVersion":1,"targetPackageId":"com.StressLevelZero.BONELAB",
+                     "files":[{"source":"payload.dat","destination":"payload.dat"}]}
+                """.trimIndent(),
+                "payload.dat" to "payload"
+            )
+            val analysis = analyzer.analyze(zip, bonelab)
+            val adb = FakeAdb()
+
+            val result = ModsManager(adb).executeInstallPlan("SERIAL", zip, analysis.installPlan)
+
+            assertFalse(result.success)
+            assertTrue(result.message.contains("مرتبطة") || result.message.contains("ربط"))
+            assertEquals(0, adb.pushCalls)
+            zip.delete()
         }
     }
 

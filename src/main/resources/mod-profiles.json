@@ -1,0 +1,70 @@
+[
+  {
+    "packageId": "com.StressLevelZero.BONELAB",
+    "displayName": "BONELAB",
+    "engine": "Marrow",
+    "destination": "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods",
+    "authoritativePaths": [
+      "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods"
+    ],
+    "knownContentDirectories": ["Mods"],
+    "supportedPackageTypes": [
+      "BONELAB_NATIVE_CONTENT",
+      "BONELAB_CODE_MOD",
+      "QMOD",
+      "NFVR_MANIFEST"
+    ],
+    "modTypes": [
+      "BONELAB_NATIVE_CONTENT",
+      "BONELAB_CODE_MOD",
+      "QMOD",
+      "NFVR_MANIFEST"
+    ],
+    "installationStrategies": [
+      "KNOWN_GAME_PROFILE",
+      "QMOD",
+      "NFVR_MANIFEST"
+    ],
+    "recognizedArchiveSignatures": [
+      "pallet.json",
+      "catalog.json",
+      ".pallet",
+      ".assetbundle"
+    ],
+    "evidenceLevel": "AUTHORITATIVE",
+    "evidenceSources": [
+      "https://github.com/StressLevelZero/MarrowSDK/blob/main/Docs/BuildPallet.md"
+    ]
+  },
+  {
+    "packageId": "com.beatgames.beatsaber",
+    "displayName": "Beat Saber",
+    "engine": "Unity IL2CPP",
+    "destination": "/sdcard/ModData/com.beatgames.beatsaber/Mods",
+    "authoritativePaths": [
+      "/sdcard/ModData/com.beatgames.beatsaber/Mods",
+      "/sdcard/ModData/com.beatgames.beatsaber/Modloader",
+      "/sdcard/Android/data/com.beatgames.beatsaber/files/mods",
+      "/sdcard/Android/data/com.beatgames.beatsaber/files/libs"
+    ],
+    "knownContentDirectories": ["Mods", "mods", "ModData"],
+    "supportedPackageTypes": [
+      "QMOD",
+      "NFVR_MANIFEST",
+      "KNOWN_GAME_PROFILE"
+    ],
+    "modTypes": ["QMOD", "NFVR_MANIFEST"],
+    "installationStrategies": [
+      "KNOWN_GAME_PROFILE",
+      "QMOD",
+      "NFVR_MANIFEST"
+    ],
+    "loaderRequirements": ["QUEST_LOADER", "SCOTLAND2"],
+    "recognizedArchiveSignatures": ["mod.json", "qmod.json"],
+    "evidenceLevel": "OPEN_SOURCE_PROJECT",
+    "evidenceSources": [
+      "https://github.com/Lauriethefish/QuestPatcher",
+      "https://github.com/sc2ad/scotland2"
+    ]
+  }
+]

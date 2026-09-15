@@ -17,17 +17,11 @@ data class GameInfo(
     val notes: String
 )
 
-private val SUPPORTED_GAMES = listOf(
+private val LEGACY_SUPPORTED_GAMES = listOf(
     GameInfo(
         name = "BONELAB",
         packageName = "com.StressLevelZero.BONELAB",
         modPath = "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods",
-        notes = "قد يتطلب تشغيل اللعبة مرة واحدة لإنشاء مجلد المودات"
-    ),
-    GameInfo(
-        name = "Blade & Sorcery: Nomad",
-        packageName = "com.WarpFrog.BNS",
-        modPath = "/sdcard/Android/data/com.WarpFrog.BNS/files/Mods",
         notes = "قد يتطلب تشغيل اللعبة مرة واحدة لإنشاء مجلد المودات"
     ),
     GameInfo(
@@ -139,12 +133,6 @@ private val SUPPORTED_GAMES = listOf(
         notes = "قد يتطلب تشغيل اللعبة مرة واحدة لإنشاء مجلد المودات"
     ),
     GameInfo(
-        name = "Blade & Sorcery",
-        packageName = "com.WarpFrog.BladeAndSorcery",
-        modPath = "/sdcard/Android/data/com.WarpFrog.BladeAndSorcery/files/Mods",
-        notes = "قد يتطلب تشغيل اللعبة مرة واحدة لإنشاء مجلد المودات"
-    ),
-    GameInfo(
         name = "Half-Life: Alyx",
         packageName = "com.Valve.HalfLifeAlyx",
         modPath = "/sdcard/Android/data/com.Valve.HalfLifeAlyx/files/Mods",
@@ -200,6 +188,20 @@ private val SUPPORTED_GAMES = listOf(
     )
 )
 
+/**
+ * Only profiles with documented destinations are advertised as built-in
+ * games.  The historical list above is retained for source compatibility
+ * but is never exposed or used for destination selection.
+ */
+private val SUPPORTED_GAMES = GameModProfileRegistry.profiles.map { profile ->
+    GameInfo(
+        name = profile.displayName,
+        packageName = profile.packageId,
+        modPath = profile.destination,
+        notes = "قد يتطلب تشغيل اللعبة مرة واحدة لإنشاء مجلد المودات"
+    )
+}
+
 data class ModInstallResult(
     val success: Boolean,
     val message: String,
@@ -209,7 +211,8 @@ data class ModInstallResult(
 
 class ModsManager(
     private val adbClient: AdbClient,
-    private val loaderDetector: ModLoaderDetector = AdbModLoaderDetector(adbClient)
+    private val loaderDetector: ModLoaderDetector = AdbModLoaderDetector(adbClient),
+    private val apkPatcher: ApkModLoaderPatcher = NoOpApkModLoaderPatcher
 ) {
     companion object {
         private const val MAX_ENTRY_BYTES = ModPackageAnalyzer.MAX_ENTRY_BYTES
@@ -238,7 +241,76 @@ class ModsManager(
         installedApp: InstalledQuestApp
     ): ModPackageAnalysis = withContext(Dispatchers.IO) {
         val detection = loaderDetector.detect(serial, installedApp)
-        ModPackageAnalyzer().analyze(zipFile, installedApp, detection)
+        val discovery = discoverModDirectoriesInternal(serial, installedApp, detection)
+        val analysis = ModPackageAnalyzer().analyze(
+            zipFile,
+            installedApp,
+            detection,
+            discovery
+        )
+        analysis.copy(installPlan = analysis.installPlan.bindToDevice(serial))
+    }
+
+    /**
+     * Read-only selected-package inspection. Every probe is package scoped,
+     * serial scoped, and uses `test -d`; this method never creates a folder.
+     */
+    suspend fun discoverModDirectories(
+        serial: String,
+        installedApp: InstalledQuestApp
+    ): ModDirectoryDiscovery = withContext(Dispatchers.IO) {
+        val detection = runCatching {
+            loaderDetector.detect(serial, installedApp)
+        }.getOrNull()
+        discoverModDirectoriesInternal(serial, installedApp, detection)
+    }
+
+    private suspend fun discoverModDirectoriesInternal(
+        serial: String,
+        installedApp: InstalledQuestApp,
+        loaderDetection: ModLoaderDetection?
+    ): ModDirectoryDiscovery {
+        val profile = GameModProfileRegistry.findByPackageId(installedApp.packageName)
+        val paths = linkedMapOf<String, String>()
+        fun add(path: String, source: String) {
+            if (path.isNotBlank() &&
+                AndroidPathValidator.isSafe(path) &&
+                (profile?.authoritativePaths?.contains(path) == true ||
+                    ModDestinationPolicy.isPackageBound(path, installedApp.packageName))
+            ) {
+                paths.putIfAbsent(path, source)
+            }
+        }
+        profile?.authoritativePaths?.forEach { add(it, "documented profile path") }
+        add("/sdcard/Android/data/${installedApp.packageName}/files/Mods", "known package Mods path")
+        add("/sdcard/Android/data/${installedApp.packageName}/files/mods", "known package mods path")
+        add("/sdcard/Android/data/${installedApp.packageName}/files/Plugins", "known package Plugins path")
+        add("/sdcard/Android/data/${installedApp.packageName}/files/plugins", "known package plugins path")
+        add("/sdcard/ModData/${installedApp.packageName}", "known ModData package path")
+        val candidates = paths.map { (path, source) ->
+            ModDirectoryCandidate(
+                packageId = installedApp.packageName,
+                path = path,
+                exists = runCatching {
+                    adbClient.shell(serial, "test", "-d", path).exit == 0
+                }.getOrDefault(false),
+                source = source,
+                evidenceLevel = profile?.evidenceLevel ?: ModEvidenceLevel.OPEN_SOURCE_PROJECT
+            )
+        }
+        return ModDirectoryDiscovery(
+            serial = serial,
+            packageId = installedApp.packageName,
+            appVersion = installedApp.versionName,
+            candidates = candidates,
+            loaderDetection = loaderDetection,
+            profile = profile,
+            diagnostics = listOf(
+                "readOnly=true",
+                "package=${installedApp.packageName}",
+                "candidateCount=${candidates.size}"
+            )
+        )
     }
 
     suspend fun scanInstalledQuestApps(
@@ -315,6 +387,20 @@ class ModsManager(
             ?: return ModInstallResult(false, "الخطة لا تحتوي حالة التطبيق التي تمت مراجعتها؛ أعد تحليل الحزمة.")
         val reviewedIdentity = plan.archiveIdentity
             ?: return ModInstallResult(false, "الخطة لا تحتوي هوية الأرشيف التي تمت مراجعتها؛ أعد تحليل الحزمة.")
+        val operationBinding = plan.operationBinding
+            ?: return ModInstallResult(false, "الخطة غير مرتبطة بجهاز محدد؛ أعد تحليل الحزمة وربطها قبل النقل.")
+        val expectedPlanId = modAnalysisPlanId(serial, reviewedApp, reviewedIdentity.sha256)
+        if (!modOperationBindingMatches(
+                operationBinding,
+                serial,
+                reviewedApp,
+                reviewedIdentity.sha256,
+                expectedPlanId
+            ) ||
+            operationBinding.analysisPlanId != expectedPlanId
+        ) {
+            return ModInstallResult(false, "تغير ربط الجهاز أو الخطة؛ أعد تحليل الحزمة قبل النقل.")
+        }
         val currentApp = scanInstalledQuestApps(serial)
             .firstOrNull { it.packageName == reviewedApp.packageName }
             ?: return ModInstallResult(false, "التطبيق المستهدف لم يعد مثبتًا؛ أعد تحليل الحزمة.")
@@ -324,21 +410,82 @@ class ModsManager(
         val loaderDetection = runCatching {
             loaderDetector.detect(serial, currentApp)
         }.getOrNull()
-        val freshAnalysis = ModPackageAnalyzer().analyze(zipFile, currentApp, loaderDetection)
-        val freshPlan = freshAnalysis.installPlan
-        if (freshAnalysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER) {
+        val patchAssessment = runCatching {
+            apkPatcher.assess(serial, currentApp)
+        }.getOrNull()
+        if (patchAssessment?.required == true) {
             return ModInstallResult(
                 false,
-                freshAnalysis.message.ifBlank { "تحتاج هذه الحزمة إلى تجهيز محمّل المود قبل التثبيت." }
+                "تحتاج اللعبة إلى تصحيح APK قبل تثبيت هذا النوع من المودات؛ لم يتم تنفيذ أي تصحيح."
             )
         }
-        if (!freshAnalysis.installable ||
+        val discovery = if (
+            plan.strategy == ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY &&
+            plan.confirmation != null
+        ) {
+            val inspected = discoverModDirectoriesInternal(serial, currentApp, loaderDetection)
+            val destination = plan.confirmation.destination
+            if (!AndroidPathValidator.isSafe(destination) ||
+                plan.destinationRoot != destination ||
+                plan.confirmation.token != modInstallConfirmationToken(
+                    reviewedIdentity.sha256,
+                    currentApp.packageName,
+                    destination
+                )
+            ) {
+                return ModInstallResult(
+                    false,
+                    "تغيرت وجهة التأكيد أو رمزها؛ أعد فحص المجلد قبل النقل."
+                )
+            }
+            val exact = inspected.existingCandidates.firstOrNull {
+                it.packageId == currentApp.packageName &&
+                    it.path == destination
+            } ?: return ModInstallResult(
+                false,
+                "لم تعد الوجهة المؤكدة موجودة بعد الفحص القراءة فقط؛ أعد التحليل."
+            )
+            inspected.copy(
+                candidates = listOf(exact)
+            )
+        } else {
+            null
+        }
+        val freshAnalysis = ModPackageAnalyzer().analyze(
+            zipFile,
+            currentApp,
+            loaderDetection,
+            discovery
+        )
+        var freshPlan = runCatching { freshAnalysis.installPlan.bindToDevice(serial) }
+            .getOrElse { freshAnalysis.installPlan }
+        if (plan.confirmation != null && !plan.requiresExplicitConfirmation) {
+            freshPlan = freshPlan.confirmDestination(plan.confirmation.token)
+        }
+        if (freshPlan.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ||
+            freshPlan.outcome == ModInstallOutcome.APK_PATCH_REQUIRED
+        ) {
+            return ModInstallResult(
+                false,
+                freshAnalysis.message.ifBlank {
+                    if (freshPlan.outcome == ModInstallOutcome.APK_PATCH_REQUIRED) {
+                        "تحتاج هذه الحزمة إلى تصحيح APK؛ لم يتم تنفيذ أي تصحيح."
+                    } else {
+                        "تحتاج هذه الحزمة إلى تجهيز محمّل المود قبل التثبيت."
+                    }
+                }
+            )
+        }
+        if (!freshPlan.installable ||
             freshPlan.archiveIdentity != reviewedIdentity ||
             !sameSecurityProjection(plan, freshPlan)
         ) {
             return ModInstallResult(false, "تغير الأرشيف أو خطة التثبيت منذ التحليل؛ أعد التحليل قبل النقل.")
         }
-        var executionPlan = freshPlan
+        var executionPlan = freshPlan.copy(
+            operationBinding = operationBinding,
+            analysisPlanId = operationBinding.analysisPlanId
+        )
         val profile = executionProfile(executionPlan)
             ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
         if (executionPlan.destinationRoot != profile.destination) {
@@ -413,6 +560,11 @@ class ModsManager(
             }
             if (verificationErrors.isNotEmpty()) {
                 return ModInstallResult(false, verificationErrors.joinToString("\n"))
+            }
+            val appAfterVerification = scanInstalledQuestApps(serial)
+                .firstOrNull { it.packageName == reviewedApp.packageName }
+            if (appAfterVerification == null || !sameAppState(reviewedApp, appAfterVerification)) {
+                return ModInstallResult(false, "تغير اتصال النظارة أو إصدار اللعبة أثناء التحقق؛ لم يتم اعتماد النجاح.")
             }
 
             onProgress(ModExecutionProgress(ModInstallPhase.COMPLETED, 1.0, "اكتمل التثبيت والتحقق"))
@@ -528,6 +680,16 @@ class ModsManager(
 
     private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
         val target = plan.targetPackageId ?: return null
+        if (plan.strategy == ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY) {
+            val root = plan.destinationRoot ?: return null
+            return GameModProfile(
+                packageId = target,
+                displayName = "Confirmed existing mod directory",
+                destination = root,
+                authoritativePaths = setOf(root),
+                evidenceLevel = ModEvidenceLevel.OPEN_SOURCE_PROJECT
+            )
+        }
         GameModProfileRegistry.findByPackageId(target)?.let { return it }
         val root = plan.destinationRoot ?: return null
         return when (plan.packageType) {
@@ -594,6 +756,11 @@ class ModsManager(
                     sameAppState(expected.reviewedApp, actual.reviewedApp))) &&
             expected.loaderRequirement?.requested == actual.loaderRequirement?.requested &&
             expected.loaderRequirement?.status == actual.loaderRequirement?.status &&
+            expected.resolution == actual.resolution &&
+            expected.dependencies == actual.dependencies &&
+            expected.optionalDependencies == actual.optionalDependencies &&
+            expected.patchRequirement == actual.patchRequirement &&
+            expected.confirmation == actual.confirmation &&
             expected.preconditions.map { it.code to it.satisfied } ==
                 actual.preconditions.map { it.code to it.satisfied } &&
             expected.diagnostics == actual.diagnostics
@@ -616,11 +783,15 @@ class ModsManager(
     }
     
     suspend fun testPathExists(serial: String, path: String): Boolean {
+        if (!AndroidPathValidator.isSafe(path)) return false
         val result = adbClient.shell(serial, "test", "-d", path)
         return result.exit == 0
     }
     
     suspend fun createModPath(serial: String, path: String): CmdResult {
+        if (!AndroidPathValidator.isSafe(path)) {
+            return CmdResult(1, "", "unsafe destination path")
+        }
         return adbClient.shell(serial, "mkdir", "-p", path)
     }
     
@@ -630,7 +801,7 @@ class ModsManager(
             return null
         }
         
-        return gameInfo.modPath
+        return gameInfo.modPath.takeIf(AndroidPathValidator::isSafe)
     }
     
 enum class ModInstallPhase {

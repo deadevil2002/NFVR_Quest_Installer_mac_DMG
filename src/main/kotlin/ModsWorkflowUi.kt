@@ -43,6 +43,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,8 +65,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.Instant
 import java.util.Locale
 
 /**
@@ -196,6 +196,9 @@ internal fun sanitizeModsLogText(value: String): String =
 fun ModsWorkflowUi(
     connected: Boolean,
     pickerOpen: Boolean = false,
+    pickerStatus: String? = null,
+    deviceSerial: String? = null,
+    deviceModel: String? = null,
     installedApps: List<InstalledQuestApp>,
     scanning: Boolean,
     searchFilter: String,
@@ -211,7 +214,10 @@ fun ModsWorkflowUi(
     onChangeSelectedApp: () -> Unit = {},
     onClearSelectedApp: () -> Unit = {},
     selectedZipFilename: String?,
+    selectedZipSizeBytes: Long? = null,
+    selectedZipSha256: String? = null,
     onChooseFile: () -> Unit,
+    dropRouter: DesktopDropRouter? = null,
     analyzing: Boolean,
     analysis: ModPackageAnalysis?,
     onAnalyze: () -> Unit,
@@ -222,6 +228,9 @@ fun ModsWorkflowUi(
     // not invoked; built-in content is informational in this UI.
     onOpenExternalUrl: (String) -> Unit = {},
     logText: String,
+    modSupport: ModSupportUiState? = null,
+    onCopyDiagnostics: () -> Unit = {},
+    onDestinationConfirmed: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val focusManager = LocalFocusManager.current
@@ -246,6 +255,9 @@ fun ModsWorkflowUi(
     }
     val editingEnabled = modsUiControlsEnabled(installing) && !pickerOpen
     var appPickerRequested by remember(selectedApp) { mutableStateOf(selectedApp == null) }
+    var genericDestinationConfirmed by remember(analysis) {
+        mutableStateOf(analysis?.let { !genericDestinationNeedsConfirmation(it) } ?: false)
+    }
     val currentStep = when {
         selectedApp == null -> 1
         selectedZipFilename.isNullOrBlank() -> 2
@@ -282,7 +294,25 @@ fun ModsWorkflowUi(
                 if (scanning || scanProgress != null) {
                     item { ScanStatus(scanProgress, scanning) }
                 }
-                item { WorkflowRail(connected, selectedApp != null, !selectedZipFilename.isNullOrBlank(), analysis != null, installing || executionProgress?.phase == ModsManager.ModInstallPhase.COMPLETED) }
+                item {
+                    WorkflowRail(
+                        connected,
+                        selectedApp != null,
+                        !selectedZipFilename.isNullOrBlank(),
+                        analysis != null,
+                        installing || executionProgress?.phase == ModsManager.ModInstallPhase.COMPLETED
+                    )
+                }
+                if (deviceSerial != null || deviceModel != null) {
+                    item {
+                        StatusNote(
+                            "الفحص الحالي: ${deviceModel?.takeIf { it.isNotBlank() } ?: "Quest"}" +
+                                " · ${shortSerial(deviceSerial)}",
+                            Icons.Default.Info,
+                            MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
                 item { StepTitle("01", "اختر اللعبة من النظارة", "قائمة الألعاب المثبتة من Quest — بدون إدخال مسارات يدوية") }
                 if (selectedApp == null || appPickerRequested) {
                     item {
@@ -353,6 +383,9 @@ fun ModsWorkflowUi(
                     item {
                         ZipCard(
                             selectedZipFilename,
+                            selectedZipSizeBytes,
+                            selectedZipSha256,
+                            pickerStatus,
                             onChooseFile = {
                                 clearFocusBeforeModsTransition(
                                     { focusManager.clearFocus(force = true) },
@@ -360,7 +393,8 @@ fun ModsWorkflowUi(
                                 )
                             },
                             selectedApp = selectedApp,
-                            enabled = editingEnabled
+                            enabled = editingEnabled,
+                            dropRouter = dropRouter
                         )
                     }
                 }
@@ -396,9 +430,22 @@ fun ModsWorkflowUi(
                         }
                     )
                 }
+                if (selectedApp != null && modSupport != null) {
+                    item { ModSupportCard(modSupport) }
+                }
                 item { StepTitle("04", "راجع خطة التثبيت", "لا يبدأ النقل إلا بعد فحص النوع والتوافق والوجهات") }
                 if (currentStep == 4 && analysis != null) {
-                    item { AnalysisCard(analysis) }
+                    item {
+                        AnalysisCard(
+                            analysis,
+                            onCopyDiagnostics = onCopyDiagnostics,
+                            destinationConfirmed = genericDestinationConfirmed,
+                            onDestinationConfirmationChanged = {
+                                genericDestinationConfirmed = it
+                                onDestinationConfirmed(it)
+                            }
+                        )
+                    }
                     item {
                         Button(
                             onClick = {
@@ -411,6 +458,7 @@ fun ModsWorkflowUi(
                                 analysis.installable &&
                                 analysis.compatibility.compatible &&
                                 !analysis.installPlan.hasBlockingPreconditions &&
+                                (!genericDestinationNeedsConfirmation(analysis) || genericDestinationConfirmed) &&
                                 !installing,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
                         ) {
@@ -436,6 +484,7 @@ fun ModsWorkflowUi(
                                 analysis.installable &&
                                 analysis.compatibility.compatible &&
                                 !analysis.installPlan.hasBlockingPreconditions &&
+                                (!genericDestinationNeedsConfirmation(analysis) || genericDestinationConfirmed) &&
                                 !installing,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
                         ) {
@@ -491,9 +540,17 @@ fun ModsWorkflowUi(
                 style = MaterialTheme.typography.titleSmall,
                 color = if (complete) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurface
             )
+            if (value?.deviceSerial != null) {
+                Text(
+                    "الجهاز: ${value.deviceModel?.takeIf { it.isNotBlank() } ?: "Quest"} · " +
+                        shortSerial(value.deviceSerial),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
             if (value != null) {
                 val total = value.total
-                val count = value.apps.size
+                val count = value.discoveredCount.coerceAtLeast(value.apps.size)
                 Text(
                     if (total == null) "تمت معالجة ${value.processed} تطبيقًا — المكتشف: $count"
                     else "${value.processed} / $total — المكتشف: $count" +
@@ -501,10 +558,13 @@ fun ModsWorkflowUi(
                     style = MaterialTheme.typography.labelMedium
                 )
                 Text(
-                    "آخر تحديث: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(value.lastUpdatedMillis))}",
+                    "آخر تحديث: ${formatLocalTime(Instant.ofEpochMilli(value.lastUpdatedMillis))}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                value.status?.takeIf { it.isNotBlank() }?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall)
+                }
                 if (scanning) {
                     if (value.total == null) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     else LinearProgressIndicator(
@@ -617,12 +677,27 @@ fun ModsWorkflowUi(
 
 @Composable private fun ZipCard(
     filename: String?,
+    sizeBytes: Long?,
+    sha256: String?,
+    pickerStatus: String?,
     onChooseFile: () -> Unit,
     selectedApp: InstalledQuestApp?,
-    enabled: Boolean
+    enabled: Boolean,
+    dropRouter: DesktopDropRouter?
 ) {
+    val hovered = dropRouter?.hovered?.collectAsState()?.value == DesktopDropTarget.MOD_PACKAGE
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(
+            Modifier
+                .registerDesktopDropTargetIf(dropRouter, DesktopDropTarget.MOD_PACKAGE)
+                .padding(18.dp)
+                .background(
+                    if (hovered == true) MaterialTheme.colorScheme.primaryContainer
+                    else Color.Transparent,
+                    RoundedCornerShape(12.dp)
+                ),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 Box(Modifier.size(46.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
                     Icon(Icons.Default.Info, null, tint = MaterialTheme.colorScheme.primary)
@@ -633,10 +708,35 @@ fun ModsWorkflowUi(
                 }
                 OutlinedButton(onClick = onChooseFile, enabled = enabled) { Text("اختيار ملف") }
             }
+            Text(
+                if (hovered == true) "أفلت ملف ZIP هنا للتحليل"
+                else "أو اسحب ملف ZIP إلى هذه المنطقة",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (hovered == true) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (sizeBytes != null || !sha256.isNullOrBlank()) {
+                Text(
+                    listOfNotNull(
+                        sizeBytes?.let { bytes(it) },
+                        sha256?.takeIf { it.isNotBlank() }?.let { "SHA-256: ${it.take(16)}…" }
+                    ).joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            pickerStatus?.takeIf { it.isNotBlank() }?.let {
+                StatusNote(it, Icons.Default.Info, MaterialTheme.colorScheme.primary)
+            }
             if (selectedApp != null) StatusNote("الهدف المحدد: ${selectedApp.displayName ?: selectedApp.packageName}", Icons.Default.CheckCircle, MaterialTheme.colorScheme.tertiary)
         }
     }
 }
+
+private fun Modifier.registerDesktopDropTargetIf(
+    router: DesktopDropRouter?,
+    target: DesktopDropTarget
+): Modifier = if (router == null) this else registerDesktopDropTarget(router, target)
 
 @Composable private fun BuiltInContentCard(analysis: ModPackageAnalysis) {
     val outcome = modsUiOutcome(analysis)
@@ -672,7 +772,37 @@ fun ModsWorkflowUi(
     }
 }
 
-@Composable private fun AnalysisCard(analysis: ModPackageAnalysis) {
+@Composable private fun ModSupportCard(state: ModSupportUiState) {
+    val tone = if (state.stale) warningColor() else MaterialTheme.colorScheme.primary
+    Card(
+        colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.08f)),
+        border = BorderStroke(1.dp, tone.copy(alpha = 0.55f))
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("اكتشاف دعم المود", style = MaterialTheme.typography.titleMedium)
+            Text(state.status, color = tone)
+            Text(
+                "الجهاز: ${shortSerial(state.serial)} · الحزمة: ${state.packageId}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "ملف اللعبة: ${state.profileName ?: "غير معروف"} · المحمّل: ${state.loader}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            state.existingDirectory?.let {
+                Text("مجلد مودات مقروء: $it", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Composable private fun AnalysisCard(
+    analysis: ModPackageAnalysis,
+    onCopyDiagnostics: () -> Unit,
+    destinationConfirmed: Boolean,
+    onDestinationConfirmationChanged: (Boolean) -> Unit
+) {
     val outcome = modsUiOutcome(analysis)
     val tone = outcomeColor(outcome.tone)
     val allWarnings = deduplicateModWarnings(analysis.installPlan.preconditions)
@@ -704,6 +834,23 @@ fun ModsWorkflowUi(
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             InfoGrid(analysis)
+            if (genericDestinationNeedsConfirmation(analysis) ||
+                analysis.installPlan.confirmation != null
+            ) {
+                Checkbox(
+                    checked = destinationConfirmed,
+                    onCheckedChange = onDestinationConfirmationChanged
+                )
+                Text(
+                    if (genericDestinationNeedsConfirmation(analysis)) {
+                        "أؤكد الوجهة المقترحة الظاهرة أدناه؛ لن تتم الكتابة قبل هذا التأكيد."
+                    } else {
+                        "تم تأكيد الوجهة المقترحة لهذه الخطة."
+                    },
+                    color = warningColor(),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
             StatusNote(outcome.action, Icons.Default.Info, tone)
             if (analysis.installPlan.mappings.isNotEmpty()) {
                 Text("خطة الملفات والوجهات", style = MaterialTheme.typography.titleMedium)
@@ -739,6 +886,9 @@ fun ModsWorkflowUi(
                 .forEach { reason ->
                     StatusNote(sanitizeModsUiText(reason), Icons.Default.Warning, warningColor())
                 }
+            OutlinedButton(onClick = onCopyDiagnostics) {
+                Text("نسخ معلومات الفحص")
+            }
         }
     }
 }
@@ -748,6 +898,15 @@ private fun isLoaderPrecondition(precondition: ModInstallPrecondition): Boolean 
     return code.contains("LOADER") ||
         Regex("(?i)\\b(loader|modloader|محمّل|محمل)\\b")
             .containsMatchIn(precondition.message)
+}
+
+private fun shortSerial(serial: String?): String {
+    val value = serial?.trim().orEmpty()
+    return when {
+        value.isBlank() -> "السيريال غير متاح"
+        value.length <= 12 -> value
+        else -> "…${value.takeLast(10)}"
+    }
 }
 
 @Composable
@@ -970,6 +1129,7 @@ private fun displayModPackageType(type: ModPackageType): String = when (type) {
 private fun displayModOutcome(outcome: ModInstallOutcome): String = when (outcome) {
     ModInstallOutcome.DIRECT_INSTALL_READY -> "جاهز للتثبيت"
     ModInstallOutcome.REQUIRES_MOD_LOADER -> "يتطلب محمّل مودات"
+    ModInstallOutcome.APK_PATCH_REQUIRED -> "يتطلب تجهيز APK بمحمّل متوافق"
     ModInstallOutcome.BUILT_IN_GAME_CONTENT -> "محتوى مخصص مدمج في اللعبة"
     ModInstallOutcome.UNSUPPORTED -> "غير مدعوم"
     ModInstallOutcome.UNSAFE_ARCHIVE -> "أرشيف غير آمن"

@@ -1,5 +1,5 @@
 import java.io.File
-import java.time.Instant
+import java.time.Clock
 
 object UserDataPaths {
     val root: File
@@ -10,6 +10,8 @@ object DiagnosticLogger {
     private const val MAX_LOG_BYTES = 1_000_000L
     private const val MAX_RECENT_BYTES = 40_000
     private val lock = Any()
+    @Volatile
+    private var clock: Clock = Clock.systemUTC()
 
     private val logFile: File
         get() = File(UserDataPaths.root, "logs/diagnostic.log")
@@ -21,12 +23,23 @@ object DiagnosticLogger {
         write("ERROR", message + details)
     }
 
+    /**
+     * Diagnostic files intentionally keep an ISO Instant for support tooling;
+     * this hook only makes log creation deterministic in focused tests.
+     */
+    internal fun setClockForTests(value: Clock) {
+        clock = value
+    }
+
+    fun safeForCopy(value: String): String = safeDiagnosticText(value)
+
     fun recent(): String = synchronized(lock) {
         runCatching {
             val file = logFile
             if (!file.exists()) return@synchronized ""
             val text = file.readText()
-            if (text.length <= MAX_RECENT_BYTES) text else text.takeLast(MAX_RECENT_BYTES)
+            val bounded = if (text.length <= MAX_RECENT_BYTES) text else text.takeLast(MAX_RECENT_BYTES)
+            safeDiagnosticText(bounded)
         }.getOrDefault("")
     }
 
@@ -36,7 +49,7 @@ object DiagnosticLogger {
             file.parentFile?.mkdirs()
             rotateIfNeeded(file)
             val safe = redact(message).take(80_000)
-            file.appendText("${Instant.now()} [$level] $safe\n")
+            file.appendText("${clock.instant()} [$level] $safe\n")
         }
         Unit
     }
@@ -51,7 +64,7 @@ object DiagnosticLogger {
     private fun redact(value: String): String {
         val home = System.getProperty("user.home").orEmpty()
         val withoutHome = if (home.isBlank()) value else value.replace(home, "[USER_HOME]", ignoreCase = true)
-        return withoutHome
+        return safeDiagnosticText(withoutHome)
             .replace(Regex("""(?i)(license[_ -]?key\s*[=:]\s*)\S+"""), "$1[REDACTED]")
             .replace(Regex("""(?i)(authorization\s*[=:]\s*)\S+"""), "$1[REDACTED]")
             .replace(Regex("""(?i)(token\s*[=:]\s*)\S+"""), "$1[REDACTED]")

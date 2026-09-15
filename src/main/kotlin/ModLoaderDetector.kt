@@ -36,6 +36,19 @@ enum class ModLoaderStatus {
     UNKNOWN
 }
 
+/**
+ * Public summary used by discovery UI.  UNKNOWN is deliberately distinct
+ * from NONE: the absence of authenticated evidence is not proof that a
+ * loader is absent.
+ */
+enum class ModLoaderState {
+    QUESTLOADER,
+    SCOTLAND2,
+    OTHER,
+    NONE,
+    UNKNOWN
+}
+
 data class ModLoaderEvidence(
     val loader: ModLoaderKind,
     val status: ModLoaderStatus,
@@ -70,6 +83,24 @@ data class ModLoaderDetection(
         required.isEmpty() ||
             (checkedReadOnly && required.any { evidence[it]?.status == ModLoaderStatus.DETECTED })
 
+    val state: ModLoaderState
+        get() {
+            if (!checkedReadOnly) return ModLoaderState.UNKNOWN
+            val detected = this.detected
+            return when {
+                ModLoaderKind.QUEST_LOADER in detected -> ModLoaderState.QUESTLOADER
+                ModLoaderKind.SCOTLAND2 in detected -> ModLoaderState.SCOTLAND2
+                ModLoaderKind.LEMON_LOADER in detected ||
+                    ModLoaderKind.MELON_LOADER in detected -> ModLoaderState.OTHER
+                evidence.values.any { it.status == ModLoaderStatus.UNKNOWN } ->
+                    ModLoaderState.UNKNOWN
+                else -> ModLoaderState.NONE
+            }
+        }
+
+    val loaderState: ModLoaderState
+        get() = state
+
     fun summary(required: Set<ModLoaderKind>): String {
         if (required.isEmpty()) return "لا يتطلب هذا النوع محمّل مودات."
         val names = required.joinToString(" أو ") { it.displayName }
@@ -79,6 +110,33 @@ data class ModLoaderDetection(
             ModLoaderStatus.UNKNOWN -> "تعذر التحقق من محمّل المود المطلوب: $names."
         }
     }
+}
+
+/**
+ * APK patching is intentionally an interface boundary.  Implementations may
+ * report a reviewed, version-specific capability in a later release, but no
+ * generic implementation is provided by this engine.
+ */
+data class ApkPatchAssessment(
+    val packageId: String,
+    val required: Boolean,
+    val supported: Boolean = false,
+    val patcherId: String? = null,
+    val reason: String = "The installed APK requires a reviewed mod-loader patch."
+)
+
+fun interface ApkModLoaderPatcher {
+    fun assess(serial: String, app: InstalledQuestApp): ApkPatchAssessment
+}
+
+object NoOpApkModLoaderPatcher : ApkModLoaderPatcher {
+    override fun assess(serial: String, app: InstalledQuestApp): ApkPatchAssessment =
+        ApkPatchAssessment(
+            packageId = app.packageName,
+            required = false,
+            supported = false,
+            reason = "No APK patcher is enabled."
+        )
 }
 
 /**

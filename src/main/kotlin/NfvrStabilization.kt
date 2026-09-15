@@ -389,7 +389,12 @@ data class InstalledAppsScanProgress(
     val lastUpdatedMillis: Long = System.currentTimeMillis(),
     val completed: Boolean = false,
     val cancelled: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    /** Identity is captured at scan start and must accompany every callback. */
+    val deviceSerial: String? = null,
+    val deviceModel: String? = null,
+    val status: String? = null,
+    val discoveredCount: Int = apps.size
 ) {
     val percent: Int?
         get() = total?.takeIf { it > 0 }?.let {

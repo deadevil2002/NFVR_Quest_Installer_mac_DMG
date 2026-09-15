@@ -10,8 +10,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import java.util.concurrent.Executor
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 internal sealed interface IsolatedPickerOutput {
@@ -45,12 +49,32 @@ internal sealed interface NativePickerOutput {
     data class Failed(val hresult: Int?, val diagnostic: String) : NativePickerOutput
 }
 
+/**
+ * JNA requires mapped library interfaces to be visible to its reflection
+ * layer.  Keep this interface non-private even though callers only see the
+ * higher-level picker API.
+ */
 internal interface WindowsNativePickerAdapter {
     fun choose(
         mode: DesktopChooserMode,
         initialDirectory: File?,
         title: String,
         ownerHwnd: Long?
+    ): NativePickerOutput
+}
+
+/**
+ * Optional extension used by the real COM adapter.  A timeout can revoke the
+ * permit before Show(); test adapters that do not need native COM can keep the
+ * simpler four-argument contract above.
+ */
+internal interface NativePickerShowGate {
+    fun chooseWithShowGate(
+        mode: DesktopChooserMode,
+        initialDirectory: File?,
+        title: String,
+        ownerHwnd: Long?,
+        canShow: () -> Boolean
     ): NativePickerOutput
 }
 
@@ -75,7 +99,7 @@ internal fun pickerOptions(mode: DesktopChooserMode): Int = when (mode) {
         FOS_FORCEFILESYSTEM or FOS_PATHMUSTEXIST or FOS_NOCHANGEDIR or FOS_FILEMUSTEXIST
 }
 
-private interface Ole32Native : com.sun.jna.win32.StdCallLibrary {
+internal interface Ole32Native : com.sun.jna.win32.StdCallLibrary {
     fun CoInitializeEx(reserved: Pointer?, coInit: Int): Int
     fun CoUninitialize()
     fun CoCreateInstance(
@@ -88,7 +112,7 @@ private interface Ole32Native : com.sun.jna.win32.StdCallLibrary {
     fun CoTaskMemFree(pointer: Pointer?)
 }
 
-private interface Shell32Native : com.sun.jna.win32.StdCallLibrary {
+internal interface Shell32Native : com.sun.jna.win32.StdCallLibrary {
     fun SHCreateItemFromParsingName(
         path: WString,
         bindContext: Pointer?,
@@ -97,24 +121,34 @@ private interface Shell32Native : com.sun.jna.win32.StdCallLibrary {
     ): Int
 }
 
-private object WindowsNativeLibraries {
+internal object WindowsNativeLibraries {
     val ole32: Ole32Native = Native.load("ole32", Ole32Native::class.java)
     val shell32: Shell32Native = Native.load("shell32", Shell32Native::class.java)
 }
 
-private class ComdlgFilterSpec(name: Pointer, pattern: Pointer) : com.sun.jna.Structure() {
+internal class ComdlgFilterSpec(name: Pointer, pattern: Pointer) : com.sun.jna.Structure() {
     @JvmField var pszName: Pointer = name
     @JvmField var pszSpec: Pointer = pattern
 
     override fun getFieldOrder(): List<String> = listOf("pszName", "pszSpec")
 }
 
-private object JnaWindowsNativePickerAdapter : WindowsNativePickerAdapter {
+internal object JnaWindowsNativePickerAdapter : WindowsNativePickerAdapter, NativePickerShowGate {
     override fun choose(
         mode: DesktopChooserMode,
         initialDirectory: File?,
         title: String,
         ownerHwnd: Long?
+    ): NativePickerOutput {
+        return chooseWithShowGate(mode, initialDirectory, title, ownerHwnd) { true }
+    }
+
+    override fun chooseWithShowGate(
+        mode: DesktopChooserMode,
+        initialDirectory: File?,
+        title: String,
+        ownerHwnd: Long?,
+        canShow: () -> Boolean
     ): NativePickerOutput {
         var initialized = false
         var dialog: Pointer? = null
@@ -197,6 +231,13 @@ private object JnaWindowsNativePickerAdapter : WindowsNativePickerAdapter {
             val owner = ownerHwnd
                 ?.takeIf { it != 0L }
                 ?.let(Pointer::createConstant)
+            if (!canShow()) {
+                return NativePickerOutput.Failed(null, "picker initialization watchdog revoked Show()")
+            }
+            DiagnosticLogger.info(
+                "native picker Show: type=${mode.name.lowercase()} ownerHwnd=${ownerHwnd ?: 0L} " +
+                    "thread=${Thread.currentThread().name}"
+            )
             result = invokeHresult(dialog, 3, owner)
             if (result == HRESULT_CANCELLED) return NativePickerOutput.Cancelled
             if (result < 0) return NativePickerOutput.Failed(result, "IFileOpenDialog.Show failed")
@@ -269,31 +310,142 @@ internal fun comInvocationArguments(
  * Therefore cancelling the waiting coroutine cannot permit another native
  * dialog while the previous modal Show call is still running.
  */
+internal enum class PickerLifecycleState {
+    IDLE,
+    OPENING,
+    OPEN,
+    RESULT,
+    CANCEL,
+    ERROR,
+    DISPOSING
+}
+
+internal class PickerLifecycle(
+    private val pickerType: DesktopChooserMode,
+    private val ownerHwnd: Long?
+) {
+    private val state = AtomicReference(PickerLifecycleState.IDLE)
+
+    fun current(): PickerLifecycleState = state.get()
+
+    fun transition(next: PickerLifecycleState, detail: String = "") {
+        val previous = state.getAndSet(next)
+        DiagnosticLogger.info(
+            "picker lifecycle: type=${pickerType.name.lowercase()} " +
+                "$previous->$next ownerHwnd=${ownerHwnd ?: 0L} " +
+                "thread=${Thread.currentThread().name}" +
+                detail.takeIf { it.isNotBlank() }?.let { " $it" }.orEmpty()
+        )
+    }
+}
+
+internal class PickerTaskLease(
+    val id: Long,
+    private val lifecycle: PickerLifecycle
+) {
+    private val showAllowed = AtomicBoolean(true)
+    private val showGateLock = Any()
+
+    fun revokeIfOpening(): Boolean = synchronized(showGateLock) {
+        if (lifecycle.current() != PickerLifecycleState.OPENING) return false
+        showAllowed.compareAndSet(true, false)
+    }
+
+    fun allowShow(): Boolean = synchronized(showGateLock) {
+        if (!showAllowed.get()) return false
+        lifecycle.transition(PickerLifecycleState.OPEN)
+        true
+    }
+
+    fun revoke(): Boolean = synchronized(showGateLock) {
+        showAllowed.compareAndSet(true, false)
+    }
+}
+
 internal class PickerTaskCoordinator(
     private val executor: Executor,
     private val gate: DesktopChooserGate = DesktopChooserGate()
 ) {
+    private var nextId = 0L
+    private var activeLease: PickerTaskLease? = null
+
+    @Synchronized
+    fun acquire(lifecycle: PickerLifecycle): PickerTaskLease? {
+        if (!gate.tryAcquire()) return null
+        val lease = PickerTaskLease(++nextId, lifecycle)
+        activeLease = lease
+        return lease
+    }
+
+    @Synchronized
+    fun release(lease: PickerTaskLease): Boolean {
+        if (activeLease !== lease) return false
+        activeLease = null
+        gate.release()
+        return true
+    }
+
+    /**
+     * Initialization can hang before the native modal dialog is shown.  The
+     * watchdog quarantines that attempt immediately; its eventual worker
+     * completion cannot release a gate belonging to a newer attempt.
+     */
+    fun quarantine(lease: PickerTaskLease): Boolean {
+        if (!lease.revokeIfOpening()) return false
+        return release(lease)
+    }
+
+    /** Kept as a tiny compatibility helper for deterministic gate tests. */
     fun tryAcquire(): Boolean = gate.tryAcquire()
 
-    fun submitAfterAcquire(task: () -> Unit, completed: () -> Unit): Boolean {
+    fun submitAfterAcquire(
+        task: () -> Unit,
+        completed: () -> Unit,
+        lease: PickerTaskLease? = null
+    ): Boolean {
         return try {
             executor.execute {
                 try {
                     task()
                 } finally {
-                    gate.release()
+                    if (lease != null) {
+                        release(lease)
+                    } else {
+                        gate.release()
+                    }
                     runCatching { completed() }
                 }
             }
             true
         } catch (error: Throwable) {
-            gate.release()
+            if (lease != null) {
+                release(lease)
+            } else {
+                gate.release()
+            }
             runCatching { completed() }
             throw error
         }
     }
 
     fun isOpen(): Boolean = gate.isOpen()
+}
+
+/**
+ * A blocked initialization must never occupy a shared single-thread queue.
+ * Each production attempt receives an isolated daemon STA worker; a timed-out
+ * worker may finish later without delaying the next picker attempt.
+ */
+private class FreshPickerExecutor : Executor {
+    private val nextThreadId = AtomicLong(0L)
+
+    override fun execute(command: Runnable) {
+        val id = nextThreadId.incrementAndGet()
+        Thread(command, "nfvr-native-picker-sta-$id").apply {
+            isDaemon = true
+            start()
+        }
+    }
 }
 
 internal fun normalizePickerPath(path: String): File? = runCatching {
@@ -350,14 +502,15 @@ internal fun mapNativePickerOutput(
 }
 
 /**
- * One native picker at a time.  Every COM call runs on this one daemon
- * executor thread, which initializes and uninitializes its own STA.
+ * One native picker at a time.  Every COM call runs on an isolated daemon
+ * STA worker, so a quarantined initialization cannot block a later attempt.
  */
 object WindowsIsolatedPicker {
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "nfvr-native-picker-sta").apply { isDaemon = true }
+    internal var initializationWatchdogMillis: Long = 10_000L
+    private val watchdog: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "nfvr-native-picker-watchdog").apply { isDaemon = true }
     }
-    private val coordinator = PickerTaskCoordinator(executor)
+    private val coordinator = PickerTaskCoordinator(FreshPickerExecutor())
 
     @Volatile
     internal var adapter: WindowsNativePickerAdapter = JnaWindowsNativePickerAdapter
@@ -396,15 +549,25 @@ object WindowsIsolatedPicker {
         onNativeTaskComplete: () -> Unit
     ): DesktopChooserResult {
         if (!isWindows()) {
+            DiagnosticLogger.info(
+                "picker lifecycle: type=${mode.name.lowercase()} IDLE->ERROR " +
+                    "ownerHwnd=${ownerHwnd ?: 0L} thread=${Thread.currentThread().name} unsupported host"
+            )
             runCatching { onNativeTaskComplete() }
             return DesktopChooserResult.Failed(
                 "هذه النافذة الأصلية متاحة في إصدار Windows فقط.",
                 "native picker unsupported host=${System.getProperty("os.name").orEmpty()}"
             )
         }
-        if (!coordinator.tryAcquire()) {
+        val lifecycle = PickerLifecycle(mode, ownerHwnd)
+        lifecycle.transition(PickerLifecycleState.OPENING)
+        val lease = coordinator.acquire(lifecycle)
+        if (lease == null) {
+            lifecycle.transition(PickerLifecycleState.ERROR, "busy")
             runCatching { onNativeTaskComplete() }
-            DiagnosticLogger.info("native picker busy: mode=$mode")
+            DiagnosticLogger.info(
+                "native picker busy: type=${mode.name.lowercase()} ownerHwnd=${ownerHwnd ?: 0L}"
+            )
             return DesktopChooserResult.Busy
         }
         return try {
@@ -413,7 +576,9 @@ object WindowsIsolatedPicker {
                 initialDirectory,
                 title,
                 ownerHwnd,
-                onNativeTaskComplete
+                onNativeTaskComplete,
+                lifecycle,
+                lease
             )
             val mapped = mapNativePickerOutput(mode, native)
             when (mapped) {
@@ -430,8 +595,12 @@ object WindowsIsolatedPicker {
             }
             mapped
         } catch (cancelled: CancellationException) {
+            lifecycle.transition(PickerLifecycleState.CANCEL, "waiting coroutine cancelled")
             throw cancelled
         } catch (error: Throwable) {
+            lease.revoke()
+            lifecycle.transition(PickerLifecycleState.ERROR, "exception=${error::class.java.simpleName}")
+            runCatching { onNativeTaskComplete() }
             val technical = "native picker failed: type=${mode.name.lowercase()} " +
                 "operation=select ${error::class.java.simpleName}: ${error.message.orEmpty()}"
             DiagnosticLogger.error(technical, error)
@@ -447,23 +616,82 @@ object WindowsIsolatedPicker {
         initialDirectory: File?,
         title: String,
         ownerHwnd: Long?,
-        onNativeTaskComplete: () -> Unit
+        onNativeTaskComplete: () -> Unit,
+        lifecycle: PickerLifecycle,
+        lease: PickerTaskLease
     ): NativePickerOutput = suspendCancellableCoroutine { continuation ->
         var result: NativePickerOutput? = null
+        val terminalDelivered = AtomicBoolean(false)
+        val timeout = watchdog.schedule({
+            if (coordinator.quarantine(lease)) {
+                lifecycle.transition(PickerLifecycleState.ERROR, "initialization watchdog timeout")
+                DiagnosticLogger.error(
+                    "native picker initialization timeout: type=${mode.name.lowercase()} " +
+                        "ownerHwnd=${ownerHwnd ?: 0L}"
+                )
+                lifecycle.transition(PickerLifecycleState.DISPOSING)
+                if (terminalDelivered.compareAndSet(false, true)) {
+                    if (continuation.isActive) {
+                        continuation.resume(
+                            NativePickerOutput.Failed(
+                                null,
+                                "native picker initialization timed out before Show()"
+                            )
+                        )
+                    }
+                    runCatching { onNativeTaskComplete() }
+                }
+                lifecycle.transition(PickerLifecycleState.IDLE)
+            }
+        }, initializationWatchdogMillis.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
         val completed: () -> Unit = {
+            timeout.cancel(false)
+            val firstCompletion = terminalDelivered.compareAndSet(false, true)
+            val lifecycleResult = when (result) {
+                NativePickerOutput.Cancelled -> PickerLifecycleState.CANCEL
+                is NativePickerOutput.Failed -> PickerLifecycleState.ERROR
+                is NativePickerOutput.Selected -> PickerLifecycleState.RESULT
+                null -> PickerLifecycleState.ERROR
+            }
             val delivered = result ?: NativePickerOutput.Failed(
                 null,
                 "native picker task completed without a result"
             )
-            if (continuation.isActive) continuation.resume(delivered)
-            runCatching { onNativeTaskComplete() }
+            if (firstCompletion) {
+                lifecycle.transition(lifecycleResult)
+                lifecycle.transition(PickerLifecycleState.DISPOSING)
+                if (continuation.isActive) continuation.resume(delivered)
+                runCatching { onNativeTaskComplete() }
+                lifecycle.transition(PickerLifecycleState.IDLE)
+            } else {
+                DiagnosticLogger.info(
+                    "native picker late completion quarantined: ownerHwnd=${ownerHwnd ?: 0L} " +
+                        "thread=${Thread.currentThread().name}"
+                )
+            }
             Unit
         }
         try {
             coordinator.submitAfterAcquire(
                 task = {
                     result = try {
-                        adapter.choose(mode, initialDirectory, title, ownerHwnd)
+                        when (val nativeAdapter = adapter) {
+                            is NativePickerShowGate -> nativeAdapter.chooseWithShowGate(
+                                mode,
+                                initialDirectory,
+                                title,
+                                ownerHwnd,
+                                lease::allowShow
+                            )
+                            else -> if (lease.allowShow()) {
+                                nativeAdapter.choose(mode, initialDirectory, title, ownerHwnd)
+                            } else {
+                                NativePickerOutput.Failed(
+                                    null,
+                                    "picker initialization watchdog revoked native Show()"
+                                )
+                            }
+                        }
                     } catch (error: Throwable) {
                         NativePickerOutput.Failed(
                             null,
@@ -471,10 +699,14 @@ object WindowsIsolatedPicker {
                         )
                     }
                 },
-                completed = completed
+                completed = completed,
+                lease = lease
             )
         } catch (error: Throwable) {
+            timeout.cancel(false)
+            coordinator.quarantine(lease)
             if (continuation.isActive) {
+                terminalDelivered.set(true)
                 continuation.resume(
                     NativePickerOutput.Failed(
                         null,

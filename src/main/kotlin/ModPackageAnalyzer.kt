@@ -27,11 +27,12 @@ class ModPackageAnalyzer(
         private val SHA256 = Regex("[0-9a-fA-F]{64}")
         private val QMOD_METADATA_KEYS = setOf(
             "_QPVersion", "name", "id", "author", "version", "description", "coverImage",
-            "isLibrary"
+            "porter", "isLibrary"
         )
         private val QMOD_IMPLEMENTED_KEYS = setOf(
             "packageId", "packageVersion", "modloader", "modFiles", "lateModFiles",
-            "libraryFiles", "fileCopies", "copyExtensions", "dependencies"
+            "libraryFiles", "fileCopies", "copyExtensions", "dependencies",
+            "porter"
         )
         private val QMOD_UNIMPLEMENTED_KEYS = setOf(
             "actions", "hooks", "postInstall",
@@ -59,12 +60,20 @@ class ModPackageAnalyzer(
         private val QUEST_ROOTS = setOf(
             "android", "quest", "quest2", "quest3", "android64", "arm64"
         )
+        private val SUPPORTED_QMOD_SCHEMA_VERSIONS = setOf(
+            "0.1.0", "0.1.1", "0.1.2", "1.0.0", "1.1.0", "1.2.0"
+        )
+        private val SEMVER = Regex(
+            """^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"""
+        )
+        private val QMOD_EXTENSION = Regex("""^[A-Za-z0-9][A-Za-z0-9_-]*$""")
     }
 
     fun analyze(
         zipFile: File,
         installedApp: InstalledQuestApp? = null,
-        loaderDetection: ModLoaderDetection? = null
+        loaderDetection: ModLoaderDetection? = null,
+        directoryDiscovery: ModDirectoryDiscovery? = null
     ): ModPackageAnalysis {
         return try {
             val archive = inspectArchive(zipFile)
@@ -91,8 +100,14 @@ class ModPackageAnalyzer(
                     analyzeBonelabPayload(archive, installedApp, loaderDetection)
                 isKnownGameProfilePayload(archive, installedApp) ->
                     analyzeKnownGameProfile(archive, installedApp, loaderDetection)
+                directoryDiscovery != null && directoryDiscovery.existingCandidates.isNotEmpty() ->
+                    analyzeExistingDirectoryProposal(
+                        archive,
+                        installedApp,
+                        directoryDiscovery
+                    )
                 archive.entries.any(::looksLikeGenericModPayload) -> analyzeGeneric(archive)
-                else -> unknown(archive)
+                else -> unknown(archive, installedApp)
             }
         } catch (e: ModPackageException) {
             e.diagnosticEntry?.let { entry ->
@@ -105,8 +120,12 @@ class ModPackageAnalyzer(
     }
 
     /** More explicit spelling for callers that distinguish analysis from inspection. */
-    fun inspect(zipFile: File, installedApp: InstalledQuestApp? = null): ModPackageAnalysis =
-        analyze(zipFile, installedApp)
+    fun inspect(
+        zipFile: File,
+        installedApp: InstalledQuestApp? = null,
+        loaderDetection: ModLoaderDetection? = null,
+        directoryDiscovery: ModDirectoryDiscovery? = null
+    ): ModPackageAnalysis = analyze(zipFile, installedApp, loaderDetection, directoryDiscovery)
 
     private fun inspectArchive(zipFile: File): ArchiveMetadata {
         require(zipFile.isFile) { "Selected mod archive does not exist." }
@@ -231,6 +250,7 @@ class ModPackageAnalyzer(
         val target = json.optString("packageId", "").trim().ifBlank { null }
         val profile = target?.let(profileRegistry::findByPackageId)
         val preconditions = mutableListOf<ModInstallPrecondition>()
+        validateQmodSchema(json, preconditions)
         if (target == null) {
             preconditions += blocked("TARGET_PACKAGE_MISSING", "QMOD does not declare a target packageId.")
         } else if (installedApp == null) {
@@ -290,19 +310,35 @@ class ModPackageAnalyzer(
             )
         }
         checkQmodPackageVersion(json, installedApp, preconditions)
-        if (hasPatchingRequirement(json)) {
-            preconditions += blocked(
-                "UNSUPPORTED_PATCHING",
-                "This QMOD requires APK/game patching, which NFVR will not perform."
-            )
-        }
-        val dependencies = json.opt("dependencies")
-        if (dependencies != null && dependencies != JSONObject.NULL && hasEntries(dependencies)) {
+        val declaredDependencies = parseDependencies(
+            json.opt("dependencies"),
+            optional = false,
+            preconditions = preconditions
+        )
+        val dependencies = declaredDependencies.filterNot { it.optional }
+        val dependencyOptionals = declaredDependencies.filter { it.optional }
+        if (dependencies.isNotEmpty()) {
             preconditions += blocked(
                 "DEPENDENCIES_REQUIREMENT",
                 "This QMOD declares dependencies; NFVR will not download or install dependencies automatically."
             )
         }
+        if (dependencyOptionals.isNotEmpty()) {
+            preconditions += satisfied(
+                "OPTIONAL_DEPENDENCIES_UNRESOLVED",
+                "Optional QMOD dependencies were recorded for review; NFVR will not download them automatically."
+            )
+        }
+        val patchRequirement = if (hasPatchingRequirement(json)) {
+            preconditions += blocked(
+                "APK_PATCH_REQUIRED",
+                "This QMOD requires APK/game patching; NFVR will not patch the installed application."
+            )
+            ModPatchRequirement(
+                required = true,
+                reason = "QMOD declares an APK/game patching requirement."
+            )
+        } else null
         addStrictQmodSchemaPreconditions(json, preconditions)
         addDangerousPayloadPrecondition(archive, preconditions)
 
@@ -334,7 +370,15 @@ class ModPackageAnalyzer(
             preconditions = preconditions,
             archiveIdentity = archive.identity,
             reviewedApp = installedApp,
-            loaderRequirement = loaderRequirement
+            loaderRequirement = loaderRequirement,
+            dependencies = dependencies,
+            optionalDependencies = dependencyOptionals,
+            patchRequirement = patchRequirement,
+            resolution = resolution(
+                ModResolutionStrategy.QMOD,
+                100,
+                "QMOD mod.json is an explicit declarative package manifest."
+            )
         )
         return result(
             type = ModPackageType.QMOD,
@@ -364,18 +408,18 @@ class ModPackageAnalyzer(
                     is JSONArray -> {
                         for (i in 0 until copies.length()) {
                             val item = copies.getJSONObject(i)
-                            val allowed = setOf("name", "source", "destination")
+                            val allowed = setOf("name", "destination")
                             if (item.keys().asSequence().any { it !in allowed } ||
                                 !item.has("destination") ||
-                                (!item.has("name") && !item.has("source"))
+                                !item.has("name")
                             ) {
                                 preconditions += blocked(
                                     "INVALID_FILE_COPIES",
-                                    "QMOD fileCopies requires name/source and destination only."
+                                    "QMOD fileCopies requires canonical name and destination fields only."
                                 )
                                 continue
                             }
-                            val source = item.optString("name", item.optString("source", ""))
+                            val source = item.optString("name", "")
                             val destination = item.getString("destination")
                             addQmodMapping(
                                 archive, profile, mappings, target, source, destination,
@@ -383,14 +427,10 @@ class ModPackageAnalyzer(
                             )
                         }
                     }
-                    is JSONObject -> {
-                        for (source in copies.keys()) {
-                            addQmodMapping(
-                                archive, profile, mappings, target, source,
-                                copies.getString(source), null, preconditions
-                            )
-                        }
-                    }
+                    is JSONObject -> preconditions += blocked(
+                        "INVALID_FILE_COPIES",
+                        "QMOD fileCopies must use the canonical array of name/destination records."
+                    )
                     else -> preconditions += blocked("INVALID_FILE_COPIES", "QMOD fileCopies must be an array or object.")
                 }
             } catch (e: Exception) {
@@ -433,65 +473,204 @@ class ModPackageAnalyzer(
                 }
             }
         }
-        parseQmodCopyExtensions(
-            archive,
-            json,
-            profile,
-            target,
-            mappings,
-            preconditions
-        )
+        parseQmodCopyExtensions(json, preconditions)
         // Never infer a destination or copy every archive entry.  QMODs must
         // explicitly declare modFiles, lateModFiles, libraryFiles, or
         // fileCopies.
         return mappings.distinctBy { it.sourcePath to it.destinationPath }
     }
 
-    private fun parseQmodCopyExtensions(
-        archive: ArchiveMetadata,
+    /**
+     * Validation follows the published QuestPatcher schema versions rather
+     * than treating every JSON object named mod.json as a QMOD.  Archives
+     * without _QPVersion are retained as a deliberately limited legacy
+     * compatibility path because older QuestLoader packages used that form.
+     */
+    private fun validateQmodSchema(
         json: JSONObject,
-        profile: GameModProfile?,
-        target: String?,
-        mappings: MutableList<ModFileMapping>,
         preconditions: MutableList<ModInstallPrecondition>
     ) {
-        val extensions = json.optJSONArray("copyExtensions") ?: return
-        for (i in 0 until extensions.length()) {
-            val item = extensions.optJSONObject(i)
-            if (item == null || item.keys().asSequence().any { it !in setOf("extension", "destination") } ||
-                item.optString("extension").isBlank() || item.optString("destination").isBlank()
-            ) {
+        val rawVersion = json.opt("_QPVersion")
+        if (rawVersion == null || rawVersion == JSONObject.NULL) {
+            preconditions += satisfied(
+                "LEGACY_QMOD_FORMAT",
+                "QMOD omits _QPVersion; legacy QuestLoader compatibility rules apply."
+            )
+        } else if (rawVersion !is String ||
+            rawVersion.trim() !in SUPPORTED_QMOD_SCHEMA_VERSIONS
+        ) {
+            preconditions += blocked(
+                "UNSUPPORTED_QMOD_VERSION",
+                "QMOD _QPVersion must be one of ${SUPPORTED_QMOD_SCHEMA_VERSIONS.joinToString()}."
+            )
+            return
+        } else {
+            val required = listOf("name", "id", "author", "version")
+            val missing = required.filter { key ->
+                val value = json.opt(key)
+                value !is String || value.trim().isEmpty()
+            }
+            if (missing.isNotEmpty()) {
                 preconditions += blocked(
-                    "INVALID_COPY_EXTENSIONS",
-                    "QMOD copyExtensions requires extension and destination."
+                    "MISSING_QMOD_FIELDS",
+                    "QMOD ${rawVersion.trim()} is missing required fields: ${missing.joinToString()}."
                 )
-                continue
             }
-            val extension = item.getString("extension").removePrefix(".").lowercase(Locale.ROOT)
-            val destination = item.getString("destination").trimEnd('/')
-            val sources = archive.entries.filter {
-                it !in archive.directories &&
-                    it.substringAfterLast('/', "").substringAfterLast('.', "").lowercase(Locale.ROOT) == extension
-            }
-            if (sources.isEmpty()) {
+            val version = json.optString("version", "").trim()
+            if (version.isNotEmpty() && !SEMVER.matches(version)) {
                 preconditions += blocked(
-                    "COPY_EXTENSION_NO_MATCH",
-                    "QMOD copyExtensions did not match any '$extension' file."
-                )
-            }
-            for (source in sources) {
-                addQmodMapping(
-                    archive,
-                    profile,
-                    mappings,
-                    target,
-                    source,
-                    "$destination/${source.substringAfterLast('/')}",
-                    null,
-                    preconditions
+                    "INVALID_QMOD_VERSION",
+                    "QMOD version must be a valid semantic version."
                 )
             }
         }
+        val contentFields = listOf(
+            "modFiles", "lateModFiles", "libraryFiles", "dependencies", "fileCopies"
+        )
+        if (contentFields.none { json.has(it) }) {
+            preconditions += blocked(
+                "NO_QMOD_CONTENT_FIELDS",
+                "QMOD must declare at least one of modFiles, lateModFiles, libraryFiles, dependencies, or fileCopies."
+            )
+        }
+    }
+
+    private fun parseQmodCopyExtensions(
+        json: JSONObject,
+        preconditions: MutableList<ModInstallPrecondition>
+    ) {
+        when (val raw = json.opt("copyExtensions")) {
+            null, JSONObject.NULL -> return
+            is JSONArray -> {
+                if (raw.length() > 0) {
+                    preconditions += blocked(
+                        "COPY_EXTENSIONS_REGISTRATION_UNSUPPORTED",
+                        "QMOD copyExtensions registers a QuestPatcher file destination; NFVR cannot persist that registration."
+                    )
+                }
+                for (i in 0 until raw.length()) {
+                    val item = raw.optJSONObject(i)
+                    if (item == null ||
+                        item.keys().asSequence().any { it !in setOf("extension", "destination") } ||
+                        item.optString("extension").isBlank() ||
+                        item.optString("destination").isBlank()
+                    ) {
+                        preconditions += blocked(
+                            "INVALID_COPY_EXTENSIONS",
+                            "QMOD copyExtensions requires extension and destination."
+                        )
+                        continue
+                    }
+                    val extension = item.getString("extension").trim()
+                    val destination = item.getString("destination").trim().trimEnd('/')
+                    if (!QMOD_EXTENSION.matches(extension) ||
+                        extension.startsWith(".") ||
+                        !AndroidPathValidator.isSafe(destination)
+                    ) {
+                        preconditions += blocked(
+                            "INVALID_COPY_EXTENSIONS",
+                            "QMOD copyExtensions requires a safe extension and destination."
+                        )
+                    }
+                }
+            }
+            else -> preconditions += blocked(
+                "INVALID_COPY_EXTENSIONS",
+                "QMOD copyExtensions must be the canonical array of extension/destination records."
+            )
+        }
+    }
+
+    private fun parseDependencies(
+        raw: Any?,
+        optional: Boolean,
+        preconditions: MutableList<ModInstallPrecondition>
+    ): List<ModPackageDependency> {
+        if (raw == null || raw == JSONObject.NULL) return emptyList()
+        val result = mutableListOf<ModPackageDependency>()
+
+        fun add(value: Any?, fallbackId: String? = null) {
+            when (value) {
+                is JSONObject -> {
+                    val allowed = setOf("id", "version", "downloadIfMissing", "required")
+                    if (value.keys().asSequence().any { it !in allowed }) {
+                        preconditions += blocked(
+                            "INVALID_DEPENDENCY",
+                            "QMOD dependency objects contain unsupported fields."
+                        )
+                    }
+                    val id = value.optString("id")
+                        .ifBlank { value.optString("modId") }
+                        .ifBlank { value.optString("packageId") }
+                        .ifBlank { fallbackId.orEmpty() }
+                    val version = value.optString("version")
+                        .ifBlank { value.optString("versionRange") }
+                        .ifBlank { null }
+                    val sourceUrl = value.optString("downloadIfMissing")
+                        .ifBlank { value.optString("url") }
+                        .ifBlank { value.optString("downloadUrl") }
+                        .ifBlank { null }
+                    val canonicalArrayEntry = fallbackId == null
+                    val requiredValue = if (value.has("required")) {
+                        value.opt("required") as? Boolean
+                    } else {
+                        true
+                    }
+                    if (requiredValue == null) {
+                        preconditions += blocked(
+                            "INVALID_DEPENDENCY",
+                            "QMOD dependency required must be a boolean."
+                        )
+                    } else if (id.isBlank() ||
+                        (canonicalArrayEntry && version.isNullOrBlank())
+                    ) {
+                        preconditions += blocked(
+                            "INVALID_DEPENDENCY",
+                            "QMOD dependency entries must declare non-empty id and version."
+                        )
+                    } else {
+                        val isOptional = optional || !requiredValue
+                        result += ModPackageDependency(
+                            id = id,
+                            version = version,
+                            optional = isOptional,
+                            sourceUrl = sourceUrl,
+                            required = !isOptional
+                        )
+                    }
+                }
+                is String -> {
+                    val id = value.trim().ifBlank { fallbackId.orEmpty() }
+                    if (id.isBlank() || fallbackId == null) {
+                        preconditions += blocked(
+                            "INVALID_DEPENDENCY",
+                            "QMOD dependency entries must be objects with id and version."
+                        )
+                    } else {
+                        result += ModPackageDependency(
+                            id = id,
+                            optional = optional,
+                            required = !optional
+                        )
+                    }
+                }
+                else -> preconditions += blocked(
+                    "INVALID_DEPENDENCY",
+                    "QMOD dependencies must be objects, IDs, or an ID map."
+                )
+            }
+        }
+
+        when (raw) {
+            is JSONArray -> for (index in 0 until raw.length()) add(raw.opt(index))
+            is JSONObject -> for (key in raw.keys()) add(raw.opt(key), key)
+            is String -> add(raw)
+            else -> preconditions += blocked(
+                "INVALID_DEPENDENCY",
+                "QMOD dependencies must be an array, object, or ID."
+            )
+        }
+        return result.distinctBy { it.id to it.version }
     }
 
     private fun addQmodMapping(
@@ -541,11 +720,25 @@ class ModPackageAnalyzer(
         }
     }
 
+    private fun androidLayoutPath(entry: String, root: String): String? {
+        val normalized = entry.trimStart('/')
+        val prefixes = listOf(
+            "$root/",
+            "sdcard/$root/",
+            "storage/emulated/0/$root/"
+        )
+        return prefixes.firstNotNullOfOrNull { prefix ->
+            normalized.takeIf { it.startsWith(prefix) }?.removePrefix(prefix)?.let {
+                "$root/$it"
+            }
+        }
+    }
+
     private fun isAndroidDataLayout(archive: ArchiveMetadata): Boolean =
-        archive.entries.any { it.startsWith("Android/data/") }
+        archive.entries.any { androidLayoutPath(it, "Android/data") != null }
 
     private fun isAndroidObbLayout(archive: ArchiveMetadata): Boolean =
-        archive.entries.any { it.startsWith("Android/obb/") }
+        archive.entries.any { androidLayoutPath(it, "Android/obb") != null }
 
     private fun analyzeAndroidLayout(
         archive: ArchiveMetadata,
@@ -553,11 +746,11 @@ class ModPackageAnalyzer(
         obb: Boolean
     ): ModPackageAnalysis {
         val dataPackages = archive.entries
-            .filter { it.startsWith("Android/data/") }
+            .mapNotNull { androidLayoutPath(it, "Android/data") }
             .mapNotNull { it.removePrefix("Android/data/").substringBefore('/').takeIf(PACKAGE_ID::matches) }
             .toSet()
         val obbPackages = archive.entries
-            .filter { it.startsWith("Android/obb/") }
+            .mapNotNull { androidLayoutPath(it, "Android/obb") }
             .mapNotNull { it.removePrefix("Android/obb/").substringBefore('/').takeIf(PACKAGE_ID::matches) }
             .toSet()
         val packages = dataPackages + obbPackages
@@ -609,18 +802,20 @@ class ModPackageAnalyzer(
             )
             for (entry in archive.entries) {
                 if (entry in archive.directories) continue
+                val dataEntry = androidLayoutPath(entry, "Android/data")
+                val obbEntry = androidLayoutPath(entry, "Android/obb")
                 when {
-                    entry.startsWith("Android/data/$target/") ->
+                    dataEntry?.startsWith("Android/data/$target/") == true ->
                         addMapping(
                             archive, dataProfile, mappings,
-                            entry, entry.removePrefix("Android/data/$target/"),
+                            entry, dataEntry.removePrefix("Android/data/$target/"),
                             null, preconditions,
                             allowFullDestination = false
                         )
-                    entry.startsWith("Android/obb/$target/") ->
+                    obbEntry?.startsWith("Android/obb/$target/") == true ->
                         addMapping(
                             archive, obbProfile, mappings,
-                            entry, entry.removePrefix("Android/obb/$target/"),
+                            entry, obbEntry.removePrefix("Android/obb/$target/"),
                             null, preconditions,
                             allowFullDestination = false
                         )
@@ -911,6 +1106,136 @@ class ModPackageAnalyzer(
         )
     }
 
+    private fun analyzeExistingDirectoryProposal(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?,
+        discovery: ModDirectoryDiscovery
+    ): ModPackageAnalysis {
+        val target = installedApp?.packageName
+        val candidate = discovery.existingCandidates.firstOrNull {
+            it.packageId == target && it.readOnly && AndroidPathValidator.isSafe(it.path)
+        }
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        if (target == null) {
+            preconditions += blocked(
+                "TARGET_APP_REQUIRED",
+                "Select the installed Quest app before proposing an existing mod directory."
+            )
+        }
+        if (discovery.serial.isBlank() || target != discovery.packageId) {
+            preconditions += blocked(
+                "DISCOVERY_BINDING_MISMATCH",
+                "The read-only directory discovery belongs to a different selected package."
+            )
+        }
+        if (candidate == null) {
+            preconditions += blocked(
+                "NO_EXISTING_MOD_DIRECTORY",
+                "No existing mod directory was found for the selected package."
+            )
+        } else {
+            preconditions += satisfied(
+                "EXISTING_MOD_DIRECTORY_FOUND",
+                "An existing mod directory was found by read-only inspection."
+            )
+            preconditions += blocked(
+                "EXPLICIT_CONFIRMATION_REQUIRED",
+                "The proposed existing mod directory must be shown and explicitly confirmed before writing."
+            )
+        }
+        addDangerousPayloadPrecondition(archive, preconditions)
+        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        val mappings = mutableListOf<ModFileMapping>()
+        if (candidate != null) {
+            val profile = GameModProfile(
+                packageId = target!!,
+                displayName = "Existing mod directory",
+                destination = candidate.path,
+                knownContentDirectories = emptySet(),
+                authoritativePaths = setOf(candidate.path),
+                evidenceLevel = candidate.evidenceLevel
+            )
+            val wrapper = archive.entries
+                .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
+                .groupingBy { it }
+                .eachCount()
+                .entries
+                .singleOrNull()?.key
+            for (entry in archive.entries) {
+                if (entry in archive.directories) continue
+                val relative = if (wrapper != null && entry.startsWith("$wrapper/")) {
+                    entry.removePrefix("$wrapper/")
+                } else {
+                    entry
+                }
+                if (relative.isBlank()) continue
+                addMapping(
+                    archive,
+                    profile,
+                    mappings,
+                    entry,
+                    "${candidate.path.trimEnd('/')}/$relative",
+                    null,
+                    preconditions,
+                    allowFullDestination = true,
+                    targetPackageId = target
+                )
+            }
+        }
+        if (mappings.isEmpty()) {
+            preconditions += blocked(
+                "NO_COPY_MAPPINGS",
+                "The archive contains no safe files for the existing mod directory."
+            )
+        }
+        val confirmation = candidate?.let {
+            ModInstallConfirmation(
+                token = modInstallConfirmationToken(
+                    archive.identity?.sha256.orEmpty(),
+                    target.orEmpty(),
+                    it.path
+                ),
+                destination = it.path,
+                reason = "Directory existence is evidence only; destination was inferred from a read-only scan."
+            )
+        }
+        val profile = candidate?.let {
+            GameModProfile(
+                packageId = target!!,
+                displayName = "Existing mod directory",
+                destination = it.path,
+                evidenceLevel = it.evidenceLevel
+            )
+        }
+        val plan = plan(
+            type = ModPackageType.GENERIC_DATA,
+            target = target,
+            profile = profile,
+            mappings = mappings,
+            strategy = ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY,
+            preconditions = preconditions,
+            archiveIdentity = archive.identity,
+            reviewedApp = installedApp,
+            confirmation = confirmation,
+            resolution = resolution(
+                ModResolutionStrategy.EXISTING_GAME_MOD_DIRECTORY,
+                55,
+                "Read-only discovery found an existing package-scoped directory; explicit confirmation is required."
+            )
+        )
+        return result(
+            ModPackageType.GENERIC_DATA,
+            if (candidate == null) blockingMessage(plan)
+            else "A generic existing mod directory was proposed; confirm the displayed destination before installing.",
+            plan,
+            archive,
+            metadata = mapOf(
+                "candidateDestination" to candidate?.path,
+                "confirmationRequired" to (candidate != null)
+            )
+        )
+    }
+
     private fun looksLikeCodeModPayload(path: String): Boolean =
         path.lowercase(Locale.ROOT).endsWith(".dll") ||
             path.lowercase(Locale.ROOT).contains("/melonloader/") ||
@@ -938,6 +1263,11 @@ class ModPackageAnalyzer(
                 // Kept as a stable compatibility code for existing callers;
                 // it no longer implies a browser or external URL workflow.
                 satisfied("MOD_IO_MANAGED", "The package is managed by the game's built-in content system.")
+            ),
+            resolution = resolution(
+                ModResolutionStrategy.BUILT_IN_CONTENT_TYPE,
+                100,
+                "Manifest identifies content managed by the game's own custom-content system."
             )
         )
         return result(
@@ -960,7 +1290,12 @@ class ModPackageAnalyzer(
             packageType = ModPackageType.GENERIC_DATA,
             strategy = ModInstallStrategy.NONE,
             archiveIdentity = archive.identity,
-            preconditions = preconditions
+            preconditions = preconditions,
+            resolution = resolution(
+                ModResolutionStrategy.UNKNOWN,
+                0,
+                "No package-bound manifest, Android layout, loader package, profile, or discovered directory matched."
+            )
         )
         return result(
             ModPackageType.GENERIC_DATA,
@@ -1036,9 +1371,16 @@ class ModPackageAnalyzer(
             enforceWhenUnknown = loader != null,
             targetPackageId = target
         )
-        if (json.optString("modType", "").equals("apk-patch", true)) {
-            preconditions += blocked("UNSUPPORTED_PATCHING", "NFVR manifests may not request APK patching.")
-        }
+        val patchRequirement = if (json.optString("modType", "").equals("apk-patch", true)) {
+            preconditions += blocked(
+                "APK_PATCH_REQUIRED",
+                "NFVR manifest requests APK patching; NFVR will not patch the installed application."
+            )
+            ModPatchRequirement(
+                required = true,
+                reason = "NFVR manifest modType=apk-patch."
+            )
+        } else null
         addDangerousManifestPreconditions(json, preconditions, NFVR_ALLOWED_KEYS)
         addDangerousPayloadPrecondition(archive, preconditions)
 
@@ -1058,7 +1400,13 @@ class ModPackageAnalyzer(
             ModInstallStrategy.DECLARATIVE_COPY, preconditions,
             archive.identity,
             installedApp,
-            loaderRequirement
+            loaderRequirement,
+            patchRequirement = patchRequirement,
+            resolution = resolution(
+                ModResolutionStrategy.NFVR_MANIFEST,
+                100,
+                "nfvr-mod.json is an explicit NFVR declarative manifest."
+            )
         )
         return result(
             ModPackageType.NFVR_MANIFEST,
@@ -1236,7 +1584,12 @@ class ModPackageAnalyzer(
         preconditions: List<ModInstallPrecondition>,
         archiveIdentity: ModArchiveIdentity? = null,
         reviewedApp: InstalledQuestApp? = null,
-        loaderRequirement: ModLoaderRequirement? = null
+        loaderRequirement: ModLoaderRequirement? = null,
+        dependencies: List<ModPackageDependency> = emptyList(),
+        optionalDependencies: List<ModPackageDependency> = emptyList(),
+        patchRequirement: ModPatchRequirement? = null,
+        confirmation: ModInstallConfirmation? = null,
+        resolution: ModStrategyDecision = resolutionFor(type)
     ): ModInstallPlan {
         val installable = mappings.isNotEmpty() && preconditions.none { !it.satisfied }
         val unsupportedLoader = preconditions.any { it.code == "UNSUPPORTED_MOD_LOADER" }
@@ -1259,8 +1612,13 @@ class ModPackageAnalyzer(
         val outcome = when {
             type == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ->
                 ModInstallOutcome.BUILT_IN_GAME_CONTENT
-            type == ModPackageType.UNKNOWN || type == ModPackageType.GENERIC_DATA ->
+            type == ModPackageType.UNKNOWN ->
                 ModInstallOutcome.UNSUPPORTED
+            type == ModPackageType.GENERIC_DATA &&
+                confirmation == null ->
+                ModInstallOutcome.UNSUPPORTED
+            patchRequirement?.required == true ->
+                ModInstallOutcome.APK_PATCH_REQUIRED
             unsupportedLoader -> ModInstallOutcome.UNSUPPORTED
             hardPayloadBlock -> ModInstallOutcome.UNSUPPORTED
             requiresLoader -> ModInstallOutcome.REQUIRES_MOD_LOADER
@@ -1278,8 +1636,61 @@ class ModPackageAnalyzer(
         strategy = strategy,
         archiveIdentity = archiveIdentity,
         reviewedApp = reviewedApp,
-        loaderRequirement = loaderRequirement
+            loaderRequirement = loaderRequirement,
+            dependencies = dependencies,
+            optionalDependencies = optionalDependencies,
+            patchRequirement = patchRequirement,
+            confirmation = confirmation,
+            resolution = resolution,
+            diagnostics = preconditions.filterNot { it.satisfied }.map { it.message }
+        )
+    }
+
+    private fun resolution(
+        strategy: ModResolutionStrategy,
+        confidence: Int,
+        evidence: String
+    ): ModStrategyDecision = ModStrategyDecision(
+        selected = strategy,
+        confidence = confidence,
+        evidence = listOf(
+            ModStrategyEvidence(
+                strategy = strategy,
+                level = when (strategy) {
+                    ModResolutionStrategy.NFVR_MANIFEST,
+                    ModResolutionStrategy.QMOD,
+                    ModResolutionStrategy.ANDROID_FILESYSTEM_LAYOUT ->
+                        ModEvidenceLevel.AUTHORITATIVE
+                    ModResolutionStrategy.KNOWN_GAME_PROFILE ->
+                        ModEvidenceLevel.OPEN_SOURCE_PROJECT
+                    ModResolutionStrategy.BUILT_IN_CONTENT_TYPE ->
+                        ModEvidenceLevel.AUTHORITATIVE
+                    ModResolutionStrategy.EXISTING_GAME_MOD_DIRECTORY,
+                    ModResolutionStrategy.KNOWN_MOD_LOADER_PACKAGE ->
+                        ModEvidenceLevel.COMMUNITY_VERIFIED
+                    ModResolutionStrategy.UNKNOWN ->
+                        ModEvidenceLevel.HEURISTIC
+                },
+                confidence = confidence,
+                evidence = listOf(evidence)
+            )
+        )
     )
+
+    private fun resolutionFor(type: ModPackageType): ModStrategyDecision {
+        val strategy = when (type) {
+            ModPackageType.NFVR_MANIFEST -> ModResolutionStrategy.NFVR_MANIFEST
+            ModPackageType.QMOD -> ModResolutionStrategy.QMOD
+            ModPackageType.ANDROID_DATA_LAYOUT,
+            ModPackageType.ANDROID_OBB_LAYOUT -> ModResolutionStrategy.ANDROID_FILESYSTEM_LAYOUT
+            ModPackageType.BONELAB_NATIVE_CONTENT,
+            ModPackageType.BONELAB_CODE_MOD,
+            ModPackageType.KNOWN_GAME_PROFILE -> ModResolutionStrategy.KNOWN_GAME_PROFILE
+            ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> ModResolutionStrategy.BUILT_IN_CONTENT_TYPE
+            ModPackageType.GENERIC_DATA -> ModResolutionStrategy.EXISTING_GAME_MOD_DIRECTORY
+            ModPackageType.UNKNOWN -> ModResolutionStrategy.UNKNOWN
+        }
+        return resolution(strategy, if (strategy == ModResolutionStrategy.UNKNOWN) 0 else 70, "recognized package structure")
     }
 
     private fun inferDestinationRoot(
@@ -1411,12 +1822,7 @@ class ModPackageAnalyzer(
                 "QMOD mod.json contains unsupported top-level fields: ${unknown.joinToString()}."
             )
         }
-        val legacyPackageVersion = if (json.has("packageVersion") && !json.has("_QPVersion")) {
-            listOf("packageVersion")
-        } else {
-            emptyList()
-        }
-        val unimplemented = json.keys().asSequence().filter(QMOD_UNIMPLEMENTED_KEYS::contains).toList() + legacyPackageVersion
+        val unimplemented = json.keys().asSequence().filter(QMOD_UNIMPLEMENTED_KEYS::contains).toList()
         if (unimplemented.isNotEmpty()) {
             preconditions += blocked(
                 "UNSUPPORTED_QMOD_FIELD",
@@ -1609,17 +2015,49 @@ class ModPackageAnalyzer(
 
     private fun collisionKey(path: String): String = ModArchivePath.collisionKey(path)
 
-    private fun unknown(archive: ArchiveMetadata): ModPackageAnalysis {
+    private fun unknown(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp? = null
+    ): ModPackageAnalysis {
+        val extensions = archive.entries.asSequence()
+            .filterNot { it in archive.directories }
+            .map { it.substringAfterLast('.', "").lowercase(Locale.ROOT).takeIf(String::isNotBlank) }
+            .filterNotNull()
+            .distinct()
+            .sorted()
+            .take(20)
+            .toList()
+        val topLevel = archive.entries
+            .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
+            .distinct()
+            .sorted()
+            .take(20)
+        val diagnostics = buildList {
+            add("selectedPackage=${installedApp?.packageName ?: "none"}")
+            add("topLevel=${topLevel.joinToString(",").ifBlank { "none" }}")
+            add("extensions=${extensions.joinToString(",").ifBlank { "none" }}")
+            add("manifests=${archive.metadata.keys.sorted().joinToString(",").ifBlank { "none" }}")
+            add("loaderEvidence=not authenticated during offline archive analysis")
+            add("candidateDestinationEvidence=none")
+        }
         val plan = ModInstallPlan(
             packageType = ModPackageType.UNKNOWN,
             archiveIdentity = archive.identity,
-            preconditions = listOf(blocked("UNKNOWN_FORMAT", "This mod format is not recognized or its destination cannot be determined safely."))
+            reviewedApp = installedApp,
+            preconditions = listOf(blocked("UNKNOWN_FORMAT", "This mod format is not recognized or its destination cannot be determined safely.")),
+            diagnostics = diagnostics,
+            resolution = resolution(
+                ModResolutionStrategy.UNKNOWN,
+                0,
+                "No safe strategy matched the archive."
+            )
         )
         return result(
             ModPackageType.UNKNOWN,
-            "This mod format is not recognized or its installation destination cannot be determined safely.",
+            "This mod format is not recognized safely. Diagnostic classification is available for support.",
             plan,
-            archive
+            archive,
+            metadata = mapOf("diagnostics" to diagnostics)
         )
     }
 
@@ -1662,7 +2100,8 @@ class ModPackageAnalyzer(
         installPlan = plan,
         metadata = metadata,
         entries = archive.entries,
-        externalWorkflow = externalWorkflow
+        externalWorkflow = externalWorkflow,
+        diagnostics = plan.diagnostics.distinct()
     )
 
     private fun blockingMessage(plan: ModInstallPlan): String =
@@ -1728,19 +2167,6 @@ class ModPackageAnalyzer(
         val diagnosticEntry: String? = null
     ) : Exception(message)
 
-}
-
-internal fun sha256File(file: File): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    file.inputStream().use { input ->
-        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            digest.update(buffer, 0, read)
-        }
-    }
-    return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
 private fun JSONObject.toMap(): Map<String, Any?> =

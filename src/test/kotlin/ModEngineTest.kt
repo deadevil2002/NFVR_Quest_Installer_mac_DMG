@@ -224,7 +224,9 @@ class ModEngineTest {
     fun qmodAllowsOnlyValidatedArm64ElfUnderLoaderRoot() {
         val zip = zipOfBytes(
             "mod.json" to """
-                {"_QPVersion":"1.2.0","packageId":"com.StressLevelZero.BONELAB",
+                {"_QPVersion":"1.2.0","name":"Native","id":"native",
+                 "author":"NFVR","version":"1.0.0",
+                 "packageId":"com.StressLevelZero.BONELAB",
                  "modloader":"QuestLoader","modFiles":["lib.so"]}
             """.trimIndent().toByteArray(),
             "lib.so" to arm64ElfPayload()
@@ -246,7 +248,8 @@ class ModEngineTest {
     fun legacyQmodLateFilesAreRejectedWithoutExplicitLoaderSemantics() {
         val zip = zipOf(
             "mod.json" to """
-                {"packageId":"com.StressLevelZero.BONELAB","lateModFiles":["late.dat"]}
+                {"name":"Late","id":"late","author":"NFVR","version":"1.0.0",
+                 "packageId":"com.StressLevelZero.BONELAB","lateModFiles":["late.dat"]}
             """.trimIndent(),
             "late.dat" to "late"
         )
@@ -582,7 +585,7 @@ class ModEngineTest {
                 }
             }
             val result = ModsManager(adb, detector)
-                .executeInstallPlan("SERIAL", zip, analysis.plan)
+                .executeInstallPlan("SERIAL", zip, analysis.plan.bindToDevice("SERIAL"))
 
             assertFalse(result.success)
             assertEquals(0, adb.pushCalls)
@@ -603,7 +606,7 @@ class ModEngineTest {
             )
             val analysis = analyzer.analyze(zip, bonelab)
             assertTrue(analysis.installable)
-            val tampered = analysis.plan.copy(
+            val tampered = analysis.plan.bindToDevice("SERIAL").copy(
                 strategy = ModInstallStrategy.NONE,
                 destinationRoot = "/sdcard/Android/data/com.StressLevelZero.BONELAB/files"
             )

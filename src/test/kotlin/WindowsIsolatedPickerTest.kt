@@ -8,6 +8,10 @@ import com.sun.jna.Pointer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 
 class WindowsIsolatedPickerTest {
     @Test
@@ -126,6 +130,97 @@ class WindowsIsolatedPickerTest {
         } finally {
             release.countDown()
             executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun pickerLifecycleRevokesShowPermitOnlyWhileOpening() {
+        val lifecycle = PickerLifecycle(DesktopChooserMode.FILES, 77L)
+        val lease = PickerTaskLease(1L, lifecycle)
+        lifecycle.transition(PickerLifecycleState.OPENING)
+        assertTrue(lease.allowShow())
+        assertEquals(PickerLifecycleState.OPEN, lifecycle.current())
+        assertTrue(!lease.revokeIfOpening())
+        assertTrue(lease.revoke())
+    }
+
+    @Test
+    fun initializationTimeoutReturnsImmediatelyAndQuarantinesLateWorker() = runBlocking {
+        val root = Files.createTempDirectory("nfvr-picker-timeout-").toFile()
+        val zip = File(root, "second.zip").also { it.writeBytes(byteArrayOf(1)) }
+        val started = CountDownLatch(1)
+        val releaseLateWorker = CountDownLatch(1)
+        val firstCallback = CountDownLatch(1)
+        val secondCallback = CountDownLatch(1)
+        val calls = AtomicInteger(0)
+        val callbacks = AtomicInteger(0)
+        val previousAdapter = WindowsIsolatedPicker.adapter
+        val previousTimeout = WindowsIsolatedPicker.initializationWatchdogMillis
+        val previousOs = System.getProperty("os.name")
+        WindowsIsolatedPicker.initializationWatchdogMillis = 80L
+        System.setProperty("os.name", "Windows 11")
+        WindowsIsolatedPicker.adapter = object : WindowsNativePickerAdapter, NativePickerShowGate {
+            override fun choose(
+                mode: DesktopChooserMode,
+                initialDirectory: File?,
+                title: String,
+                ownerHwnd: Long?
+            ): NativePickerOutput = NativePickerOutput.Cancelled
+
+            override fun chooseWithShowGate(
+                mode: DesktopChooserMode,
+                initialDirectory: File?,
+                title: String,
+                ownerHwnd: Long?,
+                canShow: () -> Boolean
+            ): NativePickerOutput {
+                if (calls.incrementAndGet() == 1) {
+                    started.countDown()
+                    releaseLateWorker.await(5, TimeUnit.SECONDS)
+                }
+                return if (canShow()) {
+                    NativePickerOutput.Selected(zip.path)
+                } else {
+                    NativePickerOutput.Failed(null, "late Show permit revoked")
+                }
+            }
+        }
+        try {
+            val first = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                WindowsIsolatedPicker.chooseZipFile(
+                    onNativeTaskComplete = {
+                        callbacks.incrementAndGet()
+                        firstCallback.countDown()
+                    }
+                )
+            }
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            val timedOut = withTimeout(2_000L) { first.await() }
+            assertTrue(timedOut is DesktopChooserResult.Failed)
+            assertTrue(firstCallback.await(2, TimeUnit.SECONDS))
+            assertEquals(1, callbacks.get())
+
+            // The first STA worker is still blocked, but a new attempt must
+            // not queue behind it after its lease was quarantined.
+            val second = withTimeout(2_000L) {
+                WindowsIsolatedPicker.chooseZipFile(
+                    onNativeTaskComplete = {
+                        callbacks.incrementAndGet()
+                        secondCallback.countDown()
+                    }
+                )
+            }
+            assertEquals(DesktopChooserResult.Selected(zip.absoluteFile), second)
+            assertTrue(secondCallback.await(2, TimeUnit.SECONDS))
+            releaseLateWorker.countDown()
+            assertEquals(2, callbacks.get())
+        } finally {
+            releaseLateWorker.countDown()
+            WindowsIsolatedPicker.adapter = previousAdapter
+            WindowsIsolatedPicker.initializationWatchdogMillis = previousTimeout
+            if (previousOs == null) System.clearProperty("os.name")
+            else System.setProperty("os.name", previousOs)
+            root.deleteRecursively()
         }
     }
 

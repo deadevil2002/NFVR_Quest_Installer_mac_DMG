@@ -1,4 +1,3 @@
-import java.text.SimpleDateFormat
 import java.io.InputStream
 import java.math.BigInteger
 import java.net.NetworkInterface
@@ -9,7 +8,6 @@ import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
 import java.io.IOException
 import java.io.FileNotFoundException
-import java.util.Date
 import java.util.Locale
 import java.util.Base64
 import java.util.concurrent.TimeUnit
@@ -996,9 +994,13 @@ object PcvrChecker {
                        solution: String, details: String = "") =
         PcvrCheckResult(title, status, explanation, solution, details)
 
-    fun generateReport(checks: List<PcvrCheckResult>, systemInfo: PcvrSystemInfo): String {
+    fun generateReport(
+        checks: List<PcvrCheckResult>,
+        systemInfo: PcvrSystemInfo,
+        timeFormatter: NfvrTimeFormatter = NfvrTimeFormatter()
+    ): String {
         val sb = StringBuilder()
-        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val timestamp = timeFormatter.formatDateTime(timeFormatter.now())
         sb.appendLine("=".repeat(60))
         sb.appendLine("تقرير فحص جاهزية PCVR")
         sb.appendLine("وقت الفحص: $timestamp")

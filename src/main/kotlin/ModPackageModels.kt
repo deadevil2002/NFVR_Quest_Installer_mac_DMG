@@ -42,7 +42,52 @@ enum class ModInstallStrategy {
     ANDROID_DATA_COPY,
     ANDROID_OBB_COPY,
     MOD_IO_MANAGED,
+    GENERIC_EXISTING_DIRECTORY_COPY,
     NONE
+}
+
+/**
+ * Strategy selection is intentionally separate from the copy implementation.
+ * The resolver exposes the evidence that caused a strategy to win, rather
+ * than silently falling through a collection of game-specific heuristics.
+ */
+enum class ModResolutionStrategy {
+    NFVR_MANIFEST,
+    QMOD,
+    ANDROID_FILESYSTEM_LAYOUT,
+    KNOWN_MOD_LOADER_PACKAGE,
+    KNOWN_GAME_PROFILE,
+    EXISTING_GAME_MOD_DIRECTORY,
+    BUILT_IN_CONTENT_TYPE,
+    UNKNOWN
+}
+
+enum class ModEvidenceLevel {
+    AUTHORITATIVE,
+    OPEN_SOURCE_PROJECT,
+    COMMUNITY_VERIFIED,
+    HEURISTIC
+}
+
+data class ModStrategyEvidence(
+    val strategy: ModResolutionStrategy,
+    val level: ModEvidenceLevel,
+    val confidence: Int,
+    val evidence: List<String> = emptyList()
+) {
+    init {
+        require(confidence in 0..100) { "confidence must be between 0 and 100" }
+    }
+}
+
+data class ModStrategyDecision(
+    val selected: ModResolutionStrategy,
+    val confidence: Int,
+    val evidence: List<ModStrategyEvidence> = emptyList()
+) {
+    init {
+        require(confidence in 0..100) { "confidence must be between 0 and 100" }
+    }
 }
 
 /**
@@ -53,6 +98,7 @@ enum class ModInstallStrategy {
 enum class ModInstallOutcome {
     DIRECT_INSTALL_READY,
     REQUIRES_MOD_LOADER,
+    APK_PATCH_REQUIRED,
     BUILT_IN_GAME_CONTENT,
     UNSUPPORTED,
     UNSAFE_ARCHIVE
@@ -159,6 +205,65 @@ data class ModArchiveIdentity(
     val sha256: String
 )
 
+data class ModPackageDependency(
+    val id: String,
+    val version: String? = null,
+    val downloadRequired: Boolean = true,
+    val optional: Boolean = false,
+    val sourceUrl: String? = null,
+    val required: Boolean = !optional
+)
+
+/**
+ * Patching is a capability boundary, not an installation command.  NFVR
+ * records why a package needs an APK patch while leaving the actual patch
+ * operation to a separately reviewed implementation.
+ */
+data class ModPatchRequirement(
+    val required: Boolean,
+    val reason: String,
+    val patcherId: String? = null,
+    val supported: Boolean = false
+)
+
+data class ModDirectoryCandidate(
+    val packageId: String,
+    val path: String,
+    val exists: Boolean,
+    val source: String,
+    val evidenceLevel: ModEvidenceLevel = ModEvidenceLevel.OPEN_SOURCE_PROJECT,
+    val readOnly: Boolean = true
+)
+
+data class ModDirectoryDiscovery(
+    val serial: String,
+    val packageId: String,
+    val appVersion: String? = null,
+    val candidates: List<ModDirectoryCandidate> = emptyList(),
+    val loaderDetection: ModLoaderDetection? = null,
+    val profile: GameModProfile? = null,
+    val diagnostics: List<String> = emptyList()
+) {
+    val existingCandidates: List<ModDirectoryCandidate>
+        get() = candidates.filter { it.exists }
+}
+
+data class ModInstallConfirmation(
+    val token: String,
+    val destination: String,
+    val reason: String,
+    val required: Boolean = true
+)
+
+fun modInstallConfirmationToken(
+    archiveSha256: String,
+    packageId: String,
+    destination: String
+): String =
+    java.security.MessageDigest.getInstance("SHA-256")
+        .digest("$archiveSha256\u001f$packageId\u001f$destination".toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
 data class ModInstallPrecondition(
     val code: String,
     val message: String,
@@ -207,7 +312,17 @@ data class ModInstallPlan(
     val archiveIdentity: ModArchiveIdentity? = null,
     val reviewedApp: InstalledQuestApp? = null,
     val loaderRequirement: ModLoaderRequirement? = null,
-    val diagnostics: List<String> = emptyList()
+    val diagnostics: List<String> = emptyList(),
+    val resolution: ModStrategyDecision = ModStrategyDecision(
+        ModResolutionStrategy.UNKNOWN,
+        confidence = 0
+    ),
+    val dependencies: List<ModPackageDependency> = emptyList(),
+    val optionalDependencies: List<ModPackageDependency> = emptyList(),
+    val patchRequirement: ModPatchRequirement? = null,
+    val confirmation: ModInstallConfirmation? = null,
+    val analysisPlanId: String? = null,
+    val operationBinding: ModOperationBinding? = null
 ) {
     val fileMappings: List<ModFileMapping>
         get() = mappings
@@ -223,6 +338,54 @@ data class ModInstallPlan(
 
     val hasBlockingPreconditions: Boolean
         get() = preconditions.any { !it.satisfied }
+
+    val requiresExplicitConfirmation: Boolean
+        get() = confirmation?.required == true &&
+            preconditions.any { !it.satisfied && it.code == "EXPLICIT_CONFIRMATION_REQUIRED" }
+
+    /**
+     * Bind an immutable analysis to the selected headset.  The helper only
+     * creates a binding; it never performs I/O or makes an unbound plan
+     * installable.
+     */
+    fun bindToDevice(serial: String): ModInstallPlan {
+        val normalizedSerial = serial.trim()
+        require(normalizedSerial.isNotEmpty()) { "device serial is required" }
+        val app = reviewedApp ?: error("an installed app is required before device binding")
+        val archive = archiveIdentity ?: error("an archive identity is required before device binding")
+        val id = modAnalysisPlanId(normalizedSerial, app, archive.sha256)
+        return copy(
+            analysisPlanId = id,
+            operationBinding = ModOperationBinding(
+                deviceSerial = normalizedSerial,
+                packageId = app.packageName,
+                gameVersion = app.versionName,
+                archiveSha256 = archive.sha256,
+                analysisPlanId = id
+            )
+        )
+    }
+
+    /**
+     * Generic existing-directory proposals must be explicitly accepted by the
+     * caller that showed the destination to the user.
+     */
+    fun confirmDestination(token: String): ModInstallPlan {
+        if (confirmation?.token != token) return this
+        val updated = preconditions.map { precondition ->
+            if (precondition.code == "EXPLICIT_CONFIRMATION_REQUIRED") {
+                precondition.copy(satisfied = true)
+            } else {
+                precondition
+            }
+        }
+        val ready = mappings.isNotEmpty() && updated.none { !it.satisfied }
+        return copy(
+            installable = ready,
+            outcome = if (ready) ModInstallOutcome.DIRECT_INSTALL_READY else outcome,
+            preconditions = updated
+        )
+    }
 
     fun progress(copiedBytes: Long, copiedFiles: Int): ModInstallProgress =
         ModInstallProgress(copiedBytes, totalBytes, copiedFiles, totalFiles)
@@ -283,6 +446,12 @@ data class ModPackageAnalysis(
 
     val externalActionUrl: String?
         get() = externalWorkflow?.actionUrl
+
+    val strategy: ModResolutionStrategy
+        get() = installPlan.resolution.selected
+
+    val confidence: Int
+        get() = installPlan.resolution.confidence
 }
 
 data class GameModProfile(
@@ -297,7 +466,16 @@ data class GameModProfile(
     val maximumGameVersion: String? = null,
     val knownContentDirectories: Set<String> = emptySet(),
     val recognizedArchiveSignatures: Set<String> = emptySet(),
-    val loaderRequirements: Set<ModLoaderKind> = emptySet()
+    val loaderRequirements: Set<ModLoaderKind> = emptySet(),
+    val engine: String = "Unknown",
+    val authoritativePaths: Set<String> = emptySet(),
+    val modTypes: Set<ModPackageType> = supportedPackageTypes,
+    val installationStrategies: Set<ModResolutionStrategy> = setOf(
+        ModResolutionStrategy.KNOWN_GAME_PROFILE
+    ),
+    val evidenceLevel: ModEvidenceLevel = ModEvidenceLevel.HEURISTIC,
+    val evidenceSources: List<String> = emptyList(),
+    val versionRules: Map<String, String> = emptyMap()
 )
 
 /**
@@ -306,25 +484,7 @@ data class GameModProfile(
  * from a package name or from an archive entry.
  */
 object GameModProfileRegistry {
-    private val registeredProfiles = listOf(
-        profile(
-            "com.StressLevelZero.BONELAB",
-            "BONELAB",
-            supportedPackageTypes = setOf(
-                ModPackageType.BONELAB_NATIVE_CONTENT,
-                ModPackageType.BONELAB_CODE_MOD,
-                ModPackageType.QMOD,
-                ModPackageType.NFVR_MANIFEST
-            ),
-            knownContentDirectories = setOf("Mods")
-        ),
-        profile(
-            "com.beatgames.beatsaber",
-            "Beat Saber",
-            "/sdcard/ModData/com.beatgames.beatsaber/Mods",
-            loaderRequirements = setOf(ModLoaderKind.QUEST_LOADER, ModLoaderKind.SCOTLAND2)
-        )
-    )
+    private val registeredProfiles: List<GameModProfile> = loadProfiles()
 
     val profiles: List<GameModProfile>
         get() = registeredProfiles
@@ -334,24 +494,62 @@ object GameModProfileRegistry {
 
     fun forPackage(packageId: String): GameModProfile? = findByPackageId(packageId)
 
-    private fun profile(
-        packageId: String,
-        name: String,
-        destination: String = "/sdcard/Android/data/$packageId/files/Mods",
-        supportedPackageTypes: Set<ModPackageType> = setOf(
-            ModPackageType.QMOD,
-            ModPackageType.NFVR_MANIFEST
-        ),
-        knownContentDirectories: Set<String> = setOf("Mods"),
-        loaderRequirements: Set<ModLoaderKind> = emptySet()
-    ): GameModProfile =
-        GameModProfile(
-            packageId = packageId,
-            displayName = name,
-            destination = destination,
-            supportedPackageTypes = supportedPackageTypes,
-            knownContentDirectories = knownContentDirectories,
-            recognizedArchiveSignatures = setOf("mod.json", "nfvr-mod.json"),
-            loaderRequirements = loaderRequirements
-        )
+    private fun loadProfiles(): List<GameModProfile> {
+        val stream = GameModProfileRegistry::class.java.classLoader
+            ?.getResourceAsStream("mod-profiles.json")
+            ?: return emptyList()
+        return runCatching {
+            stream.bufferedReader(Charsets.UTF_8).use { reader ->
+                val root = org.json.JSONArray(reader.readText())
+                (0 until root.length()).mapNotNull { index ->
+                    val item = root.optJSONObject(index) ?: return@mapNotNull null
+                    val packageId = item.optString("packageId").trim()
+                    val destination = item.optString("destination").trim()
+                    if (packageId.isBlank() || destination.isBlank()) return@mapNotNull null
+                    fun stringSet(key: String): Set<String> =
+                        item.optJSONArray(key)?.let { array ->
+                            (0 until array.length()).mapNotNull {
+                                array.optString(it).trim().takeIf(String::isNotBlank)
+                            }.toSet()
+                        } ?: emptySet()
+                    fun enumSet(key: String): Set<ModPackageType> =
+                        stringSet(key).mapNotNull { value ->
+                            runCatching { ModPackageType.valueOf(value) }.getOrNull()
+                        }.toSet()
+                    val supported = enumSet("supportedPackageTypes").ifEmpty {
+                        setOf(ModPackageType.QMOD, ModPackageType.NFVR_MANIFEST)
+                    }
+                    val loaders = stringSet("loaderRequirements").mapNotNull {
+                        runCatching { ModLoaderKind.valueOf(it) }.getOrNull()
+                    }.toSet()
+                    val evidence = runCatching {
+                        ModEvidenceLevel.valueOf(item.optString("evidenceLevel"))
+                    }.getOrDefault(ModEvidenceLevel.HEURISTIC)
+                    GameModProfile(
+                        packageId = packageId,
+                        displayName = item.optString("displayName", packageId),
+                        destination = destination,
+                        supportedPackageTypes = supported,
+                        minimumGameVersion = item.optString("minimumGameVersion").ifBlank { null },
+                        maximumGameVersion = item.optString("maximumGameVersion").ifBlank { null },
+                        knownContentDirectories = stringSet("knownContentDirectories"),
+                        recognizedArchiveSignatures = stringSet("recognizedArchiveSignatures"),
+                        loaderRequirements = loaders,
+                        engine = item.optString("engine", "Unknown"),
+                        authoritativePaths = stringSet("authoritativePaths").ifEmpty {
+                            setOf(destination)
+                        },
+                        modTypes = enumSet("modTypes").ifEmpty { supported },
+                        installationStrategies = stringSet("installationStrategies")
+                            .mapNotNull { runCatching { ModResolutionStrategy.valueOf(it) }.getOrNull() }
+                            .toSet()
+                            .ifEmpty { setOf(ModResolutionStrategy.KNOWN_GAME_PROFILE) },
+                        evidenceLevel = evidence,
+                        evidenceSources = stringSet("evidenceSources").toList(),
+                        versionRules = emptyMap()
+                    )
+                }
+            }
+        }.getOrElse { emptyList() }
+    }
 }
