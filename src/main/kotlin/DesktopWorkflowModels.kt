@@ -122,6 +122,7 @@ data class ModOperationBinding(
     val deviceSerial: String,
     val packageId: String,
     val gameVersion: String?,
+    val gameVersionCode: Long? = null,
     val archiveSha256: String,
     val analysisPlanId: String
 )
@@ -167,9 +168,34 @@ fun modOperationBindingMatches(
     binding != null &&
         serial == binding.deviceSerial &&
         app?.packageName == binding.packageId &&
-        app.versionName == binding.gameVersion &&
+        stableVersionMatches(app, binding) &&
         archiveSha256 == binding.archiveSha256 &&
         planId == binding.analysisPlanId
+
+private fun stableVersionMatches(app: InstalledQuestApp?, binding: ModOperationBinding): Boolean {
+    if (app == null) return false
+    return if (!app.versionName.isNullOrBlank()) {
+        app.versionName == binding.gameVersion
+    } else {
+        app.versionCode != null && app.versionCode == binding.gameVersionCode
+    }
+}
+
+fun bindConfirmedModPlan(
+    analysis: ModPackageAnalysis,
+    serial: String?,
+    selectedApp: InstalledQuestApp?,
+    archiveSha256: String?
+): ModInstallPlan? {
+    val plan = analysis.installPlan
+    if (serial.isNullOrBlank() || selectedApp == null ||
+        plan.reviewedApp != selectedApp ||
+        plan.archiveSha256 != archiveSha256 ||
+        plan.confirmation == null ||
+        plan.hasBlockingPreconditions
+    ) return null
+    return ModOperationBindingPolicy.bindExecutable(plan, serial)
+}
 
 data class ModSupportUiState(
     val serial: String,

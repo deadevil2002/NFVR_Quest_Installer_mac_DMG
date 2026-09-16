@@ -248,7 +248,15 @@ class ModsManager(
             detection,
             discovery
         )
-        analysis.copy(installPlan = analysis.installPlan.bindToDevice(serial))
+        // Classification must remain displayable without an executable
+        // operation binding (for example Gorilla APK patch requirements).
+        val deviceAwarePlan = analysis.installPlan.copy(reviewedDeviceSerial = serial)
+        val boundPlan = deviceAwarePlan.tryBindToDevice(serial)
+        return@withContext if (boundPlan == null) {
+            analysis.copy(installPlan = deviceAwarePlan)
+        } else {
+            analysis.copy(installPlan = boundPlan)
+        }
     }
 
     /**
@@ -457,8 +465,8 @@ class ModsManager(
             loaderDetection,
             discovery
         )
-        var freshPlan = runCatching { freshAnalysis.installPlan.bindToDevice(serial) }
-            .getOrElse { freshAnalysis.installPlan }
+        var freshPlan = freshAnalysis.installPlan.tryBindToDevice(serial)
+            ?: freshAnalysis.installPlan
         if (plan.confirmation != null && !plan.requiresExplicitConfirmation) {
             freshPlan = freshPlan.confirmDestination(plan.confirmation.token)
         }
@@ -544,7 +552,15 @@ class ModsManager(
                 }
                 val parent = destination.substringBeforeLast('/', profile.destination)
                 val mkdir = createModPath(serial, parent)
-                if (mkdir.exit != 0) return ModInstallResult(false, "فشل تجهيز وجهة المود: ${mkdir.err}")
+                if (mkdir.exit != 0) {
+                    DiagnosticLogger.info(
+                        "ADB mkdir failed for mod destination: exit=${mkdir.exit}, stderr=${mkdir.err}, stdout=${mkdir.out}"
+                    )
+                    return ModInstallResult(
+                        false,
+                        customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                    )
+                }
 
                 val source = extracted.getValue(mapping.sourcePath)
                 onProgress(
@@ -559,7 +575,13 @@ class ModsManager(
                     onProgress(ModExecutionProgress(ModInstallPhase.TRANSFERRING, fraction, "نقل ${source.name}"))
                 }
                 if (pushed.exit != 0) {
-                    return ModInstallResult(false, "فشل نقل ${source.name}: ${pushed.err.ifBlank { pushed.out }}")
+                    DiagnosticLogger.info(
+                        "ADB push failed for ${mapping.sourcePath}: exit=${pushed.exit}, stderr=${pushed.err}, stdout=${pushed.out}"
+                    )
+                    return ModInstallResult(
+                        false,
+                        customerModExecutionFailureMessage(ModExecutionFailureKind.TRANSFER)
+                    )
                 }
                 copiedBytes += mapping.sizeBytes
                 copiedFiles++
@@ -570,7 +592,13 @@ class ModsManager(
                 verifyRemoteFile(serial, mapping)
             }
             if (verificationErrors.isNotEmpty()) {
-                return ModInstallResult(false, verificationErrors.joinToString("\n"))
+                DiagnosticLogger.info(
+                    "Mod verification failed: ${verificationErrors.joinToString(" | ")}"
+                )
+                return ModInstallResult(
+                    false,
+                    customerModExecutionFailureMessage(ModExecutionFailureKind.VERIFY)
+                )
             }
             val appAfterVerification = scanInstalledQuestApps(serial)
                 .firstOrNull { it.packageName == reviewedApp.packageName }
@@ -584,7 +612,10 @@ class ModsManager(
         } catch (e: Exception) {
             ModInstallHistory.record(executionPlan, false, e.message ?: "error")
             DiagnosticLogger.error("فشل تنفيذ خطة تثبيت المود", e)
-            return ModInstallResult(false, "فشل التثبيت: ${e.message ?: "خطأ غير معروف"}")
+            return ModInstallResult(
+                false,
+                customerModExecutionFailureMessage(ModExecutionFailureKind.UNEXPECTED)
+            )
         } finally {
             tempRoot.deleteRecursively()
         }

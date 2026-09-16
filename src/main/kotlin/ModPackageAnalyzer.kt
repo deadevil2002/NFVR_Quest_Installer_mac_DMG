@@ -76,8 +76,10 @@ class ModPackageAnalyzer(
         loaderDetection: ModLoaderDetection? = null,
         directoryDiscovery: ModDirectoryDiscovery? = null
     ): ModPackageAnalysis {
+        var inspectedArchive: ArchiveMetadata? = null
         return try {
             val archive = inspectArchive(zipFile)
+            inspectedArchive = archive
             val rootManifestCandidates = ROOT_MANIFEST_NAMES.filter(archive.metadata::containsKey)
             if (rootManifestCandidates.size > 1) {
                 throw ModPackageException(
@@ -91,7 +93,7 @@ class ModPackageAnalyzer(
             when {
                 rootMod != null -> analyzeQmod(archive, rootMod, installedApp, loaderDetection)
                 rootPackage != null && isVirtualStump(rootPackage) ->
-                    analyzeVirtualStump(archive, rootPackage)
+                    analyzeVirtualStump(archive, rootPackage, installedApp)
                 rootNfvr != null -> analyzeNfvr(archive, rootNfvr, installedApp, loaderDetection)
                 isAndroidDataLayout(archive) ->
                     analyzeAndroidLayout(archive, installedApp, obb = false)
@@ -114,9 +116,18 @@ class ModPackageAnalyzer(
             e.diagnosticEntry?.let { entry ->
                 DiagnosticLogger.error("ZIP rejected entry '$entry': ${e.message.orEmpty()}")
             }
-            failed(e.message ?: "Package metadata is invalid.", e.diagnosticEntry)
+            failed(
+                e.message ?: "Package metadata is invalid.",
+                e.diagnosticEntry,
+                installedApp,
+                inspectedArchive?.identity
+            )
         } catch (e: Exception) {
-            failed("Unable to inspect ZIP metadata: ${e.message ?: "invalid archive"}.")
+            failed(
+                "Unable to inspect ZIP metadata: ${e.message ?: "invalid archive"}.",
+                installedApp = installedApp,
+                archiveIdentity = inspectedArchive?.identity
+            )
         }
     }
 
@@ -1322,13 +1333,16 @@ class ModPackageAnalyzer(
 
     private fun analyzeVirtualStump(
         archive: ArchiveMetadata,
-        json: JSONObject
+        json: JSONObject,
+        installedApp: InstalledQuestApp?
     ): ModPackageAnalysis {
         val plan = ModInstallPlan(
             outcome = ModInstallOutcome.BUILT_IN_GAME_CONTENT,
             packageType = ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
             strategy = ModInstallStrategy.NONE,
+            targetPackageId = installedApp?.packageName,
             archiveIdentity = archive.identity,
+            reviewedApp = installedApp,
             preconditions = listOf(
                 satisfied(
                     "BUILT_IN_GAME_CONTENT",
@@ -1380,7 +1394,9 @@ class ModPackageAnalyzer(
             packageType = ModPackageType.GENERIC_DATA,
             outcome = if (gorillaNative) ModInstallOutcome.APK_PATCH_REQUIRED else ModInstallOutcome.UNSUPPORTED,
             strategy = ModInstallStrategy.NONE,
+            targetPackageId = installedApp?.packageName,
             archiveIdentity = archive.identity,
+            reviewedApp = installedApp,
             preconditions = preconditions,
             patchRequirement = patchRequirement,
             resolution = resolution(
@@ -2135,6 +2151,7 @@ class ModPackageAnalyzer(
         }
         val plan = ModInstallPlan(
             packageType = ModPackageType.UNKNOWN,
+            targetPackageId = installedApp?.packageName,
             archiveIdentity = archive.identity,
             reviewedApp = installedApp,
             preconditions = listOf(blocked("UNKNOWN_FORMAT", "This mod format is not recognized or its destination cannot be determined safely.")),
@@ -2154,7 +2171,12 @@ class ModPackageAnalyzer(
         )
     }
 
-    private fun failed(message: String, diagnosticEntry: String? = null): ModPackageAnalysis =
+    private fun failed(
+        message: String,
+        diagnosticEntry: String? = null,
+        installedApp: InstalledQuestApp? = null,
+        archiveIdentity: ModArchiveIdentity? = null
+    ): ModPackageAnalysis =
         ModPackageAnalysis(
             ModPackageType.UNKNOWN,
             recognized = false,
@@ -2162,7 +2184,9 @@ class ModPackageAnalyzer(
             compatibility = ModCompatibility(false, listOf(message)),
             installPlan = ModInstallPlan(
                 outcome = ModInstallOutcome.UNSAFE_ARCHIVE,
-                archiveIdentity = null,
+                targetPackageId = installedApp?.packageName,
+                archiveIdentity = archiveIdentity,
+                reviewedApp = installedApp,
                 preconditions = listOf(
                     blocked(
                         "UNSAFE_ARCHIVE",
@@ -2181,21 +2205,29 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         metadata: Map<String, Any?> = emptyMap(),
         externalWorkflow: ModExternalWorkflow? = null
-    ): ModPackageAnalysis = ModPackageAnalysis(
+    ): ModPackageAnalysis {
+        // Every classified result carries the selected app identity.  Keeping
+        // this normalization at the result boundary protects less common
+        // analyzer branches from accidentally dropping it.
+        val normalizedPlan = plan.copy(
+            targetPackageId = plan.targetPackageId ?: plan.reviewedApp?.packageName
+        )
+        return ModPackageAnalysis(
         packageType = type,
         recognized = type != ModPackageType.UNKNOWN,
         message = message,
         compatibility = if (externalWorkflow != null) {
             ModCompatibility(true)
         } else {
-            ModCompatibility(plan.installable, plan.preconditions.filterNot { it.satisfied }.map { it.message })
+            ModCompatibility(normalizedPlan.installable, normalizedPlan.preconditions.filterNot { it.satisfied }.map { it.message })
         },
-        installPlan = plan,
+        installPlan = normalizedPlan,
         metadata = metadata,
         entries = archive.entries,
         externalWorkflow = externalWorkflow,
-        diagnostics = plan.diagnostics.distinct()
+        diagnostics = normalizedPlan.diagnostics.distinct()
     )
+    }
 
     private fun blockingMessage(plan: ModInstallPlan): String =
         plan.preconditions.firstOrNull { !it.satisfied }?.message

@@ -1215,16 +1215,19 @@ fun main() {
             val analysis = when (controllerResult) {
                 is QuestModAnalysisResult.Success -> controllerResult.analysis
                 is QuestModAnalysisResult.Stale -> {
-                    finishAnalysisFailure(controllerResult.message, stale = true)
+                    DiagnosticLogger.error("نتيجة تحليل مود قديمة: ${controllerResult.message}")
+                    finishAnalysisFailure("تغيرت حالة الجهاز أو الحزمة؛ أعد التحليل قبل المتابعة.", stale = true)
                     return
                 }
                 is QuestModAnalysisResult.Error -> {
-                    finishAnalysisFailure("فشل تحليل الحزمة: ${controllerResult.message}")
+                    DiagnosticLogger.error("فشل تحليل مود: ${controllerResult.message}")
+                    finishAnalysisFailure("تعذر تحليل الحزمة؛ تحقق من الملف ثم أعد المحاولة.")
                     return
                 }
             }
             val currentSerial = getAuthorizedSerialOrNull()
-            val planId = modAnalysisPlanId(serial, app, archiveSha256)
+            val executablePlan = analysis.installPlan.tryBindToDevice(serial)
+            val planId = executablePlan?.analysisPlanId
             if (currentSerial != serial ||
                 !modOperationStillCurrent(generation, file, app, serial)
             ) {
@@ -1237,22 +1240,19 @@ fun main() {
             modZipSha256 = archiveSha256
             modPlanId = planId
             destinationConfirmedPlanId = null
-            modOperationBinding = ModOperationBinding(
-                deviceSerial = serial,
-                packageId = app.packageName,
-                gameVersion = app.versionName,
-                archiveSha256 = archiveSha256,
-                analysisPlanId = planId
+            modOperationBinding = executablePlan?.operationBinding
+            appendModLog(
+                "تحليل الحزمة: ${customerPackageTypeMessage(analysis.packageType)} — " +
+                    customerAnalysisMessage(analysis)
             )
-            appendModLog("تحليل الحزمة: ${analysis.packageType} — ${analysis.message}")
             modAnalysisStatus = "اكتمل تحليل الحزمة."
         } catch (e: Exception) {
             modAnalysis = null
             unconfirmedModAnalysis = null
-            workflowController.questModsFailed(e.message ?: "خطأ غير معروف")
-            modAnalysisStatus = "فشل تحليل الحزمة: ${e.message ?: "خطأ غير معروف"}"
+            DiagnosticLogger.error("فشل تحليل حزمة مود", e)
+            workflowController.questModsFailed("تعذر تحليل الحزمة؛ أعد المحاولة.")
+            modAnalysisStatus = "تعذر تحليل الحزمة؛ تحقق من الملف ثم أعد المحاولة."
             appendModLog(modAnalysisStatus!!)
-            DiagnosticLogger.error("فشل تحليل حزمة مود ${modZipFile?.name.orEmpty()}", e)
         } finally {
             analyzingMod = false
             modExecutionProgress = null
@@ -1959,7 +1959,8 @@ fun main() {
             }
         } catch (e: Exception) {
             if (operationGeneration == null || operationGeneration == modOperationGeneration) {
-                appendModLog("خطأ غير متوقع: ${e.message}")
+                DiagnosticLogger.error("فشل غير متوقع أثناء تثبيت المود", e)
+                appendModLog(customerModExecutionFailureMessage(ModExecutionFailureKind.UNEXPECTED))
                 modExecutionProgress = ModsManager.ModExecutionProgress(
                     ModsManager.ModInstallPhase.FAILED,
                     null,
@@ -3109,21 +3110,37 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                           val current = modAnalysis
                                           if (!confirmed) {
                                               modAnalysis = unconfirmedModAnalysis ?: current
+                                               modOperationBinding = null
+                                               modPlanId = null
                                               destinationConfirmedPlanId = null
                                           } else if (current != null) {
                                               val token = current.installPlan.confirmation?.token
                                               val confirmedPlan = token?.let {
                                                   current.installPlan.confirmDestination(it)
                                               }
-                                              if (confirmedPlan != null &&
-                                                  confirmedPlan !== current.installPlan
-                                              ) {
-                                                  modAnalysis = current.copy(installPlan = confirmedPlan)
-                                                  destinationConfirmedPlanId = modPlanId
+                                               val serial = connectedDeviceSerial
+                                               val app = selectedApp
+                                               val archiveSha = modZipSha256
+                                               val boundConfirmed = confirmedPlan?.let {
+                                                   bindConfirmedModPlan(
+                                                       current.copy(installPlan = it),
+                                                       serial,
+                                                       app,
+                                                       archiveSha
+                                                   )
+                                               }
+                                               if (confirmedPlan != null && boundConfirmed != null) {
+                                                   val boundAnalysis = current.copy(installPlan = boundConfirmed)
+                                                   modAnalysis = boundAnalysis
+                                                   modOperationBinding = boundConfirmed.operationBinding
+                                                   modPlanId = boundConfirmed.analysisPlanId
+                                                   destinationConfirmedPlanId = boundConfirmed.analysisPlanId
                                               } else {
+                                                   modOperationBinding = null
+                                                   modPlanId = null
                                                   destinationConfirmedPlanId = null
                                                   appendModLog(
-                                                      "تعذر تأكيد الوجهة: لا يوجد رمز تأكيد صالح في الخطة."
+                                                       "تعذر تأكيد الوجهة: تغير الجهاز أو اللعبة أو الأرشيف؛ أعد التحليل."
                                                   )
                                               }
                                           }

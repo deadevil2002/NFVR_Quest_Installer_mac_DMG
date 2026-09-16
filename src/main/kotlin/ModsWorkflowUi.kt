@@ -786,7 +786,7 @@ private fun Modifier.registerDesktopDropTargetIf(
                 }
             }
             Text(
-                sanitizeModsUiText(analysis.message),
+                customerAnalysisMessage(analysis),
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             StatusNote(outcome.action, Icons.Default.Info, tone)
@@ -835,7 +835,7 @@ private fun Modifier.registerDesktopDropTargetIf(
     val allWarnings = deduplicateModWarnings(analysis.installPlan.preconditions)
     val loaderPreconditions = allWarnings.filter(::isLoaderPrecondition)
     val warnings = allWarnings.filterNot(::isLoaderPrecondition)
-    val displayedWarnings = allWarnings.map { it.message }.toSet()
+    val displayedWarnings = allWarnings.map { customerPreconditionMessage(it.code) }.toSet()
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         border = BorderStroke(1.dp, tone)
@@ -853,7 +853,7 @@ private fun Modifier.registerDesktopDropTargetIf(
                 Column(Modifier.weight(1f)) {
                     Text(outcome.title, style = MaterialTheme.typography.titleMedium, color = tone)
                     Text(
-                        sanitizeModsUiText(analysis.message),
+                        customerAnalysisMessage(analysis),
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -901,7 +901,7 @@ private fun Modifier.registerDesktopDropTargetIf(
                 Text("المتطلبات والتنبيهات", style = MaterialTheme.typography.titleMedium)
                 warnings.forEach { pre ->
                     StatusNote(
-                        sanitizeModsUiText(pre.message),
+                        customerPreconditionMessage(pre.code),
                         if (pre.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning,
                         if (pre.satisfied) MaterialTheme.colorScheme.tertiary else warningColor()
                     )
@@ -910,8 +910,8 @@ private fun Modifier.registerDesktopDropTargetIf(
             analysis.compatibility.reasons
                 .distinct()
                 .filterNot(displayedWarnings::contains)
-                .forEach { reason ->
-                    StatusNote(sanitizeModsUiText(reason), Icons.Default.Warning, warningColor())
+                .forEach { _ ->
+                    StatusNote("لا يمكن متابعة التثبيت بهذه المتطلبات.", Icons.Default.Warning, warningColor())
                 }
             OutlinedButton(onClick = onCopyDiagnostics) {
                 Text("نسخ معلومات الفحص")
@@ -952,7 +952,7 @@ private fun LoaderRequirementDetails(
         } else {
             legacyPreconditions.forEach { precondition ->
                 StatusNote(
-                    sanitizeModsUiText(precondition.message),
+                    customerPreconditionMessage(precondition.code),
                     if (precondition.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning,
                     if (precondition.satisfied) {
                         MaterialTheme.colorScheme.tertiary
@@ -989,9 +989,11 @@ private fun LoaderRequirementDetails(
     StatusNote("المطلوب: $requested", Icons.Default.Info, tint)
     StatusNote("الحالة: $statusText", statusIcon, tint)
 
-    requirement.message
-        .takeIf { it.isNotBlank() }
-        ?.let { StatusNote(sanitizeModsUiText(it), Icons.Default.Info, tint) }
+    StatusNote(
+        customerLoaderRequirementMessage(requirement),
+        Icons.Default.Info,
+        tint
+    )
 
     val evidence = requirement.detection
         ?.let { detection ->
@@ -1008,9 +1010,11 @@ private fun LoaderRequirementDetails(
         .orEmpty()
     if (evidence.isNotEmpty()) {
         Text("الدليل المقروء", style = MaterialTheme.typography.labelMedium)
-        evidence.forEach { detail ->
-            StatusNote(detail, Icons.Default.Info, tint)
-        }
+        StatusNote(
+            "تم التحقق من ${evidence.size} ${if (evidence.size == 1) "إشارة" else "إشارات"} محلية لحالة المحمّل. التفاصيل التقنية متاحة في التشخيصات.",
+            Icons.Default.Info,
+            tint
+        )
     } else if (requirement.detection != null) {
         StatusNote(
             "تم فحص حالة المحمّل بأدلة قراءة فقط؛ لم يتوفر تفصيل إضافي.",

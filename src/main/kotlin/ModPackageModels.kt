@@ -104,6 +104,83 @@ enum class ModInstallOutcome {
     UNSAFE_ARCHIVE
 }
 
+fun customerPreconditionMessage(code: String): String = when {
+    code == "APK_PATCH_REQUIRED" -> "تحتاج هذه الحزمة إلى تصحيح آمن لتطبيق اللعبة قبل التثبيت."
+    code.contains("LOADER", ignoreCase = true) -> "يجب تجهيز محمّل المودات المطلوب ثم إعادة التحليل."
+    code.contains("TARGET_APP_REQUIRED", ignoreCase = true) -> "اختر لعبة مثبتة على النظارة أولًا."
+    code.contains("STALE", ignoreCase = true) -> "تغيرت حالة الجهاز أو الحزمة؛ أعد التحليل قبل المتابعة."
+    code.contains("UNSAFE", ignoreCase = true) ||
+        code.contains("CORRUPT", ignoreCase = true) ||
+        code.contains("MALFORMED", ignoreCase = true) ||
+        code.contains("TRAVERSAL", ignoreCase = true) -> "الأرشيف غير آمن أو تالف ولا يمكن استخدامه."
+    code.contains("UNSUPPORTED", ignoreCase = true) ||
+        code.contains("UNKNOWN", ignoreCase = true) -> "صيغة الحزمة غير مدعومة حاليًا."
+    code.contains("CONFIRM", ignoreCase = true) -> "يجب تأكيد الوجهة المقترحة قبل التثبيت."
+    else -> "لا يمكن تثبيت هذه الحزمة بهذه الخطة."
+}
+
+fun customerAnalysisMessage(analysis: ModPackageAnalysis): String = when {
+    analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED ->
+        customerPreconditionMessage("APK_PATCH_REQUIRED")
+    analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ->
+        customerPreconditionMessage("REQUIRES_MOD_LOADER")
+    analysis.outcome == ModInstallOutcome.UNSAFE_ARCHIVE ->
+        customerPreconditionMessage("UNSAFE_ARCHIVE")
+    analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ->
+        "هذا المحتوى مدمج وتديره اللعبة؛ لا يحتاج إلى نقل مباشر."
+    analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
+        analysis.packageType == ModPackageType.UNKNOWN || !analysis.recognized ->
+        customerPreconditionMessage("UNSUPPORTED")
+    else -> analysis.installPlan.preconditions.firstOrNull { !it.satisfied }?.let {
+        customerPreconditionMessage(it.code)
+    } ?: if (analysis.installable) {
+        "الحزمة جاهزة للتثبيت الآمن."
+    } else {
+        "لا يمكن تثبيت هذه الحزمة بهذه الخطة."
+    }
+}
+
+fun customerPackageTypeMessage(type: ModPackageType): String = when (type) {
+    ModPackageType.QMOD -> "حزمة QMOD"
+    ModPackageType.NFVR_MANIFEST -> "حزمة NFVR"
+    ModPackageType.ANDROID_DATA_LAYOUT -> "تخطيط بيانات Android"
+    ModPackageType.ANDROID_OBB_LAYOUT -> "تخطيط OBB لنظام Android"
+    ModPackageType.BONELAB_NATIVE_CONTENT -> "محتوى BONELAB"
+    ModPackageType.BONELAB_CODE_MOD -> "مود برمجي لـ BONELAB"
+    ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> "محتوى Gorilla Tag تديره اللعبة"
+    ModPackageType.KNOWN_GAME_PROFILE -> "حزمة للعبة معروفة"
+    ModPackageType.GENERIC_DATA -> "حزمة بيانات عامة"
+    ModPackageType.UNKNOWN -> "صيغة غير معروفة"
+}
+
+fun customerLoaderRequirementMessage(requirement: ModLoaderRequirement): String =
+    when (requirement.status) {
+        ModLoaderStatus.DETECTED ->
+            "تم العثور على دليل موثوق للمحمّل المطلوب على اللعبة المحددة."
+        ModLoaderStatus.NOT_DETECTED ->
+            "لم يتم العثور على المحمّل المطلوب على اللعبة المحددة."
+        ModLoaderStatus.UNKNOWN ->
+            "تعذر التحقق من حالة المحمّل المطلوب على اللعبة المحددة."
+    }
+
+enum class ModExecutionFailureKind {
+    PREPARE_DESTINATION,
+    TRANSFER,
+    VERIFY,
+    UNEXPECTED
+}
+
+fun customerModExecutionFailureMessage(kind: ModExecutionFailureKind): String = when (kind) {
+    ModExecutionFailureKind.PREPARE_DESTINATION ->
+        "تعذر تجهيز وجهة المود على النظارة."
+    ModExecutionFailureKind.TRANSFER ->
+        "تعذر نقل أحد ملفات المود إلى النظارة."
+    ModExecutionFailureKind.VERIFY ->
+        "تعذر التحقق من الملفات المنقولة على النظارة."
+    ModExecutionFailureKind.UNEXPECTED ->
+        "تعذر إكمال تثبيت المود. راجع التشخيصات ثم أعد المحاولة."
+}
+
 /**
  * A package can be installable by NFVR, or intentionally handed to a
  * browser-based service.  Keeping this separate from installability prevents
@@ -311,6 +388,7 @@ data class ModInstallPlan(
     val totalFiles: Int = mappings.size,
     val archiveIdentity: ModArchiveIdentity? = null,
     val reviewedApp: InstalledQuestApp? = null,
+    val reviewedDeviceSerial: String? = null,
     val loaderRequirement: ModLoaderRequirement? = null,
     val diagnostics: List<String> = emptyList(),
     val resolution: ModStrategyDecision = ModStrategyDecision(
@@ -360,10 +438,19 @@ data class ModInstallPlan(
                 deviceSerial = normalizedSerial,
                 packageId = app.packageName,
                 gameVersion = app.versionName,
+                gameVersionCode = app.versionCode,
                 archiveSha256 = archive.sha256,
                 analysisPlanId = id
             )
         )
+    }
+
+    /**
+     * Binding is an execution capability, not part of displaying analysis.
+     * Non-installable classifications intentionally return null.
+     */
+    fun tryBindToDevice(serial: String): ModInstallPlan? {
+        return ModOperationBindingPolicy.bindExecutable(this, serial)
     }
 
     /**
@@ -389,6 +476,29 @@ data class ModInstallPlan(
 
     fun progress(copiedBytes: Long, copiedFiles: Int): ModInstallProgress =
         ModInstallProgress(copiedBytes, totalBytes, copiedFiles, totalFiles)
+}
+
+/**
+ * Pure binding policy shared by device-aware analysis and the UI.  Analysis
+ * classifications are useful without an operation binding; only a complete,
+ * executable plan may be bound to a device.
+ */
+object ModOperationBindingPolicy {
+    fun bindExecutable(plan: ModInstallPlan, serial: String): ModInstallPlan? {
+        val normalizedSerial = serial.trim()
+        if (!plan.installable ||
+            plan.outcome != ModInstallOutcome.DIRECT_INSTALL_READY ||
+            plan.mappings.isEmpty() ||
+            plan.hasBlockingPreconditions ||
+            plan.reviewedApp == null ||
+            plan.archiveIdentity == null ||
+            normalizedSerial.isEmpty() ||
+            (plan.reviewedDeviceSerial != null &&
+                plan.reviewedDeviceSerial != normalizedSerial) ||
+            (plan.reviewedApp.versionName.isNullOrBlank() && plan.reviewedApp.versionCode == null)
+        ) return null
+        return runCatching { plan.bindToDevice(normalizedSerial) }.getOrNull()
+    }
 }
 
 data class ModInstallProgress(
