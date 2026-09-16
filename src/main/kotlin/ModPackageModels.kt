@@ -475,7 +475,14 @@ data class GameModProfile(
     ),
     val evidenceLevel: ModEvidenceLevel = ModEvidenceLevel.HEURISTIC,
     val evidenceSources: List<String> = emptyList(),
-    val versionRules: Map<String, String> = emptyMap()
+    val versionRules: Map<String, String> = emptyMap(),
+    /**
+     * A profile may classify a game without authorizing a destination.  This
+     * is required for Gorilla Tag until an authoritative Quest contract is
+     * available; only an explicit QMOD plus authenticated loader evidence can
+     * then supply canonical loader destinations.
+     */
+    val writeAuthorized: Boolean = true
 )
 
 /**
@@ -505,7 +512,8 @@ object GameModProfileRegistry {
                     val item = root.optJSONObject(index) ?: return@mapNotNull null
                     val packageId = item.optString("packageId").trim()
                     val destination = item.optString("destination").trim()
-                    if (packageId.isBlank() || destination.isBlank()) return@mapNotNull null
+                    if (packageId.isBlank() || (destination.isBlank() &&
+                            item.optBoolean("writeAuthorized", true))) return@mapNotNull null
                     fun stringSet(key: String): Set<String> =
                         item.optJSONArray(key)?.let { array ->
                             (0 until array.length()).mapNotNull {
@@ -537,7 +545,7 @@ object GameModProfileRegistry {
                         loaderRequirements = loaders,
                         engine = item.optString("engine", "Unknown"),
                         authoritativePaths = stringSet("authoritativePaths").ifEmpty {
-                            setOf(destination)
+                            destination.takeIf { it.isNotBlank() }?.let { setOf(it) } ?: emptySet()
                         },
                         modTypes = enumSet("modTypes").ifEmpty { supported },
                         installationStrategies = stringSet("installationStrategies")
@@ -546,7 +554,8 @@ object GameModProfileRegistry {
                             .ifEmpty { setOf(ModResolutionStrategy.KNOWN_GAME_PROFILE) },
                         evidenceLevel = evidence,
                         evidenceSources = stringSet("evidenceSources").toList(),
-                        versionRules = emptyMap()
+                        versionRules = emptyMap(),
+                        writeAuthorized = item.optBoolean("writeAuthorized", true)
                     )
                 }
             }

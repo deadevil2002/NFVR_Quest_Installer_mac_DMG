@@ -488,8 +488,19 @@ class ModsManager(
         )
         val profile = executionProfile(executionPlan)
             ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
-        if (executionPlan.destinationRoot != profile.destination) {
+        if (profile.writeAuthorized && executionPlan.destinationRoot != profile.destination) {
             return ModInstallResult(false, "وجهة الخطة لا تطابق ملف تعريف اللعبة الموثوق.")
+        }
+        if (!profile.writeAuthorized &&
+            (executionPlan.packageType !in setOf(
+                    ModPackageType.QMOD,
+                    ModPackageType.ANDROID_DATA_LAYOUT,
+                    ModPackageType.ANDROID_OBB_LAYOUT
+                ) ||
+                executionPlan.mappings.isEmpty() ||
+                executionPlan.mappings.any { !isApprovedDestination(it.destinationPath, profile, executionPlan) })
+        ) {
+            return ModInstallResult(false, "ملف تعريف اللعبة تصنيفي فقط؛ لا توجد وجهة محمّل موثقة قابلة للكتابة.")
         }
 
         val tempRoot = Files.createTempDirectory("NFVR_ModPlan_").toFile()
@@ -673,6 +684,14 @@ class ModsManager(
             plan.packageType == ModPackageType.NFVR_MANIFEST
         ) {
             val target = plan.targetPackageId ?: return false
+            if (target == ModPackageAnalyzer.GORILLA_TAG_PACKAGE_ID &&
+                plan.packageType == ModPackageType.QMOD
+            ) {
+                val mods = "/sdcard/Android/data/$target/files/mods"
+                val libs = "/sdcard/Android/data/$target/files/libs"
+                return path == mods || path.startsWith("$mods/") ||
+                    path == libs || path.startsWith("$libs/")
+            }
             return ModDestinationPolicy.isPackageBound(path, target)
         }
         return path == profile.destination || path.startsWith("${profile.destination}/")
@@ -680,6 +699,11 @@ class ModsManager(
 
     private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
         val target = plan.targetPackageId ?: return null
+        // Never replace Gorilla Tag's non-authorizing registry profile with
+        // the writable synthetic profile used for ordinary games.
+        if (target == ModPackageAnalyzer.GORILLA_TAG_PACKAGE_ID) {
+            return GameModProfileRegistry.findByPackageId(target)
+        }
         if (plan.strategy == ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY) {
             val root = plan.destinationRoot ?: return null
             return GameModProfile(

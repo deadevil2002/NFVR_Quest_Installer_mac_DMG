@@ -221,6 +221,7 @@ fun ModsWorkflowUi(
     analyzing: Boolean,
     analysis: ModPackageAnalysis?,
     onAnalyze: () -> Unit,
+    analysisStatus: String? = null,
     installing: Boolean,
     executionProgress: ModsManager.ModExecutionProgress?,
     onInstall: () -> Unit,
@@ -421,14 +422,40 @@ fun ModsWorkflowUi(
                     }
                 }
                 else if (analysis != null) item {
-                    CompletedSummaryCard(
-                        "التحليل",
-                        if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
-                            "محتوى تديره اللعبة"
-                        } else {
-                            "اكتمل فحص الحزمة"
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CompletedSummaryCard(
+                            "التحليل",
+                            if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
+                                "محتوى تديره اللعبة"
+                            } else {
+                                "اكتمل فحص الحزمة"
+                            }
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                clearFocusBeforeModsTransition(
+                                    { focusManager.clearFocus(force = true) },
+                                    onAnalyze
+                                )
+                            },
+                            enabled = connected && selectedApp != null &&
+                                !selectedZipFilename.isNullOrBlank() && !analyzing && !installing
+                        ) {
+                            if (analyzing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Default.Refresh, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (analyzing) "جارٍ تحليل الحزمة…" else "إعادة تحليل الحزمة")
                         }
-                    )
+                    }
+                }
+                analysisStatus?.takeIf { it.isNotBlank() }?.let { status ->
+                    item {
+                        StatusNote(
+                            status,
+                            if (analyzing) Icons.Default.Info else Icons.Default.Warning,
+                            if (analyzing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
                 if (selectedApp != null && modSupport != null) {
                     item { ModSupportCard(modSupport) }

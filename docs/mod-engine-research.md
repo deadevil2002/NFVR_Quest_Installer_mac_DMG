@@ -4,6 +4,83 @@ These notes record the external behavior used by the backend implementation.
 NFVR implements the relevant contracts independently; it does not copy code
 from these projects.
 
+## 2.3.1 correction: Gorilla Tag Quest is not PC Gorilla Tag
+
+The selected Quest package is exactly `com.AnotherAxiom.GorillaTag`.  Review of
+the current public evidence did **not** find an authoritative, versioned
+Gorilla Tag Quest loader compatibility contract (loader version, game version,
+and canonical destination together).  NFVR therefore registers Gorilla Tag
+only as a conservative classification: a package-matched QMOD that explicitly
+requests QuestLoader may use QuestPatcher's canonical loader destination *only
+after* authenticated `modded.json` evidence says QuestLoader for the selected
+app.  Scotland2 remains generic evidence only and does not authorize Gorilla
+Tag.  Native/code payloads
+are reported as `APK_PATCH_REQUIRED`; an ordinary Gorilla ZIP is reported as
+unknown/unsupported with an actionable reason.  NFVR never invents a Gorilla
+`Android/data`, `ModData`, or `Mods` path.
+
+### Malachi Mod Manager (observed PC project, not a Quest implementation)
+
+- Project: [Malachi Mod Manager](https://github.com/Malachi-the-modder/Mod-Manager)
+- Release reviewed: [Mod_Manager](https://github.com/Malachi-the-modder/Mod-Manager/releases/tag/Mod_Manager)
+- The repository/release describes a Windows desktop Gorilla Tag mod manager.
+  Its installation model is PC Gorilla Tag with BepInEx, not a standalone
+  Android/Meta Quest package.
+- Observed PC artifacts are rooted at the Windows Gorilla Tag game directory
+  (the directory containing `Gorilla Tag.exe`) and include
+  `BepInEx/core/`, `BepInEx/plugins/`, `BepInEx/config/`,
+  `BepInEx/LogOutput.log`, `winhttp.dll`, and `doorstop_config.ini`; the
+  release also installs/updates its Windows-side `ModManager.exe`.  These are
+  exact Windows filesystem names and loader artifacts, not Quest paths.
+- It is not evidence of a Quest destination, Quest APK patch, QuestLoader,
+  or Scotland2 compatibility.  No PC path, BepInEx class, executable, or
+  release binary is used by NFVR's Quest engine.  The only lesson incorporated
+  is architectural separation: a PC loader workflow must not be silently
+  conflated with a standalone Quest workflow.
+- Licensing/reuse caveat: the project and release were consulted as public
+  provenance only; NFVR does not execute `ModManager.exe`, copy binaries, or
+  copy source.  Verify the repository/release license and release contents
+  again before making any future PC integration decision.
+
+This finding is based on the repository and tagged release pages above, not on
+the release's marketing wording alone.  Public repositories and releases can
+change; the observation is time-sensitive and is not a claim that a future
+release cannot add Quest support.
+
+### Gorilla Tag Quest source review and recency caveat
+
+The following independent sources were compared:
+
+- [QuestPatcher](https://github.com/Lauriethefish/QuestPatcher) and its
+  [QMOD specification](https://github.com/Lauriethefish/QuestPatcher.QMod/blob/main/SPECIFICATION.md)
+  for package binding, QMOD fields, and the authenticated `modded.json` tag.
+- [QuestLoader](https://github.com/sc2ad/QuestLoader) as the loader ecosystem
+  represented by QMOD's loader-relative fields.
+- [Scotland2](https://github.com/sc2ad/scotland2) for its generic loader
+  directory conventions.
+- [Gorilla Tag Quest modding projects/searchable public repositories](https://github.com/search?q=Gorilla+Tag+Quest+loader&type=repositories)
+  for current package/game-specific evidence.
+- [Malachi Mod Manager](https://github.com/Malachi-the-modder/Mod-Manager) and
+  its tagged release for the separate Windows/BepInEx ecosystem.
+
+QuestPatcher and Scotland2 document generic mechanisms and Beat Saber-oriented
+examples; they do not establish that current `com.AnotherAxiom.GorillaTag`
+accepts those loaders or paths.  In particular, Scotland2 documentation is
+not treated as Gorilla compatibility evidence.  The engine consequently
+accepts no guessed Gorilla destination and makes APK patching a classification
+only, not an operation.  These sources were reviewed for this 2.3.1
+correction; GitHub content, game versions, and loader compatibility are
+mutable, so this is a dated evidence boundary rather than a promise of
+ongoing compatibility.
+
+An archive that explicitly contains
+`Android/data/com.AnotherAxiom.GorillaTag/...` is different from a discovered
+`Mods`/`plugins`/`ModData` directory: the universal Android-layout rule binds
+every mapping to the exact selected package and does not infer a mod
+destination. That explicit package-bound layout remains allowed. Directory
+discovery is read-only evidence only and is rejected for Gorilla Tag before
+confirmation; confirmation cannot override the non-authorizing profile.
+
 ## QuestPatcher QMOD
 
 - [QMOD format specification](https://github.com/Lauriethefish/QuestPatcher.QMod/blob/main/SPECIFICATION.md)

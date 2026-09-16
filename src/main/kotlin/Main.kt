@@ -652,6 +652,11 @@ fun main() {
     val bundledAdb = remember { BundledAdb(host) }
     val adb = remember { AdbClient(bundledAdb) }
     val modsManager = remember { ModsManager(adb) }
+    val modAnalysisController = remember {
+        QuestModAnalysisController { request ->
+            modsManager.analyzeModPackage(request.serial, request.archive, request.app)
+        }
+    }
     LaunchedEffect(Unit) {
         DiagnosticLogger.info("بدء تشغيل NFVR Quest Installer ${AppInfo.version}")
     }
@@ -703,6 +708,7 @@ fun main() {
     var modZipSha256 by remember { mutableStateOf<String?>(null) }
     var lastModArchiveDirectory by remember { mutableStateOf<File?>(null) }
     var modAnalysis by remember { mutableStateOf<ModPackageAnalysis?>(null) }
+    var modAnalysisStatus by remember { mutableStateOf<String?>(null) }
     var unconfirmedModAnalysis by remember { mutableStateOf<ModPackageAnalysis?>(null) }
     var modOperationBinding by remember { mutableStateOf<ModOperationBinding?>(null) }
     var modPlanId by remember { mutableStateOf<String?>(null) }
@@ -713,13 +719,55 @@ fun main() {
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
     var modLogText by remember { mutableStateOf("") }
     var modInstallDeviceLost by remember { mutableStateOf(false) }
-    var pickerOpen by remember { mutableStateOf(false) }
+    var gamePickerOpen by remember { mutableStateOf(false) }
+    var modPickerOpen by remember { mutableStateOf(false) }
     var pickerStatus by remember { mutableStateOf<String?>(null) }
     var pickerAttemptId by remember { mutableStateOf(0L) }
     val localTimeFormatter = remember { NfvrTimeFormatter() }
     val deviceGeneration = remember { DeviceSerialGeneration() }
     val activityHistory = remember { BoundedActivityHistory() }
     val uiScope = rememberCoroutineScope()
+    val workflowController = remember { DesktopWorkflowController() }
+    var pcvrState by remember { mutableStateOf(workflowController.pcvrState) }
+    var pcvrJob by remember { mutableStateOf<Job?>(null) }
+    fun startPcvrChecks(advanced: Boolean) {
+        if (pcvrJob?.isActive == true) return
+        workflowController.startPcvr(advanced)
+        pcvrState = workflowController.pcvrState
+        val job = uiScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    if (advanced) PcvrChecker.runAdvancedChecks() else PcvrChecker.runQuickChecks()
+                }
+                val (checks, info) = result
+                val message = when {
+                        PcvrChecker.isReady(checks) && checks.none { it.status == PcvrCheckStatus.UNKNOWN } ->
+                            "الكمبيوتر يطابق الفحوصات المتاحة مبدئيًا لتشغيل PCVR."
+                        PcvrChecker.isReady(checks) ->
+                            "لا يوجد فشل معروف؛ بعض القياسات غير معروفة وتحتاج تحققًا يدويًا."
+                        checks.any { it.status == PcvrCheckStatus.UNKNOWN } ->
+                            "اكتمل الفحص، لكن تعذر التحقق من بعض البيانات."
+                        else -> "اكتمل الفحص. راجع العناصر التي تحتاج إلى معالجة."
+                    }
+                workflowController.pcvrSucceeded(checks, info, message)
+                pcvrState = workflowController.pcvrState
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                DiagnosticLogger.error("فشل فحص جاهزية PCVR", error)
+                workflowController.pcvrFailed("تعذر إكمال فحص PCVR.")
+                pcvrState = workflowController.pcvrState
+            } finally {
+                if (pcvrJob === coroutineContext[Job]) {
+                    pcvrJob = null
+                    workflowController.pcvrJob(null)
+                    pcvrState = workflowController.pcvrState
+                }
+            }
+        }
+        pcvrJob = job
+        workflowController.pcvrJob(job)
+        pcvrState = workflowController.pcvrState
+    }
     val focusClearRegistry = remember { UiFocusClearRegistry() }
     val scanRequestCoalescer = remember { ScanRequestCoalescer() }
     val appScanMutex = remember { Mutex() }
@@ -784,6 +832,7 @@ fun main() {
         if (clearFocus) focusClearRegistry.clearBeforeUiMutation()
         modOperationGeneration += 1L
         modAnalysis = null
+        modAnalysisStatus = null
         unconfirmedModAnalysis = null
         modOperationBinding = null
         modPlanId = null
@@ -1094,36 +1143,53 @@ fun main() {
     }
 
     suspend fun analyzeSelectedMod() {
+        // Publish this before any mutex, device query, hashing, or suspension.
+        // A click must never look like a no-op on a slow Windows/ADB machine.
+        analyzingMod = true
+        workflowController.startQuestMods(
+            selectedApp,
+            modZipFile?.absolutePath,
+            SafeDeviceIdentity(connectedDeviceSerial, connectedDeviceModel, hasAuthorizedDevice)
+        )
+        fun finishAnalysisFailure(message: String, stale: Boolean = false) {
+            if (stale) workflowController.questModsStale(message)
+            else workflowController.questModsFailed(message)
+            modAnalysisStatus = message
+            appendModLog(message)
+        }
+        modAnalysisStatus = "جارٍ تحليل الحزمة…"
+        appendModLog("جارٍ تحليل الحزمة…")
         if (!modOperationMutex.tryLock()) {
-            appendModLog("هناك عملية مود أخرى قيد التنفيذ.")
+            finishAnalysisFailure("تعذر التحليل: توجد عملية مود أخرى قيد التنفيذ.")
+            analyzingMod = false
             return
         }
         try {
             val file = modZipFile
             val app = selectedApp
             if (file == null) {
-                appendModLog("اختر ملف المود قبل التحليل.")
+                finishAnalysisFailure("تعذر التحليل: اختر ملف ZIP أولًا.")
                 return
             }
             if (app == null) {
-                appendModLog("اختر لعبة مثبتة قبل تحليل المود.")
+                finishAnalysisFailure("تعذر التحليل: اختر لعبة Quest مثبتة أولًا.")
                 return
             }
             val requestGeneration = modOperationGeneration
             val serial = getAuthorizedSerialOrNull()
             if (serial == null) {
-                appendModLog("لا يوجد جهاز مصرح به لتحليل المود.")
+                finishAnalysisFailure("تعذر التحليل: لا يوجد جهاز Quest مصرح به.")
                 return
             }
             if (requestGeneration != modOperationGeneration ||
                 !sameModFileSnapshot(modZipFile, file) ||
                 !sameInstalledAppSnapshot(selectedApp, app)
             ) {
-                appendModLog("تم إلغاء التحليل لأن اختيار الحزمة أو اللعبة تغيّر.")
+                finishAnalysisFailure("تم رفض التحليل: تغيّر اختيار الحزمة أو اللعبة.", stale = true)
                 return
             }
             if (connectedDeviceSerial != null && connectedDeviceSerial != serial) {
-                appendModLog("تغيّر جهاز Quest أثناء تجهيز التحليل. أعد المحاولة.")
+                finishAnalysisFailure("تم رفض التحليل: تغيّر جهاز Quest. أعد المحاولة.", stale = true)
                 return
             }
             // A scan may not have published the serial yet when the user
@@ -1138,18 +1204,35 @@ fun main() {
                 null,
                 "تحليل بنية الحزمة وبياناتها"
             )
-            val analysis = withContext(Dispatchers.IO) {
-                modsManager.analyzeModPackage(serial, file, app)
+            val controllerResult = withContext(Dispatchers.IO) {
+                modAnalysisController.analyze(
+                    QuestModAnalysisRequest(serial, app, file, archiveSha256),
+                    isCurrent = {
+                        modOperationStillCurrent(generation, file, app, serial)
+                    }
+                )
+            }
+            val analysis = when (controllerResult) {
+                is QuestModAnalysisResult.Success -> controllerResult.analysis
+                is QuestModAnalysisResult.Stale -> {
+                    finishAnalysisFailure(controllerResult.message, stale = true)
+                    return
+                }
+                is QuestModAnalysisResult.Error -> {
+                    finishAnalysisFailure("فشل تحليل الحزمة: ${controllerResult.message}")
+                    return
+                }
             }
             val currentSerial = getAuthorizedSerialOrNull()
             val planId = modAnalysisPlanId(serial, app, archiveSha256)
             if (currentSerial != serial ||
                 !modOperationStillCurrent(generation, file, app, serial)
             ) {
-                appendModLog("تم تجاهل نتيجة تحليل قديمة بعد تغيّر الحزمة أو اللعبة أو الجهاز.")
+                finishAnalysisFailure("تم رفض نتيجة قديمة: تغيّرت النظارة أو اللعبة أو الحزمة.", stale = true)
                 return
             }
             modAnalysis = analysis
+            workflowController.questModsSucceeded(analysis)
             unconfirmedModAnalysis = analysis
             modZipSha256 = archiveSha256
             modPlanId = planId
@@ -1162,10 +1245,13 @@ fun main() {
                 analysisPlanId = planId
             )
             appendModLog("تحليل الحزمة: ${analysis.packageType} — ${analysis.message}")
+            modAnalysisStatus = "اكتمل تحليل الحزمة."
         } catch (e: Exception) {
             modAnalysis = null
             unconfirmedModAnalysis = null
-            appendModLog("فشل تحليل الحزمة: ${e.message ?: "خطأ غير معروف"}")
+            workflowController.questModsFailed(e.message ?: "خطأ غير معروف")
+            modAnalysisStatus = "فشل تحليل الحزمة: ${e.message ?: "خطأ غير معروف"}"
+            appendModLog(modAnalysisStatus!!)
             DiagnosticLogger.error("فشل تحليل حزمة مود ${modZipFile?.name.orEmpty()}", e)
         } finally {
             analyzingMod = false
@@ -1312,6 +1398,7 @@ fun main() {
         }
 
         isInstalling = true
+        workflowController.startGameInstall(queue.firstOrNull()?.folder?.absolutePath)
         installPhase = transitionInstallPhase(
             GameInstallPhase.IDLE,
             InstallPhaseTransition.BEGIN_PREFLIGHT
@@ -1668,6 +1755,11 @@ fun main() {
             warningText = "${safeUiMsg(e)}\n\n${translateAdbFailure(e.message.orEmpty())}"
             statusText = "الحالة: تعذر الإكمال"
         } finally {
+            if (installPhase == GameInstallPhase.COMPLETED) {
+                workflowController.gameInstallSucceeded("اكتمل التثبيت")
+            } else {
+                workflowController.gameInstallFailed(warningText ?: "تعذر إكمال التثبيت")
+            }
             isInstalling = false
             installMutex.unlock()
         }
@@ -2086,21 +2178,17 @@ fun main() {
                 }
                 val showSettings = remember { mutableStateOf(false) }
                 fun requestTabChange(tab: Int) {
-                    if (pickerOpen) return
                     uiScope.launch(Dispatchers.Main.immediate) {
-                        if (pickerOpen) return@launch
                         focusManager.clearFocus(force = true)
                         yield()
-                        if (!pickerOpen) selectedTab = tab
+                        selectedTab = tab
                     }
                 }
                 fun requestSettings(open: Boolean) {
-                    if (pickerOpen) return
                     uiScope.launch(Dispatchers.Main.immediate) {
-                        if (pickerOpen) return@launch
                         focusManager.clearFocus(force = true)
                         yield()
-                        if (!pickerOpen) showSettings.value = open
+                        showSettings.value = open
                     }
                 }
                 DisposableEffect(focusManager) {
@@ -2157,7 +2245,7 @@ fun main() {
 
                              IconButton(
                                  onClick = { requestSettings(true) },
-                                 enabled = !pickerOpen
+                                 enabled = true
                              ) {
                                 Icon(Icons.Default.Settings, contentDescription = "الإعدادات")
                             }
@@ -2224,7 +2312,7 @@ fun main() {
                                         Spacer(Modifier.weight(1f))
                                          OutlinedButton(
                                              onClick = { requestSettings(false) },
-                                             enabled = !pickerOpen
+                                             enabled = true
                                          ) { Text("إغلاق") }
                                     }
 
@@ -2533,21 +2621,21 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Tab(
                             selected = selectedTab == 0,
                              onClick = { requestTabChange(0) },
-                             enabled = !pickerOpen,
+                             enabled = true,
                             text = { Text("تثبيت الألعاب") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 1,
                              onClick = { requestTabChange(1) },
-                             enabled = !pickerOpen,
+                             enabled = true,
                             text = { Text("المودات") },
                             icon = { Icon(Icons.Default.Build, contentDescription = null) }
                         )
                         Tab(
                             selected = selectedTab == 2,
                              onClick = { requestTabChange(2) },
-                             enabled = !pickerOpen,
+                             enabled = true,
                             text = { Text("فحص جاهزية PCVR") },
                             icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                         )
@@ -2610,29 +2698,31 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         ) {
                                             Button(
                                                 onClick = {
-                                                     if (pickerOpen) return@Button
                                                     if (!requireDeviceOrWarn(::appendLog)) return@Button
+                                                    if (!workflowController.beginPicker(DesktopPickerSection.GAME_INSTALL)) {
+                                                        pickerStatus = "نافذة اختيار أخرى مفتوحة."
+                                                        appendLog("نافذة اختيار أخرى مفتوحة؛ انتظر إغلاقها.")
+                                                        return@Button
+                                                    }
                                                     focusManager.clearFocus(force = true)
-                                                     pickerOpen = true
+                                                     gamePickerOpen = workflowController.gamePickerOpen
                                                      pickerStatus = "جار فتح نافذة اختيار مجلد اللعبة…"
                                                      val attemptId = ++pickerAttemptId
                                                     uiScope.launch {
-                                                         yield()
-                                                         val chooserResult =
-                                                             WindowsIsolatedPicker.chooseFolder(
-                                                                 savedPaths.lastGameFolder?.let(::File)
-                                                                     ?: folders.lastOrNull()?.parentFile,
-                                                                 ownerHwnd = ownerHwnd,
-                                                                 onNativeTaskComplete = {
-                                                                     uiScope.launch(Dispatchers.Main.immediate) {
-                                                                          if (pickerAttemptId == attemptId) {
-                                                                              pickerOpen = false
-                                                                          }
+                                                         try {
+                                                             yield()
+                                                             val chooserResult =
+                                                                 WindowsIsolatedPicker.chooseFolder(
+                                                                     savedPaths.lastGameFolder?.let(::File)
+                                                                         ?: folders.lastOrNull()?.parentFile,
+                                                                     ownerHwnd = ownerHwnd,
+                                                                     onNativeTaskComplete = {
+                                                                         workflowController.finishPicker(DesktopPickerSection.GAME_INSTALL)
+                                                                         gamePickerOpen = workflowController.gamePickerOpen
                                                                      }
-                                                                 }
-                                                             )
-                                                          if (pickerAttemptId != attemptId) return@launch
-                                                         when (chooserResult) {
+                                                                 )
+                                                              if (pickerAttemptId != attemptId) return@launch
+                                                             when (chooserResult) {
                                                                   is DesktopChooserResult.Selected -> {
                                                                       pickerStatus = "تم استقبال المجلد — جارٍ فحصه…"
                                                                       acceptGameFolder(chooserResult.file)
@@ -2652,10 +2742,14 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                                           pickerStatus = "تم إلغاء اختيار مجلد اللعبة."
                                                                           appendLog("تم إلغاء اختيار مجلد اللعبة.")
                                                                       }
-                                                        }
+                                                            }
+                                                         } finally {
+                                                             workflowController.finishPicker(DesktopPickerSection.GAME_INSTALL)
+                                                             gamePickerOpen = workflowController.gamePickerOpen
+                                                         }
                                                     }
                                                 },
-                                                 enabled = hasAuthorizedDevice && !isInstalling && !pickerOpen
+                                                 enabled = hasAuthorizedDevice && !isInstalling && !gamePickerOpen
                                             ) { Text("إضافة مجلد") }
 
                                             Button(
@@ -2884,7 +2978,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             1 -> {
                                 ModsWorkflowUi(
                                     connected = hasAuthorizedDevice,
-                                     pickerOpen = pickerOpen,
+                                     pickerOpen = modPickerOpen,
                                      pickerStatus = pickerStatus,
                                      deviceSerial = connectedDeviceSerial,
                                      deviceModel = connectedDeviceModel,
@@ -2964,37 +3058,41 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                      selectedZipSha256 = modZipSha256,
                                      dropRouter = dropRouter,
                                     onChooseFile = {
-                                         if (pickerOpen) {
+                                         if (isInstallingMod) {
+                                            appendModLog("لا يمكن تغيير الحزمة أثناء تثبيت المود.")
+                                        } else if (!workflowController.beginPicker(DesktopPickerSection.QUEST_MODS)) {
                                              pickerStatus = "نافذة اختيار أخرى مفتوحة."
                                              appendModLog("نافذة اختيار أخرى مفتوحة؛ انتظر إغلاقها.")
-                                         } else if (isInstallingMod) {
-                                            appendModLog("لا يمكن تغيير الحزمة أثناء تثبيت المود.")
                                         } else {
                                             focusManager.clearFocus(force = true)
-                                             pickerOpen = true
+                                             modPickerOpen = workflowController.modPickerOpen
                                              pickerStatus = "جار فتح نافذة اختيار الملف…"
                                               val attemptId = ++pickerAttemptId
                                             uiScope.launch {
-                                                 yield()
-                                                 val chooserResult =
-                                                      WindowsIsolatedPicker.chooseZipFile(
-                                                          lastModArchiveDirectory,
-                                                          ownerHwnd = ownerHwnd,
-                                                          onNativeTaskComplete = {
-                                                              uiScope.launch(Dispatchers.Main.immediate) {
-                                                                   if (pickerAttemptId == attemptId) {
-                                                                       pickerOpen = false
-                                                                   }
+                                                 try {
+                                                     yield()
+                                                     val chooserResult =
+                                                          WindowsIsolatedPicker.chooseZipFile(
+                                                              lastModArchiveDirectory,
+                                                              ownerHwnd = ownerHwnd,
+                                                              onNativeTaskComplete = {
+                                                                  workflowController.finishPicker(DesktopPickerSection.QUEST_MODS)
+                                                                  modPickerOpen = workflowController.modPickerOpen
                                                               }
-                                                          }
-                                                       )
-                                                    if (pickerAttemptId != attemptId) return@launch
-                                                   acceptModZipResult(chooserResult)
+                                                          )
+                                                        if (pickerAttemptId == attemptId) {
+                                                            acceptModZipResult(chooserResult)
+                                                        }
+                                                 } finally {
+                                                     workflowController.finishPicker(DesktopPickerSection.QUEST_MODS)
+                                                     modPickerOpen = workflowController.modPickerOpen
+                                                 }
                                             }
                                         }
                                     },
                                     analyzing = analyzingMod,
                                     analysis = modAnalysis,
+                                     analysisStatus = modAnalysisStatus,
                                      modSupport = modSupport,
                                      onCopyDiagnostics = {
                                          val details = buildString {
@@ -3044,7 +3142,10 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 )
                             }
                             2 -> {
-                                PcvrReadinessTab()
+                                PcvrReadinessTab(
+                                    state = pcvrState,
+                                    onRunChecks = ::startPcvrChecks
+                                )
                             }
 
                         }

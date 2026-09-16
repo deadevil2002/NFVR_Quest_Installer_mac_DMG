@@ -13,6 +13,179 @@ class ModEngineSections8To23Test {
         versionName = "1.2.3",
         versionCode = 123L
     )
+    private val gorilla = InstalledQuestApp(
+        packageName = "com.AnotherAxiom.GorillaTag",
+        versionName = "1.0.0"
+    )
+
+    @Test
+    fun gorillaQmodRejectsMismatchedManifestPackageExactly() {
+        val archive = zipOf(
+            "mod.json" to """{"_QPVersion":"1.2.0","id":"g","name":"G","author":"NFVR",
+                "version":"1.0.0","packageId":"com.other.game","modloader":"QuestLoader",
+                "modFiles":["plugin.so"]}""".replace("\n", ""),
+            "plugin.so" to "native"
+        )
+        val analysis = ModPackageAnalyzer().analyze(archive, gorilla)
+        assertFalse(analysis.installable)
+        assertTrue(analysis.plan.preconditions.any { it.code == "TARGET_PACKAGE_MISMATCH" })
+        archive.delete()
+    }
+
+    @Test
+    fun stockGorillaNativePayloadRequiresApkPatchInsteadOfGuessedPath() {
+        val archive = zipOf("plugins/native.so" to "native")
+        val analysis = ModPackageAnalyzer().analyze(archive, gorilla)
+        assertEquals(ModInstallOutcome.APK_PATCH_REQUIRED, analysis.outcome)
+        assertFalse(analysis.installable)
+        assertTrue(analysis.plan.preconditions.any { it.code == "APK_PATCH_REQUIRED" })
+        assertTrue(analysis.plan.mappings.isEmpty())
+        archive.delete()
+    }
+
+    @Test
+    fun authenticatedCompatibleLoaderAloneEnablesOnlyCanonicalGorillaQmodPath() {
+        val archive = zipOf(
+            "mod.json" to """{"_QPVersion":"1.2.0","id":"g","name":"G","author":"NFVR",
+                "version":"1.0.0","packageId":"com.AnotherAxiom.GorillaTag",
+                "modloader":"QuestLoader","modFiles":["plugin.dat"]}""".replace("\n", ""),
+            "plugin.dat" to "payload"
+        )
+        val detection = ModLoaderDetection(
+            gorilla.packageName,
+            mapOf(
+                ModLoaderKind.QUEST_LOADER to ModLoaderEvidence(
+                    ModLoaderKind.QUEST_LOADER, ModLoaderStatus.DETECTED,
+                    listOf("authenticated QuestPatcher modded.json")
+                )
+            )
+        )
+        val analysis = ModPackageAnalyzer().analyze(
+            archive, gorilla, detection
+        )
+        assertTrue(analysis.installable)
+        assertEquals(
+            "/sdcard/Android/data/com.AnotherAxiom.GorillaTag/files/mods/plugin.dat",
+            analysis.plan.mappings.single().destinationPath
+        )
+        assertTrue(analysis.plan.mappings.single().destinationPath.contains(gorilla.packageName))
+        archive.delete()
+    }
+
+    @Test
+    fun authenticatedScotland2DoesNotAuthorizeGorillaWithoutPackageSpecificEvidence() {
+        val archive = zipOf(
+            "mod.json" to """{"_QPVersion":"1.2.0","id":"g","name":"G","author":"NFVR",
+                "version":"1.0.0","packageId":"com.AnotherAxiom.GorillaTag",
+                "modloader":"Scotland2","modFiles":["plugin.dat"]}""".replace("\n", ""),
+            "plugin.dat" to "payload"
+        )
+        val detection = ModLoaderDetection(
+            gorilla.packageName,
+            mapOf(
+                ModLoaderKind.SCOTLAND2 to ModLoaderEvidence(
+                    ModLoaderKind.SCOTLAND2, ModLoaderStatus.DETECTED,
+                    listOf("authenticated QuestPatcher modded.json")
+                )
+            )
+        )
+        val analysis = ModPackageAnalyzer().analyze(archive, gorilla, detection)
+        assertFalse(analysis.installable)
+        assertTrue(analysis.plan.preconditions.any {
+            it.code == "GORILLA_LOADER_COMPATIBILITY_UNCONFIRMED"
+        })
+        archive.delete()
+    }
+
+    @Test
+    fun gorillaDirectoryDiscoveryCannotAuthorizeOrdinaryArchiveOrConfirmation() {
+        val archive = zipOf("Mods/ordinary.dat" to "payload")
+        val discovery = ModDirectoryDiscovery(
+            serial = "SERIAL",
+            packageId = gorilla.packageName,
+            appVersion = gorilla.versionName,
+            candidates = listOf(
+                ModDirectoryCandidate(
+                    packageId = gorilla.packageName,
+                    path = "/sdcard/Android/data/${gorilla.packageName}/files/Mods",
+                    exists = true,
+                    source = "read-only test"
+                )
+            )
+        )
+        val analysis = ModPackageAnalyzer().analyze(archive, gorilla, null, discovery)
+        assertEquals(ModInstallOutcome.APK_PATCH_REQUIRED, analysis.outcome)
+        assertFalse(analysis.installable)
+        assertTrue(analysis.plan.preconditions.any {
+            it.code == "GORILLA_TAG_DESTINATION_UNAUTHORIZED"
+        })
+        assertTrue(analysis.plan.confirmation == null)
+        // There is no confirmation token to turn this classification into a
+        // writable plan.
+        assertFalse(analysis.plan.confirmDestination("anything").installable)
+        archive.delete()
+    }
+
+    @Test
+    fun exactGorillaAndroidLayoutRemainsExplicitPackageBoundStrategy() {
+        val archive = zipOf(
+            "Android/data/${gorilla.packageName}/files/verified.dat" to "payload"
+        )
+        val analysis = ModPackageAnalyzer().analyze(archive, gorilla)
+        // Universal explicit Android layouts are package-bound evidence, not
+        // guessed mod destinations; the exact selected package is required.
+        assertEquals(ModPackageType.ANDROID_DATA_LAYOUT, analysis.packageType)
+        assertTrue(analysis.installable)
+        assertTrue(analysis.plan.mappings.single().destinationPath.startsWith(
+            "/sdcard/Android/data/${gorilla.packageName}/"
+        ))
+        archive.delete()
+    }
+
+    @Test
+    fun gorillaQmodFileCopiesCannotEscapeAuthenticatedQuestLoaderRoots() {
+        fun detection() = ModLoaderDetection(
+            gorilla.packageName,
+            mapOf(
+                ModLoaderKind.QUEST_LOADER to ModLoaderEvidence(
+                    ModLoaderKind.QUEST_LOADER, ModLoaderStatus.DETECTED,
+                    listOf("authenticated QuestPatcher modded.json")
+                )
+            )
+        )
+        fun analyze(destination: String): ModPackageAnalysis {
+            val archive = zipOf(
+                "mod.json" to """{"_QPVersion":"1.2.0","id":"g","name":"G","author":"NFVR",
+                    "version":"1.0.0","packageId":"${gorilla.packageName}",
+                    "modloader":"QuestLoader","fileCopies":[
+                    {"name":"payload.dat","destination":"$destination"}]}""".replace("\n", ""),
+                "payload.dat" to "payload"
+            )
+            val result = ModPackageAnalyzer().analyze(archive, gorilla, detection())
+            archive.delete()
+            return result
+        }
+
+        val arbitrary = analyze("/sdcard/Android/data/${gorilla.packageName}/files/arbitrary/payload.dat")
+        assertFalse(arbitrary.installable)
+        assertTrue(arbitrary.plan.preconditions.any {
+            it.code == "GORILLA_QMOD_DESTINATION_UNAUTHORIZED"
+        })
+
+        val traversal = analyze("/sdcard/Android/data/${gorilla.packageName}/files/mods/../arbitrary/payload.dat")
+        assertFalse(traversal.installable)
+        assertTrue(traversal.plan.preconditions.any {
+            it.code == "GORILLA_QMOD_DESTINATION_UNAUTHORIZED" || it.code == "UNSAFE_PATH"
+        })
+
+        for (root in listOf("mods", "libs")) {
+            val canonical = analyze(
+                "/sdcard/Android/data/${gorilla.packageName}/files/$root/payload.dat"
+            )
+            assertTrue(canonical.installable)
+            assertTrue(canonical.plan.mappings.single().destinationPath.endsWith("$root/payload.dat"))
+        }
+    }
 
     @Test
     fun qmodParsesOptionalDependenciesAndCanonicalCopyExtensions() {

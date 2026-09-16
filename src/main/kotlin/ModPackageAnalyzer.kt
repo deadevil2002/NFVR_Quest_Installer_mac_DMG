@@ -17,6 +17,7 @@ class ModPackageAnalyzer(
 ) {
     companion object {
         const val BONELAB_PACKAGE_ID = "com.StressLevelZero.BONELAB"
+        const val GORILLA_TAG_PACKAGE_ID = "com.AnotherAxiom.GorillaTag"
         const val MAX_ZIP_ENTRIES = 5_000
         const val MAX_ENTRY_NAME_BYTES = 1_000
         const val MAX_METADATA_BYTES = 1L * 1024L * 1024L
@@ -106,7 +107,7 @@ class ModPackageAnalyzer(
                         installedApp,
                         directoryDiscovery
                     )
-                archive.entries.any(::looksLikeGenericModPayload) -> analyzeGeneric(archive)
+                archive.entries.any(::looksLikeGenericModPayload) -> analyzeGeneric(archive, installedApp)
                 else -> unknown(archive, installedApp)
             }
         } catch (e: ModPackageException) {
@@ -263,7 +264,18 @@ class ModPackageAnalyzer(
         } else {
             preconditions += satisfied("TARGET_PACKAGE_MATCH", "QMOD target package matches the selected app.")
         }
+        // Gorilla Tag has no current authoritative Quest loader/path contract.
+        // Do not let its conservative classification become a guessed write:
+        // an explicit loader declaration and authenticated QuestPatcher tag
+        // are both required before loader-defined destinations are usable.
         val loaderValue = json.optString("modloader", "").trim()
+        val isGorillaTag = target == GORILLA_TAG_PACKAGE_ID
+        if (isGorillaTag && loaderValue.isBlank()) {
+            preconditions += blocked(
+                "MOD_LOADER_REQUIRED",
+                "Gorilla Tag Quest compatibility is not established; this QMOD must declare a loader and use authenticated QuestPatcher evidence."
+            )
+        }
         val loader = ModLoaderKind.parse(loaderValue)
         if (loaderValue.isNotEmpty() &&
             (loader == null || loader !in setOf(ModLoaderKind.QUEST_LOADER, ModLoaderKind.SCOTLAND2))
@@ -271,6 +283,12 @@ class ModPackageAnalyzer(
             preconditions += blocked(
                 "UNSUPPORTED_MOD_LOADER",
                 "QMOD requires unsupported modloader '$loaderValue'."
+            )
+        }
+        if (isGorillaTag && loader != null && loader != ModLoaderKind.QUEST_LOADER) {
+            preconditions += blocked(
+                "GORILLA_LOADER_COMPATIBILITY_UNCONFIRMED",
+                "Scotland2 is not an established Gorilla Tag Quest compatibility contract; NFVR will not authorize its destination."
             )
         }
         // QMOD's schema default is QuestLoader even when a legacy manifest
@@ -421,6 +439,15 @@ class ModPackageAnalyzer(
                             }
                             val source = item.optString("name", "")
                             val destination = item.getString("destination")
+                            if (target == GORILLA_TAG_PACKAGE_ID &&
+                                !isGorillaQuestLoaderDestination(destination)
+                            ) {
+                                preconditions += blocked(
+                                    "GORILLA_QMOD_DESTINATION_UNAUTHORIZED",
+                                    "Gorilla Tag QMOD fileCopies may target only authenticated QuestLoader mods or libs roots."
+                                )
+                                continue
+                            }
                             addQmodMapping(
                                 archive, profile, mappings, target, source, destination,
                                 null, preconditions
@@ -718,6 +745,18 @@ class ModPackageAnalyzer(
             ModLoaderKind.LEMON_LOADER, ModLoaderKind.MELON_LOADER ->
                 "$data/Mods"
         }
+    }
+
+    private fun isGorillaQuestLoaderDestination(
+        destination: String,
+        target: String = GORILLA_TAG_PACKAGE_ID
+    ): Boolean {
+        val normalized = destination.trim().replace('\\', '/').trimEnd('/')
+        val mods = "/sdcard/Android/data/$target/files/mods"
+        val libs = "/sdcard/Android/data/$target/files/libs"
+        return AndroidPathValidator.isSafe(normalized) &&
+            (normalized == mods || normalized.startsWith("$mods/") ||
+                normalized == libs || normalized.startsWith("$libs/"))
     }
 
     private fun androidLayoutPath(entry: String, root: String): String? {
@@ -1112,6 +1151,41 @@ class ModPackageAnalyzer(
         discovery: ModDirectoryDiscovery
     ): ModPackageAnalysis {
         val target = installedApp?.packageName
+        // Directory existence is not a Gorilla Tag compatibility contract.
+        // Its classification-only profile must not become writable merely
+        // because discovery found a guessed Mods/plugins/ModData candidate.
+        if (target == GORILLA_TAG_PACKAGE_ID) {
+            val preconditions = listOf(
+                blocked(
+                    "GORILLA_TAG_DESTINATION_UNAUTHORIZED",
+                    "Gorilla Tag Quest has no authoritative generic directory contract; only an exact QMOD with authenticated QuestLoader evidence may use a canonical loader destination."
+                )
+            )
+            val plan = ModInstallPlan(
+                outcome = ModInstallOutcome.APK_PATCH_REQUIRED,
+                packageType = ModPackageType.GENERIC_DATA,
+                targetPackageId = target,
+                strategy = ModInstallStrategy.NONE,
+                archiveIdentity = archive.identity,
+                reviewedApp = installedApp,
+                preconditions = preconditions,
+                patchRequirement = ModPatchRequirement(
+                    required = true,
+                    reason = "Generic Gorilla Tag Quest archives cannot be authorized from directory discovery."
+                ),
+                resolution = resolution(
+                    ModResolutionStrategy.UNKNOWN,
+                    0,
+                    "Gorilla Tag classification-only profile rejects generic directory routing."
+                )
+            )
+            return result(
+                ModPackageType.GENERIC_DATA,
+                "Gorilla Tag Quest generic archives cannot be installed from discovered directories; use an exact QMOD with authenticated QuestLoader evidence.",
+                plan,
+                archive
+            )
+        }
         val candidate = discovery.existingCandidates.firstOrNull {
             it.packageId == target && it.readOnly && AndroidPathValidator.isSafe(it.path)
         }
@@ -1279,18 +1353,36 @@ class ModPackageAnalyzer(
         )
     }
 
-    private fun analyzeGeneric(archive: ArchiveMetadata): ModPackageAnalysis {
+    private fun analyzeGeneric(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp? = null
+    ): ModPackageAnalysis {
         val preconditions = mutableListOf<ModInstallPrecondition>()
         addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        val gorillaNative = installedApp?.packageName == GORILLA_TAG_PACKAGE_ID &&
+            archive.entries.any { it.lowercase(Locale.ROOT).endsWith(".so") ||
+                looksLikeCodeModPayload(it) }
+        if (gorillaNative) {
+            preconditions += blocked(
+                "APK_PATCH_REQUIRED",
+                "Gorilla Tag native/code mods require a reviewed APK patch or compatible loader; NFVR will not guess a Quest destination."
+            )
+        }
         preconditions += blocked(
             "DESTINATION_UNDECLARED",
             "Generic mod data has no declarative destination; NFVR will not guess where to copy it."
         )
+        val patchRequirement = if (gorillaNative) ModPatchRequirement(
+            required = true,
+            reason = "No authoritative Gorilla Tag Quest native/code-mod installation contract is available."
+        ) else null
         val plan = ModInstallPlan(
             packageType = ModPackageType.GENERIC_DATA,
+            outcome = if (gorillaNative) ModInstallOutcome.APK_PATCH_REQUIRED else ModInstallOutcome.UNSUPPORTED,
             strategy = ModInstallStrategy.NONE,
             archiveIdentity = archive.identity,
             preconditions = preconditions,
+            patchRequirement = patchRequirement,
             resolution = resolution(
                 ModResolutionStrategy.UNKNOWN,
                 0,
@@ -1596,7 +1688,8 @@ class ModPackageAnalyzer(
         val requiresLoader = preconditions.any {
             !it.satisfied && (
                 it.code == "MOD_LOADER_NOT_DETECTED" ||
-                    it.code == "MOD_LOADER_UNKNOWN"
+                    it.code == "MOD_LOADER_UNKNOWN" ||
+                    it.code == "MOD_LOADER_REQUIRED"
                 )
         }
         val hardPayloadBlock = preconditions.any {

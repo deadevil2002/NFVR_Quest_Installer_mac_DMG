@@ -26,7 +26,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,50 +34,18 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import javax.swing.SwingUtilities
 
 @Composable
-fun PcvrReadinessTab() {
-    var checks by remember { mutableStateOf<List<PcvrCheckResult>>(emptyList()) }
-    var systemInfo by remember { mutableStateOf<PcvrSystemInfo?>(null) }
-    var running by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf("اضغط بدء الفحص للتحقق من جاهزية الكمبيوتر لـ PCVR.") }
-    val scope = rememberCoroutineScope()
-
-    fun runChecks(advanced: Boolean) {
-        running = true
-        message = "جاري فحص الكمبيوتر..."
-        scope.launch(Dispatchers.IO) {
-            runCatching {
-                if (advanced) PcvrChecker.runAdvancedChecks() else PcvrChecker.runQuickChecks()
-            }.onSuccess { (newChecks, newSystemInfo) ->
-                SwingUtilities.invokeLater {
-                    checks = newChecks
-                    systemInfo = newSystemInfo
-                    message = when {
-                        PcvrChecker.isReady(newChecks) ->
-                            if (newChecks.any { it.status == PcvrCheckStatus.UNKNOWN })
-                                "لا يوجد فشل معروف؛ بعض القياسات غير معروفة وتحتاج تحققًا يدويًا."
-                            else "الكمبيوتر يطابق الفحوصات المتاحة مبدئيًا لتشغيل PCVR."
-                        newChecks.any { it.status == PcvrCheckStatus.UNKNOWN } ->
-                            "اكتمل الفحص، لكن تعذر التحقق من بعض البيانات."
-                        else -> "اكتمل الفحص. راجع العناصر التي تحتاج إلى معالجة."
-                    }
-                    running = false
-                }
-            }.onFailure {
-                DiagnosticLogger.error("فشل فحص جاهزية PCVR", it)
-                SwingUtilities.invokeLater {
-                    message = "تعذر إكمال فحص PCVR."
-                    running = false
-                }
-            }
-        }
-    }
+fun PcvrReadinessTab(
+    state: PcvrReadinessState,
+    onRunChecks: (Boolean) -> Unit
+) {
+    val checks = state.checks
+    val systemInfo = state.systemInfo
+    val running = state.running
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Column(
@@ -157,7 +124,7 @@ fun PcvrReadinessTab() {
                                 )
                             }
                             Text(
-                                message,
+                                state.message,
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -174,10 +141,10 @@ fun PcvrReadinessTab() {
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Button(enabled = !running, onClick = { runChecks(false) }) {
+                        Button(enabled = !running, onClick = { onRunChecks(false) }) {
                             Text("بدء الفحص السريع")
                         }
-                        OutlinedButton(enabled = !running, onClick = { runChecks(true) }) {
+                        OutlinedButton(enabled = !running, onClick = { onRunChecks(true) }) {
                             Text("فحص متقدم")
                         }
                         OutlinedButton(
@@ -186,7 +153,6 @@ fun PcvrReadinessTab() {
                                 val report = PcvrChecker.generateReport(checks, systemInfo!!)
                                 Toolkit.getDefaultToolkit().systemClipboard
                                     .setContents(StringSelection(report), null)
-                                message = "تم نسخ تقرير PCVR."
                             }
                         ) {
                             Text("نسخ التقرير")

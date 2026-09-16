@@ -1,5 +1,21 @@
 [
   {
+    "packageId": "com.AnotherAxiom.GorillaTag",
+    "displayName": "Gorilla Tag (Quest; conservative classification)",
+    "engine": "Unity IL2CPP",
+    "destination": "",
+    "writeAuthorized": false,
+    "supportedPackageTypes": ["QMOD"],
+    "modTypes": ["QMOD"],
+    "loaderRequirements": ["QUEST_LOADER"],
+    "installationStrategies": ["QMOD"],
+    "evidenceLevel": "OPEN_SOURCE_PROJECT",
+    "evidenceSources": [
+      "https://github.com/Lauriethefish/QuestPatcher",
+      "https://github.com/sc2ad/scotland2"
+    ]
+  },
+  {
     "packageId": "com.StressLevelZero.BONELAB",
     "displayName": "BONELAB",
     "engine": "Marrow",
