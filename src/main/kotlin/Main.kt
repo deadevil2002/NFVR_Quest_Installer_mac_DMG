@@ -717,6 +717,7 @@ fun main() {
     var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
+    var modInstallSucceeded by remember { mutableStateOf(false) }
     var modLogText by remember { mutableStateOf("") }
     var modInstallDeviceLost by remember { mutableStateOf(false) }
     var gamePickerOpen by remember { mutableStateOf(false) }
@@ -837,6 +838,7 @@ fun main() {
         modOperationBinding = null
         modPlanId = null
         destinationConfirmedPlanId = null
+        modInstallSucceeded = false
         if (!isInstallingMod) modExecutionProgress = null
     }
 
@@ -1235,6 +1237,7 @@ fun main() {
                 return
             }
             modAnalysis = analysis
+            modInstallSucceeded = false
             workflowController.questModsSucceeded(analysis)
             unconfirmedModAnalysis = analysis
             modZipSha256 = archiveSha256
@@ -1945,11 +1948,13 @@ fun main() {
                 return
             }
             if (installResult.success) {
+                modInstallSucceeded = true
                 appendModLog(installResult.message)
                 appendModLog("==============================================")
                 appendModLog("تم تثبيت المود والتحقق من الملفات بنجاح")
                 appendModLog("==============================================")
             } else {
+                modInstallSucceeded = false
                 appendModLog("فشل التثبيت: ${installResult.message}")
                 modExecutionProgress = ModsManager.ModExecutionProgress(
                     ModsManager.ModInstallPhase.FAILED,
@@ -1959,6 +1964,7 @@ fun main() {
             }
         } catch (e: Exception) {
             if (operationGeneration == null || operationGeneration == modOperationGeneration) {
+                modInstallSucceeded = false
                 DiagnosticLogger.error("فشل غير متوقع أثناء تثبيت المود", e)
                 appendModLog(customerModExecutionFailureMessage(ModExecutionFailureKind.UNEXPECTED))
                 modExecutionProgress = ModsManager.ModExecutionProgress(
@@ -3150,6 +3156,14 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     },
                                     installing = isInstallingMod,
                                     executionProgress = modExecutionProgress,
+                                     operationBound = modOperationBindingMatches(
+                                         modOperationBinding,
+                                         connectedDeviceSerial,
+                                         selectedApp,
+                                         modZipSha256,
+                                         modPlanId
+                                     ),
+                                     installSucceeded = modInstallSucceeded,
                                     onInstall = {
                                         uiScope.launch { installSelectedMod() }
                                     },

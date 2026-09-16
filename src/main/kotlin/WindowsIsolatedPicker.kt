@@ -187,8 +187,8 @@ internal object JnaWindowsNativePickerAdapter : WindowsNativePickerAdapter, Nati
             if (result < 0) return NativePickerOutput.Failed(result, "IFileOpenDialog.SetOptions failed")
 
             if (mode == DesktopChooserMode.FILES) {
-                val name = wideStringMemory("ZIP archives (*.zip)")
-                val pattern = wideStringMemory("*.zip")
+                val name = wideStringMemory("Quest mod packages (*.zip;*.qmod)")
+                val pattern = wideStringMemory("*.zip;*.qmod")
                 val filter = ComdlgFilterSpec(name, pattern)
                 filter.write()
                 result = invokeHresult(dialog, 4, 1, filter.pointer)
@@ -464,9 +464,10 @@ internal fun pickerSelectionError(mode: DesktopChooserMode, file: File): String?
             else "selected path is not a readable directory"
         DesktopChooserMode.FILES ->
             if (normalized.isFile && normalized.canRead() &&
-                normalized.name.endsWith(".zip", ignoreCase = true)
+                (normalized.name.endsWith(".zip", ignoreCase = true) ||
+                    normalized.name.endsWith(".qmod", ignoreCase = true))
             ) null
-            else "selected path is not a readable ZIP file"
+            else "selected path is not a readable ZIP or QMOD file"
     }
 }
 
@@ -484,7 +485,7 @@ internal fun mapNativePickerOutput(
             DesktopChooserResult.Failed(
                 when (mode) {
                     DesktopChooserMode.DIRECTORY -> "اختر مجلدًا موجودًا وقابلًا للقراءة."
-                    DesktopChooserMode.FILES -> "اختر ملف ZIP موجودًا وقابلًا للقراءة."
+                    DesktopChooserMode.FILES -> "اختر ملف ZIP أو QMOD موجودًا وقابلًا للقراءة."
                 },
                 "native picker invalid ${mode.name.lowercase()} output: " +
                     (validationError ?: "selected path could not be normalized")
@@ -530,7 +531,7 @@ object WindowsIsolatedPicker {
 
     suspend fun chooseZipFile(
         initialDirectory: File? = null,
-        title: String = "اختر ملف المود (ZIP)",
+        title: String = "اختر ملف المود (ZIP أو QMOD)",
         ownerHwnd: Long? = null,
         onNativeTaskComplete: () -> Unit = {}
     ): DesktopChooserResult = choose(

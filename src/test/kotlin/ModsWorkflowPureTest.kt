@@ -110,6 +110,69 @@ class ModsWorkflowPureTest {
         )
     }
 
+    @Test
+    fun builtInAnalysisIsInformationalAndExplicitlyReportsNoFileChange() {
+        val result = modsUiOutcome(
+            testAnalysis(
+                ModInstallOutcome.BUILT_IN_GAME_CONTENT,
+                ModPackageType.GORILLA_TAG_VIRTUAL_STUMP
+            )
+        )
+        assertEquals(ModsUiStatusTone.INFO, result.tone)
+        assertTrue(result.action.contains("لا يحتاج"))
+        assertTrue(result.changedFiles.contains("لم يتم تغيير"))
+    }
+
+    @Test
+    fun analysisCompletionNeverCompletesReviewOrInstallation() {
+        val builtIn = testAnalysis(
+            ModInstallOutcome.BUILT_IN_GAME_CONTENT,
+            ModPackageType.GORILLA_TAG_VIRTUAL_STUMP
+        )
+        val state = modsWorkflowSemantics(
+            builtIn,
+            operationBound = false,
+            destinationConfirmed = false,
+            installSucceeded = false
+        )
+
+        assertTrue(state.analysisCompleted)
+        assertFalse(state.planReviewed)
+        assertFalse(state.installCompleted)
+        assertFalse(modsWorkflowSemantics(builtIn, false, false, true).installCompleted)
+        assertTrue(modInstallUnavailableReason(builtIn, false, false)!!.contains("تديره اللعبة"))
+    }
+
+    @Test
+    fun onlyBoundDirectReadyPlanEnablesReviewedState() {
+        val ready = testAnalysis(ModInstallOutcome.DIRECT_INSTALL_READY, ModPackageType.QMOD)
+
+        assertFalse(modsWorkflowSemantics(ready, false, true, false).planReviewed)
+        assertFalse(modsWorkflowSemantics(ready, false, true, true).installCompleted)
+        assertTrue(modsWorkflowSemantics(ready, true, true, false).planReviewed)
+        assertFalse(modsWorkflowSemantics(ready, true, true, false).installCompleted)
+        assertTrue(modsWorkflowSemantics(ready, true, true, true).installCompleted)
+        assertTrue(modInstallUnavailableReason(ready, false, true)!!.contains("أعد التحليل"))
+        assertNull(modInstallUnavailableReason(ready, true, true))
+    }
+
+    @Test
+    fun patchAndLoaderResultsRemainLockedWithExactReasons() {
+        val patch = testAnalysis(
+            ModInstallOutcome.APK_PATCH_REQUIRED,
+            ModPackageType.GENERIC_DATA
+        )
+        val loader = testAnalysis(
+            ModInstallOutcome.REQUIRES_MOD_LOADER,
+            ModPackageType.QMOD
+        )
+
+        assertFalse(modsWorkflowSemantics(patch, true, true, true).planReviewed)
+        assertFalse(modsWorkflowSemantics(loader, true, true, true).planReviewed)
+        assertTrue(modInstallUnavailableReason(patch, true, true)!!.contains("Patch"))
+        assertTrue(modInstallUnavailableReason(loader, true, true)!!.isNotBlank())
+    }
+
     private fun testAnalysis(
         outcome: ModInstallOutcome,
         packageType: ModPackageType = ModPackageType.UNKNOWN

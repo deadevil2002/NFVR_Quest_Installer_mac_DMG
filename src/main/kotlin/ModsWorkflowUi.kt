@@ -92,7 +92,8 @@ internal enum class ModsUiStatusTone {
 internal data class ModsUiOutcome(
     val tone: ModsUiStatusTone,
     val title: String,
-    val action: String
+    val action: String,
+    val changedFiles: String = "لم يتم تغيير أي ملف على النظارة."
 )
 
 /**
@@ -129,8 +130,13 @@ internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
         )
         builtInContent -> ModsUiOutcome(
             ModsUiStatusTone.INFO,
-            "محتوى مخصص مدمج في اللعبة",
-            "يُدار بواسطة نظام المحتوى المخصص المدمج في اللعبة"
+            "تم التعرف على نوع المود",
+            "لا يحتاج تثبيتًا يدويًا عبر NFVR"
+        )
+        analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED -> ModsUiOutcome(
+            ModsUiStatusTone.WARNING,
+            "تحتاج اللعبة إلى تجهيز نظام المودات",
+            "لا يوجد إجراء تصحيح متاح؛ جهّز اللعبة بأداة آمنة معتمدة ثم أعد التحليل"
         )
         requiresLoader -> ModsUiOutcome(
             ModsUiStatusTone.WARNING,
@@ -140,7 +146,8 @@ internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
         analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY -> ModsUiOutcome(
             ModsUiStatusTone.SUCCESS,
             "جاهز للتثبيت",
-            "استخراج → نقل → تحقق"
+            "استخراج → نقل → تحقق",
+            "لم يتم تغيير أي ملف بعد؛ يبدأ النقل فقط بعد اعتماد الخطة"
         )
         analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
             analysis.packageType == ModPackageType.UNKNOWN ||
@@ -155,6 +162,62 @@ internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
             "لا يمكن التثبيت بهذه الخطة"
         )
     }
+}
+
+internal data class ModsWorkflowSemantics(
+    val analysisCompleted: Boolean,
+    val planReviewed: Boolean,
+    val installCompleted: Boolean
+)
+
+internal fun modsWorkflowSemantics(
+    analysis: ModPackageAnalysis?,
+    operationBound: Boolean,
+    destinationConfirmed: Boolean,
+    installSucceeded: Boolean
+): ModsWorkflowSemantics {
+    val reviewed = analysis != null &&
+        analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+        analysis.installable &&
+        analysis.compatibility.compatible &&
+        operationBound &&
+        (!genericDestinationNeedsConfirmation(analysis) || destinationConfirmed) &&
+        !analysis.installPlan.hasBlockingPreconditions
+    return ModsWorkflowSemantics(
+        analysisCompleted = analysis != null,
+        planReviewed = reviewed,
+        installCompleted = reviewed && installSucceeded
+    )
+}
+
+internal fun modInstallUnavailableReason(
+    analysis: ModPackageAnalysis,
+    operationBound: Boolean,
+    destinationConfirmed: Boolean
+): String? = when {
+    analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ->
+        "هذا المحتوى تديره اللعبة داخليًا؛ لا يوجد تثبيت مباشر لهذا النوع."
+    analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED ->
+        "تحتاج اللعبة إلى Patch وتجهيز نظام المودات أولًا؛ لا توجد أداة تصحيح مفعّلة في NFVR."
+    analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ->
+        analysis.installPlan.loaderRequirement
+            ?.let(::customerLoaderRequirementMessage)
+            ?: "تحتاج الحزمة إلى محمّل مودات متوافق قبل التثبيت."
+    analysis.outcome == ModInstallOutcome.UNSAFE_ARCHIVE ->
+        "الحزمة غير آمنة أو تالفة؛ لم يتم نقل أي ملف."
+    analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
+        analysis.packageType == ModPackageType.UNKNOWN ||
+        !analysis.recognized ->
+        "بنية الحزمة غير معروفة أو غير مدعومة؛ لا يوجد مسار تثبيت مباشر."
+    !analysis.installable || !analysis.compatibility.compatible ->
+        "الخطة غير متوافقة مع اللعبة المحددة."
+    analysis.installPlan.hasBlockingPreconditions ->
+        "لم تكتمل متطلبات التثبيت الموضحة في الخطة."
+    !operationBound ->
+        "تغيّرت هوية الجهاز أو اللعبة أو الحزمة؛ أعد التحليل قبل التثبيت."
+    genericDestinationNeedsConfirmation(analysis) && !destinationConfirmed ->
+        "أكد الوجهة المقترحة قبل بدء التثبيت."
+    else -> null
 }
 
 internal fun modsUiControlsEnabled(installing: Boolean): Boolean = !installing
@@ -224,6 +287,8 @@ fun ModsWorkflowUi(
     analysisStatus: String? = null,
     installing: Boolean,
     executionProgress: ModsManager.ModExecutionProgress?,
+    operationBound: Boolean = false,
+    installSucceeded: Boolean = false,
     onInstall: () -> Unit,
     // Kept for source compatibility with the host screen.  It is intentionally
     // not invoked; built-in content is informational in this UI.
@@ -259,12 +324,17 @@ fun ModsWorkflowUi(
     var genericDestinationConfirmed by remember(analysis) {
         mutableStateOf(analysis?.let { !genericDestinationNeedsConfirmation(it) } ?: false)
     }
+    val workflowSemantics = modsWorkflowSemantics(
+        analysis,
+        operationBound,
+        genericDestinationConfirmed,
+        installSucceeded
+    )
     val currentStep = when {
         selectedApp == null -> 1
         selectedZipFilename.isNullOrBlank() -> 2
         analysis == null -> 3
-        analysis.isBuiltInGameContent || analysis.isExternalWorkflow ||
-            installing || executionProgress != null -> 5
+        workflowSemantics.installCompleted -> 5
         else -> 4
     }
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -300,8 +370,9 @@ fun ModsWorkflowUi(
                         connected,
                         selectedApp != null,
                         !selectedZipFilename.isNullOrBlank(),
-                        analysis != null,
-                        installing || executionProgress?.phase == ModsManager.ModInstallPhase.COMPLETED
+                        workflowSemantics.analysisCompleted,
+                        workflowSemantics.planReviewed,
+                        workflowSemantics.installCompleted
                     )
                 }
                 if (deviceSerial != null || deviceModel != null) {
@@ -379,7 +450,7 @@ fun ModsWorkflowUi(
                         )
                     }
                 }
-                item { StepTitle("02", "اختر حزمة المود", "يتم فحص ملف ZIP آمنًا قبل لمس أي ملف على النظارة") }
+                item { StepTitle("02", "اختر حزمة المود", "يتم فحص ملف ZIP أو QMOD آمنًا قبل لمس أي ملف على النظارة") }
                 if (currentStep == 2) {
                     item {
                         ZipCard(
@@ -461,6 +532,11 @@ fun ModsWorkflowUi(
                     item { ModSupportCard(modSupport) }
                 }
                 item { StepTitle("04", "راجع خطة التثبيت", "لا يبدأ النقل إلا بعد فحص النوع والتوافق والوجهات") }
+                if (analysis != null) {
+                    item {
+                        AnalysisResultCard(analysis)
+                    }
+                }
                 if (currentStep == 4 && analysis != null) {
                     item {
                         AnalysisCard(
@@ -473,53 +549,60 @@ fun ModsWorkflowUi(
                             }
                         )
                     }
-                    item {
-                        Button(
-                            onClick = {
-                                clearFocusBeforeModsTransition(
-                                    { focusManager.clearFocus(force = true) },
-                                    onInstall
-                                )
-                            },
-                            enabled = analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
-                                analysis.installable &&
-                                analysis.compatibility.compatible &&
-                                !analysis.installPlan.hasBlockingPreconditions &&
-                                (!genericDestinationNeedsConfirmation(analysis) || genericDestinationConfirmed) &&
-                                !installing,
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("اعتماد الخطة وبدء التثبيت")
+                    if (analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY) {
+                        item {
+                            Button(
+                                onClick = {
+                                    clearFocusBeforeModsTransition(
+                                        { focusManager.clearFocus(force = true) },
+                                        onInstall
+                                    )
+                                },
+                                enabled = analysis.installable &&
+                                    operationBound &&
+                                    analysis.compatibility.compatible &&
+                                    !analysis.installPlan.hasBlockingPreconditions &&
+                                    (!genericDestinationNeedsConfirmation(analysis) || genericDestinationConfirmed) &&
+                                    !installing,
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
+                            ) {
+                                Icon(Icons.Default.PlayArrow, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("اعتماد الخطة وبدء التثبيت")
+                            }
+                        }
+                    }
+                    modInstallUnavailableReason(
+                        analysis,
+                        operationBound,
+                        genericDestinationConfirmed
+                    )?.let { reason ->
+                        item {
+                            StatusNote(reason, Icons.Default.Info, outcomeColor(modsUiOutcome(analysis).tone))
                         }
                     }
                 }
-                item { StepTitle("05", "الإجراء", "تثبيت متحقق أو محتوى تديره اللعبة") }
-                if (currentStep == 5 && analysis != null) item {
-                    if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
-                        BuiltInContentCard(analysis)
+                item { StepTitle("05", "الإجراء", "لا يكتمل إلا بعد نقل الملفات والتحقق منها على النظارة") }
+                if (analysis != null) item {
+                    if (workflowSemantics.installCompleted) {
+                        InstallationSuccessCard()
                     } else {
-                        Button(
-                            onClick = {
-                                clearFocusBeforeModsTransition(
-                                    { focusManager.clearFocus(force = true) },
-                                    onInstall
-                                )
-                            },
-                            enabled = analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
-                                analysis.installable &&
-                                analysis.compatibility.compatible &&
-                                !analysis.installPlan.hasBlockingPreconditions &&
-                                (!genericDestinationNeedsConfirmation(analysis) || genericDestinationConfirmed) &&
-                                !installing,
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary, contentColor = MaterialTheme.colorScheme.onTertiary)
-                        ) {
-                            if (installing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                            else Icon(Icons.Default.PlayArrow, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(if (installing) "جارٍ التثبيت والتحقق…" else "تثبيت المود بأمان")
+                        val unavailable = modInstallUnavailableReason(
+                            analysis,
+                            operationBound,
+                            genericDestinationConfirmed
+                        )
+                        val outcome = modsUiOutcome(analysis)
+                        val actionText = unavailable ?: if (installing) {
+                            "جارٍ نقل الملفات والتحقق منها على النظارة."
+                        } else {
+                            "الخطة جاهزة؛ استخدم زر بدء التثبيت بعد مراجعتها."
                         }
+                        StatusNote(
+                            actionText,
+                            if (unavailable == null) Icons.Default.Info else Icons.Default.Warning,
+                            outcomeColor(outcome.tone)
+                        )
                     }
                 }
                 if (installing || executionProgress != null) item { ProgressCard(executionProgress) }
@@ -605,11 +688,18 @@ fun ModsWorkflowUi(
     }
 }
 
-@Composable private fun WorkflowRail(connected: Boolean, app: Boolean, zip: Boolean, reviewed: Boolean, complete: Boolean) {
+@Composable private fun WorkflowRail(
+    connected: Boolean,
+    app: Boolean,
+    zip: Boolean,
+    analyzed: Boolean,
+    reviewed: Boolean,
+    complete: Boolean
+) {
     val steps = listOf(
         "01 اللعبة" to app,
-        "02 مود ZIP" to zip,
-        "03 التحليل" to reviewed,
+        "02 الحزمة" to zip,
+        "03 التحليل" to analyzed,
         "04 الخطة" to reviewed,
         "05 الإجراء" to complete
     )
@@ -730,14 +820,14 @@ fun ModsWorkflowUi(
                     Icon(Icons.Default.Info, null, tint = MaterialTheme.colorScheme.primary)
                 }
                 Column(Modifier.weight(1f)) {
-                    Text(filename ?: "لم يتم اختيار ملف ZIP", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(if (filename == null) "اختر حزمة مود من جهاز الكمبيوتر" else "الحزمة جاهزة للتحليل", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                     Text(filename ?: "لم يتم اختيار ملف ZIP أو QMOD", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                     Text(if (filename == null) "اختر حزمة مود من جهاز الكمبيوتر" else "الحزمة جاهزة للتحليل البنيوي", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 OutlinedButton(onClick = onChooseFile, enabled = enabled) { Text("اختيار ملف") }
             }
             Text(
-                if (hovered == true) "أفلت ملف ZIP هنا للتحليل"
-                else "أو اسحب ملف ZIP إلى هذه المنطقة",
+                if (hovered == true) "أفلت ملف ZIP أو QMOD هنا للتحليل"
+                else "أو اسحب ملف ZIP أو QMOD إلى هذه المنطقة",
                 style = MaterialTheme.typography.labelMedium,
                 color = if (hovered == true) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant
@@ -791,10 +881,43 @@ private fun Modifier.registerDesktopDropTargetIf(
             )
             StatusNote(outcome.action, Icons.Default.Info, tone)
             StatusNote(
-                "لا توجد وجهة نقل مباشرة آمنة لهذا النوع؛ لم يتم نقل أي ملف.",
+                "لم يتم تثبيت أي ملف على النظارة.",
                 Icons.Default.CheckCircle,
                 tone
             )
+        }
+    }
+}
+
+@Composable
+private fun AnalysisResultCard(analysis: ModPackageAnalysis) {
+    val outcome = modsUiOutcome(analysis)
+    val tone = outcomeColor(outcome.tone)
+    Card(
+        colors = CardDefaults.cardColors(containerColor = tone.copy(alpha = 0.12f)),
+        border = BorderStroke(2.dp, tone)
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("نتيجة التحليل", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(outcome.title, style = MaterialTheme.typography.headlineSmall, color = tone)
+            Text("النوع: ${displayModPackageType(analysis.packageType)}", style = MaterialTheme.typography.titleMedium)
+            Text(customerAnalysisMessage(analysis), style = MaterialTheme.typography.bodyLarge)
+            StatusNote(outcome.action, Icons.Default.Info, tone)
+            StatusNote(outcome.changedFiles, Icons.Default.Info, tone)
+        }
+    }
+}
+
+@Composable
+private fun InstallationSuccessCard() {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+        border = BorderStroke(2.dp, MaterialTheme.colorScheme.tertiary)
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("تم تثبيت المود بنجاح", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.tertiary)
+            Text("تم نقل الملفات والتحقق منها على النظارة.", style = MaterialTheme.typography.bodyLarge)
+            StatusNote("تم تغيير الملفات بعد اكتمال التحقق البعيد.", Icons.Default.CheckCircle, MaterialTheme.colorScheme.tertiary)
         }
     }
 }

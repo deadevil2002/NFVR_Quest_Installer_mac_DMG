@@ -38,8 +38,10 @@ class WindowsIsolatedPickerTest {
         try {
             val directory = File(root, "مجلد اللعبة").also { it.mkdirs() }
             val archive = File(root, "مود-اختبار.ZIP").also { it.writeBytes(byteArrayOf(1, 2, 3)) }
+            val qmod = File(root, "مود-اختبار.QMOD").also { it.writeBytes(byteArrayOf(1, 2, 3)) }
             assertNull(pickerSelectionError(DesktopChooserMode.DIRECTORY, directory))
             assertNull(pickerSelectionError(DesktopChooserMode.FILES, archive))
+            assertNull(pickerSelectionError(DesktopChooserMode.FILES, qmod))
             assertTrue(
                 pickerSelectionError(DesktopChooserMode.FILES, directory)
                     ?.contains("ZIP") == true
