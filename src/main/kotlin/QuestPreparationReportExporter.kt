@@ -65,11 +65,9 @@ object QuestPreparationReportExporter {
     /** Export the immutable report emitted by QuestPreparationProbe. */
     fun export(report: QuestPreparationProbeReport, directory: Path): ExportedFiles {
         val root = confinedDirectory(directory)
-        val games = report.games.asSequence()
-            .filter { isTargetGame(it) }
-            .distinctBy { it.packageId }
-            .map(::probeGameJson)
-            .toList()
+        val games = canonicalProbeGames(report).map { (game, discovery, probeState) ->
+            probeGameJson(game, discovery.state.name, probeState)
+        }
         val rootJson = JSONObject()
             .put("schemaVersion", 1)
             .put("generatedAt", Instant.now().toString())
@@ -91,6 +89,14 @@ object QuestPreparationReportExporter {
                     put("game", discovery.game)
                     put("state", discovery.state.name)
                     put("candidateCount", discovery.candidates.size)
+                    put("candidateIds", JSONArray(discovery.candidates.map { it.packageId }))
+                    put("candidates", JSONArray(discovery.candidates.map { candidate ->
+                        JSONObject().apply {
+                            put("packageId", candidate.packageId)
+                            candidate.label?.let { put("label", it) }
+                            put("evidence", JSONArray(candidate.evidence))
+                        }
+                    }))
                 }
             }))
             .put("games", JSONArray(games))
@@ -104,21 +110,83 @@ object QuestPreparationReportExporter {
         return ExportedFiles(jsonPath, textPath)
     }
 
+    /**
+     * Build one stable game row per discovery, not one row per successful
+     * inspection.  A failed/cancelled inspection therefore remains visible in
+     * the exported snapshot instead of silently disappearing.
+     */
+    private fun canonicalProbeGames(
+        report: QuestPreparationProbeReport
+    ): List<Triple<QuestProbeGame, QuestProbeDiscovery, String>> {
+        val rows = report.discoveries.mapNotNull { discovery ->
+            val candidateIds = discovery.candidates.map { it.packageId }.toSet()
+            val game = report.games.firstOrNull { it.packageId in candidateIds }
+                ?: report.games.firstOrNull { it.displayName == discovery.game }
+            // A NOT_FOUND discovery has no target package and therefore is not
+            // a game evidence row. FOUND rows are retained even when probing
+            // failed or was cancelled so their placeholder is explicit.
+            if (game == null && discovery.state != ProbeTargetState.FOUND) return@mapNotNull null
+            val packageId = game?.packageId
+                ?: discovery.candidates.singleOrNull()?.packageId
+                ?: ""
+            val value = game ?: QuestProbeGame(
+                displayName = discovery.game,
+                packageId = packageId,
+                warnings = when {
+                    report.cancelled -> listOf("probe cancelled before evidence collection")
+                    report.stale -> listOf("probe stopped because the device became stale")
+                    discovery.state == ProbeTargetState.FOUND -> listOf("inspection did not complete")
+                    else -> emptyList()
+                }
+            )
+            val probeState = when {
+                game != null && game.probeState != QuestProbeState.NOT_STARTED -> game.probeState.name
+                report.cancelled && game == null -> "CANCELLED"
+                report.stale && game == null -> "CANCELLED"
+                game == null && discovery.state == ProbeTargetState.FOUND -> "FAILED"
+                game == null -> "NOT_PROBED"
+                game.warnings.isNotEmpty() -> "PARTIAL"
+                else -> "COMPLETE"
+            }
+            Triple(value, discovery, probeState)
+        }
+        val known = rows.map { it.first.packageId }.toSet()
+        val additional = report.games.filter { isTargetGame(it) && it.packageId !in known }.map { game ->
+            Triple(
+                game,
+                QuestProbeDiscovery(
+                    game.displayName,
+                    ProbeTargetState.FOUND,
+                    listOf(QuestProbeCandidate(game.packageId, null, listOf("probe result")))
+                ),
+                if (game.probeState != QuestProbeState.NOT_STARTED) game.probeState.name
+                else if (game.warnings.isEmpty()) "COMPLETE" else "PARTIAL"
+            )
+        }
+        return (rows + additional).distinctBy { "${it.first.displayName}:${it.first.packageId}" }
+    }
+
     private fun isTargetGame(game: QuestProbeGame): Boolean =
         game.packageId in targetPackages ||
             game.displayName.lowercase() in setOf("blade & sorcery: nomad", "blade and sorcery: nomad")
 
-    private fun probeGameJson(game: QuestProbeGame): JSONObject = JSONObject().apply {
+    private fun probeGameJson(
+        game: QuestProbeGame,
+        discoveryState: String = ProbeTargetState.FOUND.name,
+        probeState: String = if (game.warnings.isEmpty()) "COMPLETE" else "PARTIAL"
+    ): JSONObject = JSONObject().apply {
         put("displayName", game.displayName)
         put("packageId", game.packageId)
-        game.versionName?.let { put("versionName", it) }
-        game.versionCode?.let { put("versionCode", it) }
-        game.firstInstallTime?.let { put("firstInstallTime", it) }
-        game.lastUpdateTime?.let { put("lastUpdateTime", it) }
-        game.installer?.let { put("installer", it) }
-        game.minSdk?.let { put("minSdk", it) }
-        game.targetSdk?.let { put("targetSdk", it) }
-        game.applicationFlags?.let { put("applicationFlags", it) }
+        put("discoveryState", discoveryState)
+        put("probeState", probeState)
+        putNullable("versionName", game.versionName)
+        putNullable("versionCode", game.versionCode)
+        putNullable("firstInstallTime", game.firstInstallTime)
+        putNullable("lastUpdateTime", game.lastUpdateTime)
+        putNullable("installer", game.installer)
+        putNullable("minSdk", game.minSdk)
+        putNullable("targetSdk", game.targetSdk)
+        putNullable("applicationFlags", game.applicationFlags)
         put("engine", JSONObject()
             .put("name", game.engine.engine.name)
             .put("confidence", game.engine.confidence)
@@ -133,17 +201,18 @@ object QuestPreparationReportExporter {
                 apk.manifestSha256?.let { put("manifestSha256", it) }
             }
         }))
-        game.manifest?.sha256?.let { put("manifestSha256", it) }
-        game.manifest?.let { manifest ->
-            put("manifest", JSONObject().apply {
-                manifest.sha256?.let { put("sha256", it) }
-                manifest.packageName?.let { put("packageName", it) }
-                manifest.versionName?.let { put("versionName", it) }
-                manifest.versionCode?.let { put("versionCode", it) }
-                manifest.minSdk?.let { put("minSdk", it) }
-                manifest.targetSdk?.let { put("targetSdk", it) }
-                manifest.applicationClass?.let { put("applicationClass", it) }
-                manifest.launcherActivity?.let { put("launcherActivity", it) }
+        putNullable("manifestSha256", game.manifest?.sha256)
+        put("manifest", JSONObject().apply {
+            val manifest = game.manifest
+            putNullable("sha256", manifest?.sha256)
+            putNullable("packageName", manifest?.packageName)
+            putNullable("versionName", manifest?.versionName)
+            putNullable("versionCode", manifest?.versionCode)
+            putNullable("minSdk", manifest?.minSdk)
+            putNullable("targetSdk", manifest?.targetSdk)
+            putNullable("applicationClass", manifest?.applicationClass)
+            putNullable("launcherActivity", manifest?.launcherActivity)
+            if (manifest != null) {
                 put("permissions", JSONArray(manifest.permissions))
                 manifest.extractNativeLibs?.let { put("extractNativeLibs", it) }
                 manifest.debuggable?.let { put("debuggable", it) }
@@ -152,8 +221,15 @@ object QuestPreparationReportExporter {
                 put("receivers", JSONArray(manifest.receivers))
                 put("metadata", JSONObject(manifest.metadata))
                 put("decoded", manifest.decoded)
-            })
-        }
+            } else {
+                put("permissions", JSONArray())
+                put("services", JSONArray())
+                put("providers", JSONArray())
+                put("receivers", JSONArray())
+                put("metadata", JSONObject())
+                put("decoded", false)
+            }
+        })
         put("signing", JSONObject().apply {
             put("entries", JSONArray(game.signing.entries))
             put("certificateFingerprints", JSONArray(game.signing.certificateFingerprints))
@@ -180,7 +256,21 @@ object QuestPreparationReportExporter {
         put("modData", safeDataJson(game.modData))
         put("preparationState", game.preparationState.name)
         put("warnings", JSONArray(game.warnings))
+        put("diagnostics", JSONObject().apply {
+            game.apkPathDiagnostics?.let { paths ->
+                put("apkPath", JSONObject()
+                    .put("rawLineCount", paths.rawLineCount)
+                    .put("validApkLineCount", paths.validApkLineCount)
+                    .put("uniqueApkCount", paths.uniqueApkCount)
+                    .put("limit", paths.limit)
+                    .put("limitExceeded", paths.limitExceeded))
+            }
+            put("warnings", JSONArray(game.warnings))
+        })
     }
+
+    private fun JSONObject.putNullable(name: String, value: Any?): JSONObject =
+        put(name, value ?: JSONObject.NULL)
 
     private fun safeDataJson(data: QuestProbeData): JSONObject = JSONObject().apply {
         put("exists", data.exists)

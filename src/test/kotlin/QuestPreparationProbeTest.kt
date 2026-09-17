@@ -8,10 +8,12 @@ import kotlin.test.assertTrue
 
 class QuestPreparationProbeTest {
     private class FakeTransport(private val packages: String, private val files: Map<String, ByteArray>,
-        private val rowOnlyDevices: Boolean = false) :
+        private val rowOnlyDevices: Boolean = false, private val failPathFor: Set<String> = emptySet(),
+        private val deviceOutput: (() -> String)? = null) :
         RestrictedQuestTransport {
         val calls = mutableListOf<String>()
-        override fun devices() = if (rowOnlyDevices) "quest-1\tdevice\n" else "List of devices attached\nquest-1\tdevice\n"
+        override fun devices() = deviceOutput?.invoke()
+            ?: if (rowOnlyDevices) "quest-1\tdevice\n" else "List of devices attached\nquest-1\tdevice\n"
         override fun getprop(serial: String, name: String): String {
             calls += "$serial getprop $name"
             return mapOf("ro.product.model" to "Quest 3", "ro.build.version.release" to "13",
@@ -21,10 +23,11 @@ class QuestPreparationProbeTest {
         override fun packageList(serial: String): String { calls += "$serial pm list packages"; return packages }
         override fun packageInfo(serial: String, packageId: String): String {
             calls += "$serial dumpsys package $packageId"
-            return "versionName=1.2.3 versionCode=12"
+            return "versionName=1.2.3 versionCode=12 firstInstallTime=2025-01-01 10:20:30 lastUpdateTime=2025-02-01 11:22:33"
         }
         override fun packagePaths(serial: String, packageId: String): List<String> {
             calls += "$serial pm path $packageId"
+            check(packageId !in failPathFor) { "simulated APK path failure" }
             return files.keys.filter { it.contains(packageId) }
         }
         override fun stat(serial: String, path: String): Long? { calls += "$serial stat $path"; return files[path]?.size?.toLong() }
@@ -98,5 +101,86 @@ class QuestPreparationProbeTest {
             assertEquals(ProbeEngine.UNREAL_ENGINE, game.engine.engine)
             assertTrue(root.listFiles().orEmpty().none { it.exists() })
         } finally { root.deleteRecursively() }
+    }
+
+    @Test fun `one APK failure preserves metadata and does not abort later found games`() {
+        val entries = listOf(
+            apk("com.AnotherAxiom.GorillaTag", true),
+            apk("com.beatgames.beatsaber", false),
+            apk("com.StressLevelZero.BONELAB", false),
+            apk("com.example.nomad", false)
+        )
+        val fake = FakeTransport(
+            entries.joinToString("\n") { "package:${it.first}" },
+            entries.toMap(),
+            failPathFor = setOf("com.AnotherAxiom.GorillaTag")
+        )
+
+        val report = QuestPreparationProbe(fake).probe()
+        assertEquals(4, report.games.size)
+        val failed = report.games.first()
+        assertEquals(ProbeTargetState.FOUND, failed.discoveryState)
+        assertEquals(QuestProbeState.PARTIAL, failed.probeState)
+        assertEquals("1.2.3", failed.versionName)
+        assertEquals("2025-01-01 10:20:30", failed.firstInstallTime)
+        assertEquals("2025-02-01 11:22:33", failed.lastUpdateTime)
+        assertEquals(3, report.games.drop(1).count { it.probeState == QuestProbeState.COMPLETE })
+    }
+
+    @Test fun `individual scan only probes selected found game`() {
+        val entries = listOf(
+            apk("com.AnotherAxiom.GorillaTag", true),
+            apk("com.beatgames.beatsaber", false),
+            apk("com.StressLevelZero.BONELAB", false)
+        )
+        val fake = FakeTransport(entries.joinToString("\n") { "package:${it.first}" }, entries.toMap())
+        val report = QuestPreparationProbe(fake).probe(targetGame = "bonelab")
+        assertEquals(1, report.games.size)
+        assertEquals("BONELAB", report.games.single().displayName)
+        assertTrue(fake.calls.none { "com.beatgames.beatsaber" in it || "GorillaTag" in it })
+    }
+
+    @Test fun `cancellation retains completed result and marks remaining placeholders`() {
+        val entries = listOf(
+            apk("com.AnotherAxiom.GorillaTag", true),
+            apk("com.beatgames.beatsaber", false),
+            apk("com.StressLevelZero.BONELAB", false),
+            apk("com.example.nomad", false)
+        )
+        val fake = FakeTransport(entries.joinToString("\n") { "package:${it.first}" }, entries.toMap())
+        var cancel = false
+        val report = QuestPreparationProbe(fake).probe(cancelled = {
+            cancel
+        }, onGame = { game ->
+            if (game.displayName == "Gorilla Tag" && game.probeState == QuestProbeState.COMPLETE) {
+                cancel = true
+            }
+        })
+        assertTrue(report.cancelled)
+        assertEquals(QuestProbeState.COMPLETE, report.games.first().probeState)
+        assertTrue(report.games.drop(1).all { it.probeState == QuestProbeState.CANCELLED })
+    }
+
+    @Test fun `stale device retains completed result and marks remaining stale`() {
+        val entries = listOf(
+            apk("com.AnotherAxiom.GorillaTag", true),
+            apk("com.beatgames.beatsaber", false),
+            apk("com.StressLevelZero.BONELAB", false),
+            apk("com.example.nomad", false)
+        )
+        var stale = false
+        val fake = FakeTransport(
+            entries.joinToString("\n") { "package:${it.first}" },
+            entries.toMap(),
+            deviceOutput = { if (stale) "other-quest\tdevice\n" else "quest-1\tdevice\n" }
+        )
+        val report = QuestPreparationProbe(fake).probe(onGame = { game ->
+            if (game.displayName == "Gorilla Tag" && game.probeState == QuestProbeState.COMPLETE) {
+                stale = true
+            }
+        })
+        assertTrue(report.stale)
+        assertEquals(QuestProbeState.COMPLETE, report.games.first().probeState)
+        assertTrue(report.games.drop(1).all { it.probeState == QuestProbeState.STALE })
     }
 }

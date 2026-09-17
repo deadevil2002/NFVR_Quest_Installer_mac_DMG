@@ -807,7 +807,7 @@ private fun QuestPreparationProbeSection(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             if (state.busy || state.completed.isNotEmpty()) {
-                Text("${state.completed.size} / ${state.totalGames} ألعاب", style = MaterialTheme.typography.labelMedium)
+                 Text("${questProbeCompletedCount(state)} / ${state.totalGames} ألعاب", style = MaterialTheme.typography.labelMedium)
                 LinearProgressIndicator(
                     progress = { questProbeProgress(state) },
                     modifier = Modifier.fillMaxWidth()
@@ -815,28 +815,34 @@ private fun QuestPreparationProbeSection(
             }
             Text(questProbeStatus(state), style = MaterialTheme.typography.bodySmall)
             if (state.report != null) state.report.discoveries.forEach { discovery ->
-                val completed = state.completed.firstOrNull { it.displayName == discovery.game }
-                val status = when {
-                    completed?.warnings?.isNotEmpty() == true -> "NOT_FOUND"
-                    completed != null -> "FOUND"
-                    else -> questProbeStateLabel(discovery.state)
-                }
-                val tone = when (status) {
-                    "FOUND" -> MaterialTheme.colorScheme.tertiary
-                    "AMBIGUOUS" -> warningColor()
+                 // Discovery remains authoritative. Evidence warnings describe
+                 // a partial/failed probe and must never overwrite FOUND with
+                 // NOT_FOUND.
+                 val completed = state.completed.firstOrNull { game ->
+                     discovery.candidates.any { it.packageId == game.packageId }
+                 }
+                 val row = questProbeRowPresentation(
+                     discovery = discovery,
+                     game = completed,
+                     busy = state.busy && state.currentGame.equals(discovery.game, true),
+                     cancelled = state.cancelled
+                 )
+                 val tone = when (row.discoveryState) {
+                     ProbeTargetState.FOUND -> MaterialTheme.colorScheme.tertiary
+                     ProbeTargetState.AMBIGUOUS -> warningColor()
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
                     Column(Modifier.weight(1f)) {
                         Text(discovery.game, style = MaterialTheme.typography.labelLarge)
                         Text(
-                            when {
-                                discovery.candidates.isEmpty() -> status
-                                else -> "$status · " + discovery.candidates.joinToString { it.packageId }
-                            },
+                             row.discoveryLabel +
+                                 if (discovery.candidates.isEmpty()) "" else
+                                     " · " + discovery.candidates.joinToString { it.packageId },
                             style = MaterialTheme.typography.bodySmall,
                             color = tone
                         )
+                         Text(row.probeLabel, style = MaterialTheme.typography.bodySmall)
                         if (completed?.warnings?.isNotEmpty() == true) {
                             Text("تحذير: تعذر إكمال بعض الأدلة.", style = MaterialTheme.typography.bodySmall, color = warningColor())
                         }

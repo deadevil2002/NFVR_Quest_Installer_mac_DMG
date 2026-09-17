@@ -48,6 +48,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.io.StringWriter
+import java.util.concurrent.atomic.AtomicBoolean
 import java.io.PrintWriter
 import kotlin.math.roundToInt
 import java.security.MessageDigest
@@ -517,7 +518,7 @@ open fun pushWithProgress(
 class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestTransport {
     private data class CommandResult(val exit: Int, val out: String, val err: String)
     private val packagePattern = Regex("""^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$""")
-    private val remoteFilePattern = Regex("""^/(?:data/app|system|product|vendor)/[A-Za-z0-9_./+@=-]+\.apk$""")
+    private val remoteFilePattern = Regex("""^/(?:data/app|system|product|vendor)/[A-Za-z0-9_./+@=~:-]+\.apk$""")
     private val remoteDirectoryPattern = Regex("""^/sdcard/(?:Android/(?:obb|data)|ModData)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$""")
     private val serialPattern = Regex("""^[A-Za-z0-9._:-]+$""")
     private fun bounded(value: String, limit: Int = 200_000): String = value.take(limit)
@@ -567,10 +568,21 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
     override fun packageInfo(serial: String, packageId: String): String =
         out(serial, "dumpsys", "package", checkedPackage(packageId))
 
+    override fun packagePathResult(serial: String, packageId: String): QuestProbeApkPathResult {
+        val raw = out(serial, "pm", "path", checkedPackage(packageId))
+        val parsed = QuestProbeApkPaths.parse(raw)
+        DiagnosticLogger.info(
+            "PM_PATH_RAW_LINE_COUNT=${parsed.diagnostics.rawLineCount} " +
+                "PM_PATH_VALID_APK_COUNT=${parsed.diagnostics.validApkLineCount} " +
+                "PM_PATH_UNIQUE_APK_COUNT=${parsed.diagnostics.uniqueApkCount} " +
+                "PM_PATH_LIMIT=${parsed.diagnostics.limit} " +
+                "PM_PATH_LIMIT_EXCEEDED=${parsed.diagnostics.limitExceeded}"
+        )
+        return parsed
+    }
+
     override fun packagePaths(serial: String, packageId: String): List<String> =
-        out(serial, "pm", "path", checkedPackage(packageId)).lineSequence()
-            .mapNotNull { Regex("""package:(\S+)""").find(it)?.groupValues?.get(1) }
-            .filter { remoteFilePattern.matches(it) }.toList()
+        packagePathResult(serial, packageId).paths.filter { remoteFilePattern.matches(it) }
 
     override fun stat(serial: String, path: String): Long? =
         out(serial, "stat", "-c", "%s", checkedFile(path)).trim().toLongOrNull()
@@ -826,6 +838,7 @@ fun main() {
     var questProbe by remember { mutableStateOf(QuestPreparationProbeUiState()) }
     var questProbeJob by remember { mutableStateOf<Job?>(null) }
     var questProbeCancel by remember { mutableStateOf(false) }
+    var questProbeRunToken by remember { mutableStateOf(0L) }
     var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
@@ -2351,12 +2364,15 @@ fun main() {
         val serial = connectedDeviceSerial
         if (serial.isNullOrBlank() || questProbeJob != null) return
         val generation = modOperationGeneration
+        val runToken = questProbeRunToken + 1L
+        questProbeRunToken = runToken
+        val previousReport = questProbe.report
         questProbeCancel = false
-        val prior = questProbe.completed
         questProbe = questProbe.copy(
             busy = true, cancelled = false, stale = false, error = null,
             currentGame = target ?: "الألعاب المستهدفة", exportedJson = null, exportedText = null
         )
+        val callbacksOpen = AtomicBoolean(true)
         val job = uiScope.launch {
             try {
                 val report = withContext(Dispatchers.IO) {
@@ -2364,9 +2380,15 @@ fun main() {
                         targetGame = target,
                         onGame = { game ->
                             uiScope.launch(Dispatchers.Main.immediate) {
-                                if (generation == modOperationGeneration && connectedDeviceSerial == serial) {
+                                if (callbacksOpen.get() &&
+                                    runToken == questProbeRunToken &&
+                                    generation == modOperationGeneration &&
+                                    connectedDeviceSerial == serial
+                                ) {
+                                    val completed = questProbe.completed
+                                        .filterNot { it.packageId == game.packageId } + game
                                     questProbe = questProbe.copy(
-                                        completed = (questProbe.completed + game).distinctBy { it.packageId },
+                                        completed = completed.distinctBy { it.packageId },
                                         currentGame = game.displayName
                                     )
                                 }
@@ -2375,28 +2397,35 @@ fun main() {
                         cancelled = { questProbeCancel || !isActive }
                     )
                 }
-                if (generation != modOperationGeneration || connectedDeviceSerial != serial) {
+                callbacksOpen.set(false)
+                val sameDevice = report.device.serial == serial && connectedDeviceSerial == serial
+                val finalReport = mergeQuestProbeReports(previousReport, report, target, sameDevice)
+                if (runToken != questProbeRunToken ||
+                    generation != modOperationGeneration ||
+                    connectedDeviceSerial != serial
+                ) {
                     questProbe = questProbe.copy(
-                        report = report,
-                        completed = report.games,
+                        report = finalReport,
+                        completed = finalReport.games,
                         busy = false,
                         stale = true,
-                        cancelled = report.cancelled,
+                        cancelled = report.cancelled || report.stale,
                         currentGame = null
                     )
                 } else {
                     questProbe = questProbe.copy(
-                        report = report,
-                        completed = (prior + report.games).distinctBy { it.packageId },
+                        report = finalReport,
+                        completed = finalReport.games,
                         busy = false,
-                        cancelled = report.cancelled,
-                        stale = report.stale,
+                        cancelled = finalReport.cancelled,
+                        stale = finalReport.stale,
                         currentGame = null
                     )
                 }
             } catch (e: CancellationException) {
                 questProbe = questProbe.copy(busy = false, cancelled = true, currentGame = null)
             } catch (e: Throwable) {
+                callbacksOpen.set(false)
                 questProbe = questProbe.copy(
                     busy = false, error = "تعذر إكمال فحص الجاهزية: ${e.message ?: "خطأ غير معروف"}",
                     currentGame = null

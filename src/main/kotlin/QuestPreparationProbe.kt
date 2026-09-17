@@ -9,6 +9,14 @@ interface RestrictedQuestTransport {
     fun packageList(serial: String): String
     fun packageInfo(serial: String, packageId: String): String
     fun packagePaths(serial: String, packageId: String): List<String>
+    /**
+     * Carries the original pm-path diagnostics across the transport boundary.
+     * Legacy transports only implement packagePaths; their default result is
+     * still normalized defensively, while production adapters preserve raw
+     * line/accepted/unique counts from stdout.
+     */
+    fun packagePathResult(serial: String, packageId: String): QuestProbeApkPathResult =
+        QuestProbeApkPaths.normalizeDirect(packagePaths(serial, packageId))
     fun stat(serial: String, path: String): Long?
     fun list(serial: String, path: String): List<RemoteEntry>
     fun listing(serial: String, path: String): RemoteListing =
@@ -29,6 +37,8 @@ data class RestrictedListResult(
 )
 
 enum class ProbeTargetState { FOUND, NOT_FOUND, AMBIGUOUS }
+enum class QuestProbeState { NOT_STARTED, RUNNING, COMPLETE, PARTIAL, FAILED, CANCELLED, STALE }
+typealias ProbeGameState = QuestProbeState
 enum class ProbeEngine { UNITY_IL2CPP, UNITY_MONO, UNREAL_ENGINE, OTHER, UNKNOWN }
 enum class ProbePreparationState { STOCK_UNPREPARED, LOADER_READY, CONTENT_MOD_READY, CODE_MOD_READY, POSSIBLY_PATCHED, UNKNOWN }
 enum class ProbeLoader { QUESTLOADER, SCOTLAND2, LEMONLOADER, MELONLOADER_ANDROID, OTHER_KNOWN_LOADER, NONE, UNKNOWN }
@@ -40,7 +50,9 @@ data class QuestProbeDevice(
 data class QuestProbeCandidate(val packageId: String, val label: String?, val evidence: List<String>)
 data class QuestProbeDiscovery(
     val game: String, val state: ProbeTargetState, val candidates: List<QuestProbeCandidate>
-)
+) {
+    val discoveryState: ProbeTargetState get() = state
+}
 data class QuestProbeApk(
     val remotePath: String, val splitName: String?, val sizeBytes: Long?,
     val sha256: String?, val nativeHashes: Map<String, String> = emptyMap(), val manifestSha256: String? = null,
@@ -61,6 +73,8 @@ data class QuestProbeData(val exists: Boolean, val accessible: Boolean, val path
 data class QuestProbeEngineEvidence(val engine: ProbeEngine, val confidence: String, val evidence: List<String>)
 data class QuestProbeGame(
     val displayName: String, val packageId: String, val versionName: String? = null, val versionCode: Long? = null,
+    val discoveryState: ProbeTargetState = ProbeTargetState.FOUND,
+    val probeState: QuestProbeState = QuestProbeState.NOT_STARTED,
     val firstInstallTime: String? = null, val lastUpdateTime: String? = null, val installer: String? = null,
     val minSdk: Int? = null, val targetSdk: Int? = null, val applicationFlags: String? = null,
     val apks: List<QuestProbeApk> = emptyList(), val manifest: QuestProbeManifest? = null,
@@ -68,8 +82,13 @@ data class QuestProbeGame(
     val obb: QuestProbeObb = QuestProbeObb(false, false), val androidData: QuestProbeData = QuestProbeData(false, false),
     val modData: QuestProbeData = QuestProbeData(false, false), val loader: ProbeLoader = ProbeLoader.NONE,
     val contentModState: String? = null, val codeModLoaderState: String? = null,
-    val preparationState: ProbePreparationState = ProbePreparationState.UNKNOWN, val warnings: List<String> = emptyList()
-)
+    val preparationState: ProbePreparationState = ProbePreparationState.UNKNOWN,
+    val warnings: List<String> = emptyList(),
+    val apkPathDiagnostics: QuestProbeApkPathDiagnostics? = null
+) {
+    val apkInventory: List<QuestProbeApk> get() = apks
+    val loaderEvidence: ProbeLoader get() = loader
+}
 data class QuestPreparationProbeReport(
     val schemaVersion: Int = 1, val device: QuestProbeDevice, val discoveries: List<QuestProbeDiscovery>,
     val games: List<QuestProbeGame>, val cancelled: Boolean = false, val stale: Boolean = false
@@ -77,7 +96,7 @@ data class QuestPreparationProbeReport(
     fun toJson(): String {
         fun q(s: String?) = if (s == null) "null" else "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
         val gs = games.joinToString(",") { g ->
-            """{"displayName":${q(g.displayName)},"packageId":${q(g.packageId)},"versionName":${q(g.versionName)},"versionCode":${g.versionCode ?: "null"},"engine":${q(g.engine.engine.name)},"engineEvidence":[${g.engine.evidence.joinToString(",") { q(it) }}],"preparationState":${q(g.preparationState.name)},"loader":${q(g.loader.name)},"apkInventory":[${g.apks.joinToString(",") { a -> """{"remotePath":${q(a.remotePath)},"splitName":${q(a.splitName)},"sizeBytes":${a.sizeBytes ?: "null"},"sha256":${q(a.sha256)}}""" }}],"manifestSha256":${q(g.manifest?.sha256)},"signing":{"metaInfEntries":[${g.signing.entries.joinToString(",") { q(it) }}],"certificateFingerprints":[${g.signing.certificateFingerprints.joinToString(",") { q(it) }}],"baseSplitsConsistent":${g.signing.baseSplitsConsistent ?: "null"}},"obb":{"exists":${g.obb.exists},"accessible":${g.obb.accessible},"totalBytes":${g.obb.totalBytes},"entries":[${g.obb.entries.joinToString(",") { q(it.path) }}]},"androidData":{"exists":${g.androidData.exists},"accessible":${g.androidData.accessible},"paths":[${g.androidData.paths.joinToString(",") { q(it) }}]},"warnings":[${g.warnings.joinToString(",") { q(it) }}]}"""
+            """{"displayName":${q(g.displayName)},"packageId":${q(g.packageId)},"discoveryState":${q(g.discoveryState.name)},"probeState":${q(g.probeState.name)},"versionName":${q(g.versionName)},"versionCode":${g.versionCode ?: "null"},"firstInstallTime":${q(g.firstInstallTime)},"lastUpdateTime":${q(g.lastUpdateTime)},"installer":${q(g.installer)},"engine":${q(g.engine.engine.name)},"engineEvidence":[${g.engine.evidence.joinToString(",") { q(it) }}],"preparationState":${q(g.preparationState.name)},"loader":${q(g.loader.name)},"apkPathDiagnostics":${g.apkPathDiagnostics?.let { d -> """{"rawLineCount":${d.rawLineCount},"validApkLineCount":${d.validApkLineCount},"uniqueApkCount":${d.uniqueApkCount},"limit":${d.limit}}""" } ?: "null"},"apkInventory":[${g.apks.joinToString(",") { a -> """{"remotePath":${q(a.remotePath)},"splitName":${q(a.splitName)},"sizeBytes":${a.sizeBytes ?: "null"},"sha256":${q(a.sha256)}}""" }}],"manifestSha256":${q(g.manifest?.sha256)},"signing":{"metaInfEntries":[${g.signing.entries.joinToString(",") { q(it) }}],"certificateFingerprints":[${g.signing.certificateFingerprints.joinToString(",") { q(it) }}],"baseSplitsConsistent":${g.signing.baseSplitsConsistent ?: "null"}},"obb":{"exists":${g.obb.exists},"accessible":${g.obb.accessible},"totalBytes":${g.obb.totalBytes},"entries":[${g.obb.entries.joinToString(",") { q(it.path) }}]},"androidData":{"exists":${g.androidData.exists},"accessible":${g.androidData.accessible},"paths":[${g.androidData.paths.joinToString(",") { q(it) }}]},"modData":{"exists":${g.modData.exists},"accessible":${g.modData.accessible},"paths":[${g.modData.paths.joinToString(",") { q(it) }}]},"loaderEvidence":{"loader":${q(g.loader.name)},"contentModState":${q(g.contentModState)},"codeModLoaderState":${q(g.codeModLoaderState)}},"warnings":[${g.warnings.joinToString(",") { q(it) }}]}"""
         }
         return """{"schemaVersion":$schemaVersion,"device":{"serial":${q(device.serial)},"model":${q(device.model)},"android":${q(device.android)},"abi":${q(device.abi)},"abis":[${device.abis.joinToString(",") { q(it) }}],"architecture":${q(device.architecture)},"authorized":${device.authorized}},"cancelled":$cancelled,"stale":$stale,"games":[$gs]}"""
     }
@@ -94,7 +113,7 @@ class QuestPreparationProbe(
 ) {
     companion object {
         const val MAX_CANDIDATES = 256
-        const val MAX_APKS_PER_GAME = 32
+        const val MAX_APKS_PER_GAME = QuestProbeApkPaths.DEFAULT_LIMIT
         const val MAX_APK_BYTES = 512L * 1024 * 1024
         const val MAX_TOTAL_APK_BYTES = 1024L * 1024 * 1024
         const val MAX_DIRECTORY_ENTRIES = 512
@@ -136,28 +155,54 @@ class QuestPreparationProbe(
             }
             QuestProbeDiscovery(p.displayName, when { candidates.size == 1 -> ProbeTargetState.FOUND; candidates.isEmpty() -> ProbeTargetState.NOT_FOUND; else -> ProbeTargetState.AMBIGUOUS }, candidates)
         }
-        val results = mutableListOf<QuestProbeGame>()
-        var stale = false
-        try {
-        for (d in discoveries.filter {
+        val selected = discoveries.filter {
             it.state == ProbeTargetState.FOUND &&
                 (targetGame == null || it.game.equals(targetGame, true) ||
                     profiles.firstOrNull { profile -> profile.displayName == it.game }?.let { profile ->
                         targetGame.equals(profile.id, true) || targetGame in profile.knownPackages
                     } == true)
-        }) {
+        }
+        // Pre-seed every discovered target.  A later failed/cancelled probe
+        // must not make a previously discovered game disappear from the
+        // report.
+        val results = selected.map { d ->
+            val c = d.candidates.single()
+            QuestProbeGame(d.game, c.packageId, discoveryState = d.state)
+        }.toMutableList()
+        results.forEach(onGame)
+        var stale = false
+        try {
+        for ((index, d) in selected.withIndex()) {
                 if (cancelled()) break
                 ensureLive(serial, cancelled)
                 val c = d.candidates.single()
+                results[index] = results[index].copy(probeState = QuestProbeState.RUNNING)
+                onGame(results[index])
                 val result = runCatching { inspect(device, d.game, c.packageId, cancelled) }.getOrElse {
                     if (it.message?.contains("cancel", true) == true || it.message?.contains("stale", true) == true) throw it
-                    QuestProbeGame(d.game, c.packageId, warnings = listOf(it.message ?: "inspection failed"))
+                    QuestProbeGame(
+                        d.game, c.packageId, discoveryState = d.state,
+                        probeState = QuestProbeState.FAILED,
+                        warnings = listOf("PROBE_FAILED")
+                    )
                 }
-                results += result; onGame(result)
+                results[index] = result
+                onGame(result)
             }
             stale = authorizedSerial(transport.devices()) != serial
         } catch (e: IllegalStateException) {
             stale = e.message?.contains("stale", true) == true || authorizedSerial(transport.devices()) != serial
+        }
+        if (cancelled() || stale) {
+            val remainingState = if (stale) QuestProbeState.STALE else QuestProbeState.CANCELLED
+            results.indices.filter {
+                results[it].probeState !in setOf(
+                    QuestProbeState.COMPLETE, QuestProbeState.PARTIAL, QuestProbeState.FAILED
+                )
+            }.forEach { index ->
+                results[index] = results[index].copy(probeState = remainingState)
+                onGame(results[index])
+            }
         }
         return QuestPreparationProbeReport(device = device, discoveries = discoveries, games = results, cancelled = cancelled() || stale, stale = stale)
     }
@@ -178,13 +223,73 @@ class QuestPreparationProbe(
         ensureLive(device.serial, cancelled)
         val info = transport.packageInfo(device.serial, packageId).also { ensureLive(device.serial, cancelled) }
         fun field(n: String) = Regex("""(?m)$n[=:]([^\s]+)""").find(info)?.groupValues?.get(1)
-        val paths = transport.packagePaths(device.serial, packageId).also { ensureLive(device.serial, cancelled) }
-        require(paths.size in 1..MAX_APKS_PER_GAME) { "APK count exceeds safe limit" }
-        val sizes = paths.map { path -> transport.stat(device.serial, path).also { ensureLive(device.serial, cancelled) } }
-        require(sizes.all { it != null && it in 1..MAX_APK_BYTES } && sizes.filterNotNull().sum() <= MAX_TOTAL_APK_BYTES) {
-            "APK size exceeds safe limit"
+        fun dateField(n: String) = Regex(
+            """(?m)(?:^|\s)$n[=:]\s*([^\r\n]+?)(?=\s+[A-Za-z][A-Za-z0-9]*[=:]|$)"""
+        ).find(info)?.groupValues?.get(1)?.trim()
+        // Capture dumpsys metadata before touching APKs.  It remains useful
+        // evidence when an APK path, stat, or pull stage fails.
+        val metadata = QuestProbeGame(
+            displayName = display,
+            packageId = packageId,
+            discoveryState = ProbeTargetState.FOUND,
+            probeState = QuestProbeState.RUNNING,
+            versionName = field("versionName"),
+            versionCode = field("versionCode")?.toLongOrNull(),
+            firstInstallTime = dateField("firstInstallTime"),
+            lastUpdateTime = dateField("lastUpdateTime"),
+            installer = field("installer"),
+            minSdk = field("minSdk")?.toIntOrNull(),
+            targetSdk = field("targetSdk")?.toIntOrNull(),
+            applicationFlags = field("flags")
+        )
+        val warnings = mutableListOf<String>()
+        var pathDiagnostics: QuestProbeApkPathDiagnostics? = null
+        var apks = emptyList<QuestProbeApk>()
+        var apkStageComplete = false
+        try {
+            val normalized = transport.packagePathResult(device.serial, packageId).also {
+                ensureLive(device.serial, cancelled)
+            }
+            pathDiagnostics = normalized.diagnostics
+            val pathError = when {
+                normalized.paths.isEmpty() -> "zero"
+                normalized.paths.size > MAX_APKS_PER_GAME -> "limit"
+                normalized.paths.distinct().size != normalized.paths.size -> "duplicate"
+                normalized.paths.any { !QuestProbeApkPaths.isSafeApkPath(it) } -> "unsafe"
+                normalized.diagnostics.uniqueApkCount != normalized.paths.size -> "diagnostic-mismatch"
+                normalized.error != null -> "rejected"
+                else -> null
+            }
+            if (pathError != null) {
+                if (pathError == "zero") {
+                    warnings += "PM_PATH_ZERO_APK_COUNT"
+                } else if (pathError == "limit") {
+                    warnings += "PM_PATH_LIMIT_EXCEEDED: ${normalized.diagnostics.uniqueApkCount} > ${normalized.diagnostics.limit}"
+                    warnings += "عدد ملفات APK المثبتة غير معتاد ويحتاج مراجعة"
+                } else {
+                    warnings += "PM_PATH_REJECTED"
+                }
+            } else {
+                val sizes = normalized.paths.map { path ->
+                    transport.stat(device.serial, path).also { ensureLive(device.serial, cancelled) }
+                }
+                require(sizes.all { it != null && it in 1..MAX_APK_BYTES } &&
+                    sizes.filterNotNull().sum() <= MAX_TOTAL_APK_BYTES) {
+                    "APK size exceeds safe limit"
+                }
+                apks = normalized.paths.zip(sizes).map { (path, size) ->
+                    pullAnalyze(device.serial, path, size, cancelled)
+                }
+                if (apks.any { it.sha256 == null }) {
+                    warnings += "APK_PULL_FAILED"
+                } else {
+                    apkStageComplete = true
+                }
+            }
+        } catch (error: Throwable) {
+            if (isProbeAbort(error)) throw error
+            warnings += "APK_INSPECTION_FAILED"
         }
-        val apks = paths.zip(sizes).map { (path, size) -> pullAnalyze(device.serial, path, size, cancelled) }
         val manifest = apks.firstOrNull()?.let { it.manifestSha256?.let { hash -> QuestProbeManifest(hash) } }
         val signing = QuestProbeSigning(apks.flatMap { it.signingEntries }.distinct(),
             apks.flatMap { it.certificateFingerprints }.distinct(),
@@ -193,7 +298,10 @@ class QuestPreparationProbe(
         val obbResult = runCatching {
             transport.listResult(device.serial, "/sdcard/Android/obb/$packageId")
                 .also { ensureLive(device.serial, cancelled) }
-        }.getOrNull()
+        }.getOrElse {
+            if (isProbeAbort(it)) throw it
+            null
+        }
         val obbEntries = obbResult?.entries.orEmpty()
         val obb = QuestProbeObb(
             obbResult?.exists == true,
@@ -211,6 +319,9 @@ class QuestPreparationProbe(
             inspectDir(device.serial, "/sdcard/ModData/$packageId/Plugins", cancelled),
             inspectDir(device.serial, "/sdcard/ModData/$packageId/Loader", cancelled)
         )
+        if (obbResult?.success != true || !data.accessible || !mod.accessible) {
+            warnings += "DIRECTORY_PROBE_INCOMPLETE"
+        }
         val loader = loader(mod, data, apks)
         val content = if (display == "BONELAB") when {
             !data.accessible -> "UNKNOWN"
@@ -232,16 +343,28 @@ class QuestPreparationProbe(
             content == "READY" -> ProbePreparationState.CONTENT_MOD_READY
             else -> ProbePreparationState.STOCK_UNPREPARED
         }
-        return QuestProbeGame(display, packageId, field("versionName"), field("versionCode")?.toLongOrNull(), installer = field("installer"),
-            minSdk = field("minSdk")?.toIntOrNull(), targetSdk = field("targetSdk")?.toIntOrNull(), applicationFlags = field("flags"),
-            apks = apks, manifest = manifest, signing = signing, engine = engine, obb = obb,
-            androidData = data, modData = mod, loader = loader,
-            contentModState = content, codeModLoaderState = code, preparationState = state)
+        val probeState = when {
+            warnings.isNotEmpty() || !apkStageComplete -> QuestProbeState.PARTIAL
+            else -> QuestProbeState.COMPLETE
+        }
+        return metadata.copy(
+            probeState = probeState, apks = apks, manifest = manifest, signing = signing,
+            engine = engine, obb = obb, androidData = data, modData = mod, loader = loader,
+            contentModState = content, codeModLoaderState = code, preparationState = state,
+            warnings = warnings, apkPathDiagnostics = pathDiagnostics
+        )
     }
+
+    private fun isProbeAbort(error: Throwable): Boolean =
+        error.message?.contains("cancel", true) == true ||
+            error.message?.contains("stale", true) == true
 
     private fun inspectDir(s: String, path: String, cancelled: () -> Boolean): QuestProbeData {
         val result = runCatching { transport.listResult(s, path).also { ensureLive(s, cancelled) } }
-            .getOrElse { return QuestProbeData(false, false, emptyList()) }
+            .getOrElse {
+                if (isProbeAbort(it)) throw it
+                return QuestProbeData(false, false, emptyList())
+            }
         if (!result.success) return QuestProbeData(result.exists, false, emptyList())
         val e = result.entries
         val queriedPath = if (result.exists) listOf(path) else emptyList()
