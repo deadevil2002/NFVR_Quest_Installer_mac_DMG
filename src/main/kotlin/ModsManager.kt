@@ -5,6 +5,7 @@ import java.util.zip.ZipFile
 import java.security.MessageDigest
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runInterruptible
@@ -209,10 +210,67 @@ data class ModInstallResult(
     val extractedRoot: File? = null
 )
 
+/**
+ * APK identity is collected only for the selected package. A normal package
+ * scan deliberately remains cheap and does not pull every installed APK.
+ */
+fun interface QuestApkEvidenceRefresher {
+    suspend fun refresh(
+        serial: String,
+        app: InstalledQuestApp,
+        onProgress: (String) -> Unit,
+        cancelled: () -> Boolean
+    ): InstalledQuestApp
+}
+
+class RestrictedQuestApkEvidenceRefresher(
+    private val adbClient: AdbClient
+) : QuestApkEvidenceRefresher {
+    override suspend fun refresh(
+        serial: String,
+        app: InstalledQuestApp,
+        onProgress: (String) -> Unit,
+        cancelled: () -> Boolean
+    ): InstalledQuestApp {
+        onProgress("جارٍ التحقق من بصمة APK للعبة المحددة…")
+        val report = withContext(Dispatchers.IO) {
+            QuestPreparationProbe(AdbClient.AdbRestrictedQuestTransport(adbClient)).probe(
+                targetGame = app.packageName,
+                onGame = { game -> onProgress("فحص APK: ${game.displayName}") },
+                cancelled = cancelled
+            )
+        }
+        require(!report.cancelled && !report.stale) {
+            "تغير جهاز Quest أو أُلغي فحص APK."
+        }
+        require(report.device.serial == serial) {
+            "تغير جهاز Quest أثناء فحص APK."
+        }
+        val game = report.games.singleOrNull { it.packageId == app.packageName }
+            ?: error("تعذر العثور على اللعبة المحددة أثناء فحص APK.")
+        require(game.versionName == app.versionName && game.versionCode == app.versionCode) {
+            "تغير إصدار اللعبة أثناء فحص APK."
+        }
+        val base = game.apks.firstOrNull { it.splitName == null }
+            ?: error("تعذر العثور على APK الأساسي للعبة المحددة.")
+        val hash = base.sha256?.trim().orEmpty()
+        require(hash.length == 64) {
+            "تعذر التحقق من بصمة APK للعبة المحددة."
+        }
+        val profile = GameModProfileRegistry.findByPackageId(app.packageName)
+        require(profile == null || profile.acceptsApkSha256(hash)) {
+            "بصمة APK لا تطابق النسخة الموثقة للعبة."
+        }
+        return app.copy(apkSha256 = hash.lowercase())
+    }
+}
+
 class ModsManager(
     private val adbClient: AdbClient,
     private val loaderDetector: ModLoaderDetector = AdbModLoaderDetector(adbClient),
-    private val apkPatcher: ApkModLoaderPatcher = NoOpApkModLoaderPatcher
+    private val apkPatcher: ApkModLoaderPatcher = NoOpApkModLoaderPatcher,
+    private val apkEvidenceRefresher: QuestApkEvidenceRefresher =
+        RestrictedQuestApkEvidenceRefresher(adbClient)
 ) {
     companion object {
         private const val MAX_ENTRY_BYTES = ModPackageAnalyzer.MAX_ENTRY_BYTES
@@ -238,13 +296,15 @@ class ModsManager(
     suspend fun analyzeModPackage(
         serial: String,
         zipFile: File,
-        installedApp: InstalledQuestApp
+        installedApp: InstalledQuestApp,
+        onProgress: (String) -> Unit = {}
     ): ModPackageAnalysis = withContext(Dispatchers.IO) {
-        val detection = loaderDetector.detect(serial, installedApp)
-        val discovery = discoverModDirectoriesInternal(serial, installedApp, detection)
+        val evidencedApp = refreshApkEvidenceIfRequired(serial, installedApp, onProgress)
+        val detection = loaderDetector.detect(serial, evidencedApp)
+        val discovery = discoverModDirectoriesInternal(serial, evidencedApp, detection)
         val analysis = ModPackageAnalyzer().analyze(
             zipFile,
-            installedApp,
+            evidencedApp,
             detection,
             discovery
         )
@@ -409,9 +469,16 @@ class ModsManager(
         ) {
             return ModInstallResult(false, "تغير ربط الجهاز أو الخطة؛ أعد تحليل الحزمة قبل النقل.")
         }
-        val currentApp = scanInstalledQuestApps(serial)
+        val scannedCurrentApp = scanInstalledQuestApps(serial)
             .firstOrNull { it.packageName == reviewedApp.packageName }
             ?: return ModInstallResult(false, "التطبيق المستهدف لم يعد مثبتًا؛ أعد تحليل الحزمة.")
+        val currentApp = try {
+            refreshApkEvidenceIfRequired(serial, scannedCurrentApp) { message ->
+                onProgress(ModExecutionProgress(ModInstallPhase.ANALYZING, null, message))
+            }
+        } catch (error: Throwable) {
+            return ModInstallResult(false, error.message ?: "تعذر التحقق من بصمة APK.")
+        }
         if (!sameAppState(reviewedApp, currentApp)) {
             return ModInstallResult(false, "تغيرت حالة التطبيق المستهدف منذ التحليل؛ أعد تحليل الحزمة.")
         }
@@ -496,6 +563,14 @@ class ModsManager(
         )
         val profile = executionProfile(executionPlan)
             ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
+        if (profile.supportedApkSha256.isNotEmpty() &&
+            !profile.acceptsApkSha256(currentApp.apkSha256)
+        ) {
+            return ModInstallResult(
+                false,
+                "تغيرت بصمة APK عن النسخة الموثقة؛ أعد فحص اللعبة قبل النقل."
+            )
+        }
         if (profile.writeAuthorized && executionPlan.destinationRoot != profile.destination) {
             return ModInstallResult(false, "وجهة الخطة لا تطابق ملف تعريف اللعبة الموثوق.")
         }
@@ -525,8 +600,15 @@ class ModsManager(
             if (!archiveIdentityMatches(zipFile, reviewedIdentity)) {
                 return ModInstallResult(false, "تغير الأرشيف بعد التحقق؛ تم إيقاف النقل.")
             }
-            val appBeforeTransfer = scanInstalledQuestApps(serial)
+            val scannedBeforeTransfer = scanInstalledQuestApps(serial)
                 .firstOrNull { it.packageName == reviewedApp.packageName }
+            val appBeforeTransfer = scannedBeforeTransfer?.let {
+                runCatching {
+                    refreshApkEvidenceIfRequired(serial, it) { message ->
+                        onProgress(ModExecutionProgress(ModInstallPhase.VALIDATING, null, message))
+                    }
+                }.getOrNull()
+            }
             if (appBeforeTransfer == null || !sameAppState(reviewedApp, appBeforeTransfer)) {
                 return ModInstallResult(false, "تغيرت حالة التطبيق قبل النقل؛ أعد تحليل الحزمة.")
             }
@@ -542,6 +624,57 @@ class ModsManager(
                         false,
                         "تعذر التحقق من محمّل المود المطلوب قبل النقل؛ أعد تحليل الحزمة."
                     )
+                }
+            }
+
+            // Refuse collisions before the first mkdir/push. A direct install
+            // is additive only; replacing a file could destroy an unrelated
+            // mod and cannot be audited or rolled back safely.
+            val destinationRoot = destinationModRoot(executionPlan)
+            if (destinationRoot != null &&
+                executionPlan.strategy != ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY
+            ) {
+                val rootAvailable = adbClient.shell(serial, "test", "!", "-e", destinationRoot)
+                if (rootAvailable.exit == 1) {
+                    DiagnosticLogger.info("Mod install destination root already exists: $destinationRoot")
+                    return ModInstallResult(
+                        false,
+                        "مجلد المود موجود مسبقًا؛ لم يتم دمج ملفات داخل مجلد موجود."
+                    )
+                }
+                if (rootAvailable.exit != 0) {
+                    return ModInstallResult(
+                        false,
+                        customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                    )
+                }
+            }
+            for (mapping in executionPlan.mappings) {
+                val destination = mapping.destinationPath
+                if (!AndroidPathValidator.isSafe(destination)) {
+                    return ModInstallResult(false, "تم رفض وجهة غير معتمدة: $destination")
+                }
+                // Ask for the safe (non-collision) result so legacy ADB
+                // fakes and restricted shells can treat exit=0 as "absent".
+                val collision = adbClient.shell(serial, "test", "!", "-e", destination)
+                when {
+                    collision.exit == 1 -> {
+                        DiagnosticLogger.info("Mod install collision: $destination")
+                        return ModInstallResult(
+                            false,
+                            "تعارضت ملفات المود مع ملفات موجودة مسبقًا؛ لم يتم استبدال أي ملف."
+                        )
+                    }
+                    collision.exit != 0 -> {
+                        DiagnosticLogger.info(
+                            "Unable to inspect mod destination: path=$destination " +
+                                "exit=${collision.exit} stderr=${collision.err.take(500)}"
+                        )
+                        return ModInstallResult(
+                            false,
+                            customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                        )
+                    }
                 }
             }
 
@@ -570,10 +703,22 @@ class ModsManager(
                         "نقل ${source.name}"
                     )
                 )
-                val pushed = adbClient.pushWithProgress(serial, source, destination) { current, _ ->
-                    val fraction = executionPlan.progress(copiedBytes + current, copiedFiles).fraction.coerceAtMost(0.94)
-                    onProgress(ModExecutionProgress(ModInstallPhase.TRANSFERRING, fraction, "نقل ${source.name}"))
-                }
+                val pushed = adbClient.pushModFileWithProgress(
+                    serial,
+                    source,
+                    destination,
+                    onProgress = { current, _ ->
+                        val fraction = executionPlan.progress(copiedBytes + current, copiedFiles)
+                            .fraction.coerceAtMost(0.94)
+                        onProgress(
+                            ModExecutionProgress(
+                                ModInstallPhase.TRANSFERRING,
+                                fraction,
+                                "نقل ${source.name}"
+                            )
+                        )
+                    }
+                )
                 if (pushed.exit != 0) {
                     DiagnosticLogger.info(
                         "ADB push failed for ${mapping.sourcePath}: exit=${pushed.exit}, stderr=${pushed.err}, stdout=${pushed.out}"
@@ -588,8 +733,19 @@ class ModsManager(
             }
 
             onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, 0.95, "التحقق من الملفات على النظارة"))
-            val verificationErrors = executionPlan.mappings.mapNotNull { mapping ->
-                verifyRemoteFile(serial, mapping)
+            val verificationErrors = buildList {
+                val root = executionPlan.destinationRoot
+                if (root.isNullOrBlank() || !AndroidPathValidator.isSafe(root)) {
+                    add("فشل التحقق من جذر وجهة المود.")
+                } else {
+                    val rootResult = adbClient.shell(serial, "test", "-d", root)
+                    if (rootResult.exit != 0) {
+                        add("فشل التحقق: مجلد الوجهة غير موجود في $root")
+                    }
+                }
+                executionPlan.mappings.mapNotNullTo(this) { mapping ->
+                    verifyRemoteFile(serial, mapping)
+                }
             }
             if (verificationErrors.isNotEmpty()) {
                 DiagnosticLogger.info(
@@ -600,15 +756,27 @@ class ModsManager(
                     customerModExecutionFailureMessage(ModExecutionFailureKind.VERIFY)
                 )
             }
-            val appAfterVerification = scanInstalledQuestApps(serial)
+            val scannedAfterVerification = scanInstalledQuestApps(serial)
                 .firstOrNull { it.packageName == reviewedApp.packageName }
+            val appAfterVerification = scannedAfterVerification?.let {
+                runCatching {
+                    refreshApkEvidenceIfRequired(serial, it) { message ->
+                        onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, null, message))
+                    }
+                }.getOrNull()
+            }
             if (appAfterVerification == null || !sameAppState(reviewedApp, appAfterVerification)) {
                 return ModInstallResult(false, "تغير اتصال النظارة أو إصدار اللعبة أثناء التحقق؛ لم يتم اعتماد النجاح.")
             }
 
             onProgress(ModExecutionProgress(ModInstallPhase.COMPLETED, 1.0, "اكتمل التثبيت والتحقق"))
             ModInstallHistory.record(executionPlan, true, "verified")
-            return ModInstallResult(true, "تم تثبيت المود والتحقق من الملفات بنجاح.")
+            val successMessage = if (profile.supportedApkSha256.isNotEmpty()) {
+                "تم تثبيت المود والتحقق من الملفات وبصمة APK بنجاح."
+            } else {
+                "تم تثبيت المود والتحقق من الملفات بنجاح."
+            }
+            return ModInstallResult(true, successMessage)
         } catch (e: Exception) {
             ModInstallHistory.record(executionPlan, false, e.message ?: "error")
             DiagnosticLogger.error("فشل تنفيذ خطة تثبيت المود", e)
@@ -728,6 +896,27 @@ class ModsManager(
         return path == profile.destination || path.startsWith("${profile.destination}/")
     }
 
+    /**
+     * Direct installs are whole-mod directory operations. Even if each file
+     * path is new, merging into an existing sibling directory can leave stale
+     * files from a different archive. Derive the common first directory below
+     * the profile root and reserve it as an atomic destination.
+     */
+    private fun destinationModRoot(plan: ModInstallPlan): String? {
+        val root = plan.destinationRoot?.trimEnd('/').takeIf { !it.isNullOrBlank() }
+            ?: return null
+        val children = plan.mappings.mapNotNull { mapping ->
+            val relative = mapping.destinationPath.removePrefix("$root/")
+            if (relative == mapping.destinationPath || relative.isBlank()) null
+            else relative.substringBefore('/').takeIf(String::isNotBlank)
+        }.distinct()
+        return when {
+            children.size == 1 -> "$root/${children.single()}"
+            children.isEmpty() -> root
+            else -> null
+        }
+    }
+
     private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
         val target = plan.targetPackageId ?: return null
         // Never replace Gorilla Tag's non-authorizing registry profile with
@@ -758,6 +947,22 @@ class ModsManager(
         }
     }
 
+    private suspend fun refreshApkEvidenceIfRequired(
+        serial: String,
+        app: InstalledQuestApp,
+        onProgress: (String) -> Unit = {}
+    ): InstalledQuestApp {
+        val profile = GameModProfileRegistry.findByPackageId(app.packageName)
+        if (profile?.supportedApkSha256.isNullOrEmpty()) return app
+        val ownerJob = currentCoroutineContext()[Job]
+        return apkEvidenceRefresher.refresh(
+            serial,
+            app,
+            onProgress,
+            cancelled = { ownerJob?.isActive != true }
+        )
+    }
+
     private fun findNormalizedEntry(zip: ZipFile, normalizedName: String): ZipEntry? {
         val direct = zip.getEntry(normalizedName)
         if (direct != null) return direct
@@ -775,6 +980,9 @@ class ModsManager(
         val exists = adbClient.shell(serial, "test", "-f", mapping.destinationPath)
         if (exists.exit != 0) return "فشل التحقق: الملف غير موجود في ${mapping.destinationPath}"
         val size = adbClient.shell(serial, "stat", "-c", "%s", mapping.destinationPath)
+        if (size.exit != 0) {
+            return "فشل قراءة حجم ${mapping.destinationPath}: ${size.err.take(300)}"
+        }
         val actual = size.out.trim().lineSequence().lastOrNull()?.toLongOrNull()
         return if (actual == mapping.sizeBytes) null
         else "فشل التحقق من حجم ${mapping.destinationPath}: المتوقع ${mapping.sizeBytes} والفعلي ${actual ?: "غير معروف"}"
@@ -796,7 +1004,10 @@ class ModsManager(
     private fun sameAppState(expected: InstalledQuestApp, actual: InstalledQuestApp): Boolean =
         expected.packageName == actual.packageName &&
             expected.versionName == actual.versionName &&
-            expected.versionCode == actual.versionCode
+            expected.versionCode == actual.versionCode &&
+            (expected.apkSha256.isNullOrBlank() ||
+                actual.apkSha256.isNullOrBlank() ||
+                expected.apkSha256.equals(actual.apkSha256, ignoreCase = true))
 
     private fun sameSecurityProjection(expected: ModInstallPlan, actual: ModInstallPlan): Boolean =
         expected.installable == actual.installable &&

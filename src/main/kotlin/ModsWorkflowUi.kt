@@ -843,6 +843,26 @@ private fun QuestPreparationProbeSection(
                             color = tone
                         )
                          Text(row.probeLabel, style = MaterialTheme.typography.bodySmall)
+                         completed?.let { game ->
+                             Text(
+                                 questProbeGameReadinessLabel(game),
+                                 style = MaterialTheme.typography.bodySmall,
+                                 color = if (
+                                     questProbeGameReadinessLabel(game) == "مودات المحتوى جاهزة للتثبيت"
+                                 ) {
+                                     MaterialTheme.colorScheme.tertiary
+                                 } else {
+                                     MaterialTheme.colorScheme.onSurfaceVariant
+                                 }
+                             )
+                             if (game.loader != ProbeLoader.NONE) {
+                                 Text(
+                                     "دليل المحمّل: ${questProbeLoaderLabel(game.loader)}",
+                                     style = MaterialTheme.typography.labelSmall,
+                                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                                 )
+                             }
+                         }
                         if (completed?.warnings?.isNotEmpty() == true) {
                             Text("تحذير: تعذر إكمال بعض الأدلة.", style = MaterialTheme.typography.bodySmall, color = warningColor())
                         }
@@ -1499,7 +1519,11 @@ private fun LoaderRequirementDetails(
                     LinearProgressIndicator(Modifier.fillMaxWidth())
                 } else {
                     LinearProgressIndicator({ fraction.toFloat().coerceIn(0f, 1f) }, Modifier.fillMaxWidth())
-                    Text("${(fraction * 100).toInt()}% — ${progress?.kind?.name ?: "INSTALL"} / ${progress?.phase?.name ?: "PROCESSING"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "${(fraction * 100).toInt()}% — ${modProgressKindLabel(progress?.kind)} / ${modInstallPhaseLabel(progress?.phase)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
         }
@@ -1562,7 +1586,7 @@ private fun bytes(value: Long): String = when {
 
 private fun displayModPackageType(type: ModPackageType): String = when (type) {
     ModPackageType.BONELAB_NATIVE_CONTENT -> "BONELAB — محتوى أصلي"
-    ModPackageType.BONELAB_CODE_MOD -> "BONELAB — Code Mod"
+    ModPackageType.BONELAB_CODE_MOD -> "BONELAB — مود برمجي"
     ModPackageType.QMOD -> "QMOD"
     ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> "Virtual Stump — محتوى مدمج"
     ModPackageType.NFVR_MANIFEST -> "NFVR manifest"
@@ -1571,6 +1595,26 @@ private fun displayModPackageType(type: ModPackageType): String = when (type) {
     ModPackageType.KNOWN_GAME_PROFILE -> "ملف تعريف لعبة معروف"
     ModPackageType.GENERIC_DATA -> "بيانات Android"
     ModPackageType.UNKNOWN -> "غير معروف"
+}
+
+private fun modProgressKindLabel(kind: ModProgressKind?): String = when (kind) {
+    ModProgressKind.SCAN -> "فحص"
+    ModProgressKind.ANALYZE -> "تحليل"
+    ModProgressKind.INSTALL -> "تثبيت"
+    ModProgressKind.EXTERNAL -> "إجراء مدعوم"
+    null -> "تثبيت"
+}
+
+private fun modInstallPhaseLabel(phase: ModsManager.ModInstallPhase?): String = when (phase) {
+    ModsManager.ModInstallPhase.ANALYZING -> "تحليل الحزمة"
+    ModsManager.ModInstallPhase.EXTRACTING -> "استخراج آمن"
+    ModsManager.ModInstallPhase.VALIDATING -> "تحقق محلي"
+    ModsManager.ModInstallPhase.PREPARING -> "تجهيز الوجهة"
+    ModsManager.ModInstallPhase.TRANSFERRING -> "نقل الملفات"
+    ModsManager.ModInstallPhase.VERIFYING -> "تحقق بعيد"
+    ModsManager.ModInstallPhase.COMPLETED -> "اكتمل"
+    ModsManager.ModInstallPhase.FAILED -> "فشل"
+    null -> "جارٍ التنفيذ"
 }
 
 private fun displayModOutcome(outcome: ModInstallOutcome): String = when (outcome) {

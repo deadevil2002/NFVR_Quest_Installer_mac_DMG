@@ -99,6 +99,49 @@ internal fun questProbeProbeLabel(state: QuestProbeRowState): String = when (sta
     QuestProbeRowState.AMBIGUOUS -> "يلزم اختيار النسخة الصحيحة"
 }
 
+internal fun questProbePreparationLabel(state: ProbePreparationState): String = when (state) {
+    ProbePreparationState.CONTENT_MOD_READY -> "مودات المحتوى جاهزة للتثبيت"
+    ProbePreparationState.CODE_MOD_READY -> "اللعبة مجهزة لمودات الكود"
+    ProbePreparationState.LOADER_READY -> "اللعبة مجهزة بمحمّل مودات"
+    ProbePreparationState.STOCK_UNPREPARED -> "اللعبة غير مجهزة لمودات الكود"
+    ProbePreparationState.POSSIBLY_PATCHED -> "توجد أدلة تجهيز تحتاج مراجعة"
+    ProbePreparationState.UNKNOWN -> "الفحص غير مكتمل"
+}
+
+internal fun questProbeLoaderLabel(loader: ProbeLoader): String = when (loader) {
+    ProbeLoader.NONE -> "لا يوجد دليل محمّل"
+    ProbeLoader.QUESTLOADER -> "QuestLoader"
+    ProbeLoader.SCOTLAND2 -> "Scotland2"
+    ProbeLoader.LEMONLOADER -> "LemonLoader"
+    ProbeLoader.MELONLOADER_ANDROID -> "MelonLoader"
+    ProbeLoader.OTHER_KNOWN_LOADER -> "محمّل معروف"
+    ProbeLoader.UNKNOWN -> "محمّل غير معروف"
+}
+
+/**
+ * Content-only games are usable when the verified Mods directory exists even
+ * if no APK code loader is present. Keep that customer-facing distinction out
+ * of the raw probe enums.
+ */
+internal fun questProbeGameReadinessLabel(game: QuestProbeGame): String {
+    if (game.probeState == QuestProbeState.PARTIAL ||
+        game.probeState == QuestProbeState.FAILED
+    ) return "الفحص غير مكتمل"
+    val contentDirectory = (game.androidData.paths + game.modData.paths)
+        .any { it.endsWith("/files/Mods") || it.endsWith("/files/mods") }
+    return when {
+        contentDirectory -> "مودات المحتوى جاهزة للتثبيت"
+        game.codeModLoaderState?.let { it != "NONE" && it != "UNKNOWN" } == true ->
+            "مود يحتاج محمل"
+        game.preparationState == ProbePreparationState.LOADER_READY ||
+            game.preparationState == ProbePreparationState.CODE_MOD_READY ->
+            "اللعبة مجهزة"
+        game.preparationState == ProbePreparationState.STOCK_UNPREPARED ->
+            "اللعبة غير مجهزة"
+        else -> questProbePreparationLabel(game.preparationState)
+    }
+}
+
 internal fun questProbeRowPresentation(
     discovery: QuestProbeDiscovery,
     game: QuestProbeGame? = null,

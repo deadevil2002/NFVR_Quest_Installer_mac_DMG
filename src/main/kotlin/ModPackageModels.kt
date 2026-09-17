@@ -9,7 +9,14 @@ data class InstalledQuestApp(
     val versionCode: Long? = null,
     val displayName: String? = null,
     val apkPath: String? = null,
-    val thirdParty: Boolean = true
+    val thirdParty: Boolean = true,
+    /**
+     * Optional hash captured by the read-only APK inspection.  Keeping this
+     * on the selected-app identity lets a profile (and an eventual manager)
+     * bind preparation evidence to the actual APK bytes rather than only to
+     * a package/version pair.
+     */
+    val apkSha256: String? = null
 ) {
     val packageId: String
         get() = packageName
@@ -32,6 +39,8 @@ enum class ModPackageType {
             get() = GORILLA_TAG_VIRTUAL_STUMP
         val NFVR: ModPackageType
             get() = NFVR_MANIFEST
+        val NOMAD_CONTENT: ModPackageType
+            get() = KNOWN_GAME_PROFILE
     }
 }
 
@@ -108,6 +117,8 @@ fun customerPreconditionMessage(code: String): String = when {
     code == "APK_PATCH_REQUIRED" -> "تحتاج هذه الحزمة إلى تصحيح آمن لتطبيق اللعبة قبل التثبيت."
     code.contains("LOADER", ignoreCase = true) -> "يجب تجهيز محمّل المودات المطلوب ثم إعادة التحليل."
     code.contains("TARGET_APP_REQUIRED", ignoreCase = true) -> "اختر لعبة مثبتة على النظارة أولًا."
+    code.contains("APK_SHA256_REQUIRED", ignoreCase = true) ->
+        "تعذر إثبات بصمة APK المطابقة؛ أعد فحص اللعبة قبل تثبيت المحتوى."
     code.contains("STALE", ignoreCase = true) -> "تغيرت حالة الجهاز أو الحزمة؛ أعد التحليل قبل المتابعة."
     code.contains("UNSAFE", ignoreCase = true) ||
         code.contains("CORRUPT", ignoreCase = true) ||
@@ -592,8 +603,91 @@ data class GameModProfile(
      * available; only an explicit QMOD plus authenticated loader evidence can
      * then supply canonical loader destinations.
      */
-    val writeAuthorized: Boolean = true
-)
+    val writeAuthorized: Boolean = true,
+    /** Exact app version names covered by the evidence fixture. */
+    val supportedVersionNames: Set<String> = emptySet(),
+    /** Exact app version codes covered by the evidence fixture. */
+    val supportedVersionCodes: Set<Long> = emptySet(),
+    /** SHA-256 values of APK bytes covered by the evidence fixture. */
+    val supportedApkSha256: Set<String> = emptySet()
+) {
+    val apkSha256: String?
+        get() = supportedApkSha256.singleOrNull()
+
+    val requiresApkSha256Evidence: Boolean
+        get() = supportedApkSha256.isNotEmpty()
+
+    val supportedVersions: Set<String>
+        get() = supportedVersionNames
+
+    /**
+     * A profile match is deliberately exact when a profile has fixture
+     * version evidence. APK evidence is mandatory when the profile records
+     * an APK fixture. Callers without APK inspection can still use
+     * [supportsVersion], but cannot claim profile compatibility.
+     */
+    fun supportsVersion(app: InstalledQuestApp): Boolean =
+        app.packageName == packageId &&
+            (supportedVersionNames.isEmpty() || app.versionName in supportedVersionNames) &&
+            (supportedVersionCodes.isEmpty() || app.versionCode in supportedVersionCodes)
+
+    fun acceptsApkSha256(hash: String?): Boolean =
+        supportedApkSha256.isEmpty() ||
+            (!hash.isNullOrBlank() && supportedApkSha256.any { it.equals(hash.trim(), true) })
+
+    fun matchesApkSha256(hash: String?): Boolean = acceptsApkSha256(hash)
+
+    fun supportsApp(app: InstalledQuestApp, apkSha256: String? = app.apkSha256): Boolean =
+        supportsVersion(app) &&
+            acceptsApkSha256(apkSha256)
+
+    fun matchesApp(app: InstalledQuestApp, apkSha256: String? = app.apkSha256): Boolean =
+        supportsApp(app, apkSha256)
+
+    fun matchesVersion(versionName: String?, versionCode: Long?): Boolean =
+        (supportedVersionNames.isEmpty() || versionName in supportedVersionNames) &&
+            (supportedVersionCodes.isEmpty() || versionCode in supportedVersionCodes)
+
+    fun isCompatible(
+        app: InstalledQuestApp?,
+        apkSha256: String? = app?.apkSha256,
+        requireApkEvidence: Boolean = true
+    ): Boolean = compatibilityIssues(app, apkSha256, requireApkEvidence).isEmpty()
+
+    /** Stable precondition codes for manager/device-aware callers. */
+    fun compatibilityIssues(
+        app: InstalledQuestApp?,
+        apkSha256: String? = app?.apkSha256,
+        requireApkEvidence: Boolean = true
+    ): List<String> {
+        if (app == null) return listOf("TARGET_APP_REQUIRED")
+        val issues = mutableListOf<String>()
+        if (app.packageName != packageId) issues += "TARGET_PACKAGE_MISMATCH"
+        if (supportedVersionNames.isNotEmpty() &&
+            app.versionName !in supportedVersionNames
+        ) issues += "GAME_VERSION_UNSUPPORTED"
+        if (supportedVersionCodes.isNotEmpty() &&
+            app.versionCode !in supportedVersionCodes
+        ) issues += "GAME_VERSION_CODE_UNSUPPORTED"
+        if (requireApkEvidence && supportedApkSha256.isNotEmpty()) {
+            if (apkSha256.isNullOrBlank()) {
+                issues += "APK_SHA256_REQUIRED"
+            } else if (!acceptsApkSha256(apkSha256)) {
+                issues += "APK_SHA256_UNSUPPORTED"
+            }
+        }
+        return issues
+    }
+
+    fun isRecognizedArchiveSignature(path: String): Boolean {
+        val normalized = path.replace('\\', '/').lowercase()
+        return recognizedArchiveSignatures.any { signature ->
+            val value = signature.lowercase()
+            normalized == value || normalized.endsWith("/$value") ||
+                (value.startsWith(".") && normalized.endsWith(value))
+        }
+    }
+}
 
 /**
  * Destinations are intentionally kept in one registry.  Adding a game here
@@ -640,6 +734,30 @@ object GameModProfileRegistry {
                     val loaders = stringSet("loaderRequirements").mapNotNull {
                         runCatching { ModLoaderKind.valueOf(it) }.getOrNull()
                     }.toSet()
+                    val versionNames = stringSet("supportedVersionNames").ifEmpty {
+                        stringSet("supportedVersions")
+                    }
+                    val versionCodes = item.optJSONArray("supportedVersionCodes")?.let { array ->
+                        (0 until array.length()).mapNotNull { index ->
+                            when (val value = array.opt(index)) {
+                                is Number -> value.toLong()
+                                is String -> value.trim().toLongOrNull()
+                                else -> null
+                            }
+                        }.toSet()
+                    } ?: emptySet()
+                    val apkHashes = buildSet {
+                        stringSet("supportedApkSha256").forEach { add(it.lowercase()) }
+                        item.optString("apkSha256").trim()
+                            .takeIf(String::isNotBlank)?.let { add(it.lowercase()) }
+                        item.optString("apkSha256Hash").trim()
+                            .takeIf(String::isNotBlank)?.let { add(it.lowercase()) }
+                    }
+                    val versionRules = item.optJSONObject("versionRules")?.let { rules ->
+                        rules.keys().asSequence().associateWith { key ->
+                            rules.optString(key)
+                        }
+                    } ?: emptyMap()
                     val evidence = runCatching {
                         ModEvidenceLevel.valueOf(item.optString("evidenceLevel"))
                     }.getOrDefault(ModEvidenceLevel.HEURISTIC)
@@ -664,8 +782,11 @@ object GameModProfileRegistry {
                             .ifEmpty { setOf(ModResolutionStrategy.KNOWN_GAME_PROFILE) },
                         evidenceLevel = evidence,
                         evidenceSources = stringSet("evidenceSources").toList(),
-                        versionRules = emptyMap(),
-                        writeAuthorized = item.optBoolean("writeAuthorized", true)
+                        versionRules = versionRules,
+                        writeAuthorized = item.optBoolean("writeAuthorized", true),
+                        supportedVersionNames = versionNames,
+                        supportedVersionCodes = versionCodes,
+                        supportedApkSha256 = apkHashes
                     )
                 }
             }

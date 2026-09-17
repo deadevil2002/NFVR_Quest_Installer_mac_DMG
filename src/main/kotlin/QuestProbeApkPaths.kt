@@ -21,7 +21,9 @@ data class QuestProbeApkPathDiagnostics(
 data class QuestProbeApkPathResult(
     val paths: List<String>,
     val diagnostics: QuestProbeApkPathDiagnostics,
-    val error: String? = null
+    val error: String? = null,
+    /** The ordered read-only source which supplied the accepted paths. */
+    val source: QuestProbeApkPathSource = QuestProbeApkPathSource.PM_PATH
 ) {
     val accepted: Boolean get() = error == null
     val isEmpty: Boolean get() = paths.isEmpty()
@@ -31,9 +33,16 @@ data class QuestProbeApkPathResult(
     val limit: Int get() = diagnostics.limit
 }
 
+enum class QuestProbeApkPathSource {
+    PM_PATH,
+    CMD_PACKAGE_PATH,
+    DUMPSYS_CODE_PATH,
+    DUMPSYS_SOURCE_DIR
+}
+
 object QuestProbeApkPaths {
     const val DEFAULT_LIMIT: Int = 128
-    private val SAFE_PATH = Regex("""/data/app/[A-Za-z0-9._~+=@/-]+\.apk""")
+    private val SAFE_PATH = Regex("""/(?:data/app|system|product|vendor)/[A-Za-z0-9._~+=@/-]+\.apk""")
     private val SHELL_OR_CONTROL = Regex("""[\u0000-\u001f\u007f;|&${'$'}`(){}\[\]<>"'\\*?!]""")
 
     /**
@@ -62,6 +71,12 @@ object QuestProbeApkPaths {
         limit: Int = DEFAULT_LIMIT
     ): QuestProbeApkPathResult = normalize(values, limit, allowBarePaths = true)
 
+    fun normalizeDirect(
+        values: List<String>,
+        source: QuestProbeApkPathSource,
+        limit: Int = DEFAULT_LIMIT
+    ): QuestProbeApkPathResult = normalize(values, limit, allowBarePaths = true, source = source)
+
     fun normalize(values: List<String>, limit: Int = DEFAULT_LIMIT): QuestProbeApkPathResult =
         normalizeDirect(values, limit)
 
@@ -70,10 +85,60 @@ object QuestProbeApkPaths {
         limit: Int = DEFAULT_LIMIT
     ): QuestProbeApkPathResult = normalize(lines.toList(), limit, allowBarePaths = false)
 
+    /**
+     * Extracts only package-manager APK fields from a dumpsys package result.
+     * This is intentionally not a general path search: paths are accepted only
+     * from known fields and split APKs are constrained to the selected package's
+     * codePath directory.
+     */
+    fun fromDumpsys(
+        packageId: String,
+        dumpsys: String,
+        limit: Int = DEFAULT_LIMIT
+    ): QuestProbeApkPathResult {
+        require(packageId.matches(Regex("""[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+"""))) {
+            "invalid package id"
+        }
+        val codePath = Regex("""(?m)^\s*codePath=([^\s]+)""").find(dumpsys)?.groupValues?.get(1)
+            ?.takeIf(::isSafeDirectory)
+        val values = mutableListOf<String>()
+        val sources = mutableListOf<QuestProbeApkPathSource>()
+        fun field(name: String, source: QuestProbeApkPathSource) {
+            Regex("""(?m)^\s*(?:$name)\s*[:=]\s*([^\s]+)""").findAll(dumpsys).forEach { match ->
+                val value = match.groupValues[1]
+                if (isSafeApkPath(value) && (codePath == null || value.startsWith(codePath.trimEnd('/') + "/") || value == codePath)) {
+                    values += value
+                    sources += source
+                }
+            }
+        }
+        field("codePath", QuestProbeApkPathSource.DUMPSYS_CODE_PATH)
+        field("resourcePath", QuestProbeApkPathSource.DUMPSYS_CODE_PATH)
+        field("path", QuestProbeApkPathSource.DUMPSYS_CODE_PATH)
+        field("sourceDir", QuestProbeApkPathSource.DUMPSYS_SOURCE_DIR)
+        field("publicSourceDir", QuestProbeApkPathSource.DUMPSYS_SOURCE_DIR)
+        Regex("""(?m)^\s*splitSourceDirs\s*[:=]\s*(.+)$""").findAll(dumpsys).forEach { match ->
+            match.groupValues[1].split(',').map(String::trim).forEach { value ->
+                if (isSafeApkPath(value) && (codePath == null || value.startsWith(codePath.trimEnd('/') + "/"))) {
+                    values += value
+                    sources += QuestProbeApkPathSource.DUMPSYS_SOURCE_DIR
+                }
+            }
+        }
+        val result = normalizeDirect(values, QuestProbeApkPathSource.DUMPSYS_CODE_PATH, limit)
+        val preferred = sources.firstOrNull()
+        return result.copy(source = preferred ?: QuestProbeApkPathSource.DUMPSYS_CODE_PATH)
+    }
+
+    private fun isSafeDirectory(path: String): Boolean =
+        path.startsWith("/") && !SHELL_OR_CONTROL.containsMatchIn(path) &&
+            path.split('/').drop(1).none { it.isEmpty() || it == "." || it == ".." }
+
     private fun normalize(
         rawValues: List<String>,
         limit: Int,
-        allowBarePaths: Boolean
+        allowBarePaths: Boolean,
+        source: QuestProbeApkPathSource = QuestProbeApkPathSource.PM_PATH
     ): QuestProbeApkPathResult {
         require(limit > 0) { "APK path limit must be positive" }
         val unique = linkedSetOf<String>()
@@ -102,7 +167,7 @@ object QuestProbeApkPaths {
             paths.size > limit -> "APK count exceeds safe limit"
             else -> null
         }
-        return QuestProbeApkPathResult(paths, diagnostics, error)
+        return QuestProbeApkPathResult(paths, diagnostics, error, source)
     }
 
     fun isSafeApkPath(path: String): Boolean {

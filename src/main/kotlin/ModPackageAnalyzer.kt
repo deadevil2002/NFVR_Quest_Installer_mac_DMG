@@ -20,6 +20,8 @@ class ModPackageAnalyzer(
 ) {
     companion object {
         const val BONELAB_PACKAGE_ID = "com.StressLevelZero.BONELAB"
+        const val BLADE_AND_SORCERY_PACKAGE_ID = "com.Warpfrog.BladeAndSorcery"
+        const val NOMAD_PACKAGE_ID = BLADE_AND_SORCERY_PACKAGE_ID
         const val GORILLA_TAG_PACKAGE_ID = "com.AnotherAxiom.GorillaTag"
         const val MAX_ZIP_ENTRIES = 5_000
         const val MAX_ENTRY_NAME_BYTES = 1_000
@@ -28,6 +30,9 @@ class ModPackageAnalyzer(
         const val MAX_TOTAL_DECLARED_BYTES = 2L * 1024L * 1024L * 1024L
         private val ROOT_METADATA_NAMES = setOf("mod.json", "nfvr-mod.json", "qmod.json", "package.json")
         private val ROOT_MANIFEST_NAMES = ROOT_METADATA_NAMES
+        private val CONTENT_METADATA_BASENAMES = setOf(
+            "manifest.json", "module.json", "catalog.json", "pallet.json"
+        )
         private val SHA256 = Regex("[0-9a-fA-F]{64}")
         private val QMOD_METADATA_KEYS = setOf(
             "_QPVersion", "name", "id", "author", "version", "description", "coverImage",
@@ -108,7 +113,9 @@ class ModPackageAnalyzer(
                     analyzeAndroidLayout(archive, installedApp, obb = false)
                 isAndroidObbLayout(archive) ->
                     analyzeAndroidLayout(archive, installedApp, obb = true)
-                isBonelabPayload(archive) ->
+                isNomadPayload(archive, installedApp) ->
+                    analyzeNomadPayload(archive, installedApp, loaderDetection)
+                isBonelabPayload(archive, installedApp) ->
                     analyzeBonelabPayload(archive, installedApp, loaderDetection)
                 isKnownGameProfilePayload(archive, installedApp) ->
                     analyzeKnownGameProfile(archive, installedApp, loaderDetection)
@@ -210,6 +217,20 @@ class ModPackageAnalyzer(
                         throw ModPackageException("Metadata entry '$safeName' is not valid JSON.")
                     }
                     metadata[safeName] = json
+                }
+                // Game content manifests are not all rooted at a standard
+                // NFVR/QMOD filename.  Parse only bounded, well-known JSON
+                // basenames; arbitrary archive filenames remain data, not
+                // evidence of a game or an installation destination.
+                if (!entry.isDirectory &&
+                    safeName.substringAfterLast('/').lowercase(Locale.ROOT) in CONTENT_METADATA_BASENAMES &&
+                    safeName !in metadata
+                ) {
+                    val content = runCatching {
+                        readBoundedMetadata(zip, entry, safeName)
+                    }.getOrNull()
+                    val json = content?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    if (json != null) metadata[safeName] = json
                 }
             }
             var actualBytes = 0L
@@ -1177,21 +1198,288 @@ class ModPackageAnalyzer(
         )
     }
 
-    private fun isBonelabPayload(archive: ArchiveMetadata): Boolean {
+    private fun contentDocuments(archive: ArchiveMetadata): List<Pair<String, JSONObject>> =
+        archive.metadata.entries.filter { (path, _) ->
+            path.substringAfterLast('/').lowercase(Locale.ROOT) in CONTENT_METADATA_BASENAMES
+        }.map { it.key to it.value }
+
+    private fun metadataPackageId(json: JSONObject): String? =
+        listOf("targetPackageId", "packageId", "package", "gamePackage", "applicationId")
+            .firstNotNullOfOrNull { key ->
+                json.optString(key, "").trim().takeIf { it.isNotBlank() }
+            }
+
+    private fun metadataIndicatesNomad(path: String, json: JSONObject): Boolean {
+        val values = listOf(
+            json.optString("game", ""),
+            json.optString("title", ""),
+            json.optString("targetGame", ""),
+            json.optString("gameName", "")
+        ).joinToString(" ").lowercase(Locale.ROOT)
+        return metadataPackageId(json) == BLADE_AND_SORCERY_PACKAGE_ID ||
+            values.contains("blade") && values.contains("sorcery") ||
+            values.contains("nomad")
+    }
+
+    private fun isNomadDocumentEvidence(path: String, json: JSONObject): Boolean {
+        val keys = json.keys().asSequence().map { it.lowercase(Locale.ROOT) }.toSet()
+        val hasMeaningfulModFields =
+            keys.any { it in setOf("name", "title", "id", "guid", "module") } &&
+                keys.any {
+            it in setOf(
+                "version", "gameversion", "versionname", "assets", "bundles",
+                "catalog", "files", "modules", "addressables"
+            )
+        }
+        val hasThunderRoadType = listOf(
+            json.optString("type", ""),
+            json.optString("game", ""),
+            json.optString("engine", "")
+        ).any { it.equals("thunderroad", ignoreCase = true) }
+        val hasGameVersion = keys.contains("gameversion")
+        // A generic Name+Version sidecar is not Nomad evidence. Require the
+        // actual ThunderRoad schema marker or a manifest GameVersion field.
+        return hasMeaningfulModFields && (hasThunderRoadType || hasGameVersion)
+    }
+
+    private fun isNomadPayload(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?
+    ): Boolean {
+        val documents = contentDocuments(archive)
+        if (documents.isEmpty()) return false
+        val explicitNomad = documents.any { (path, json) ->
+            metadataIndicatesNomad(path, json)
+        }
+        val selectedNomad = installedApp?.packageName == BLADE_AND_SORCERY_PACKAGE_ID
+        if (!explicitNomad && !selectedNomad) return false
+
+        // A Windows/PC export must not become a Nomad package merely because
+        // it contains a generic manifest.json.  Quest content has either an
+        // explicit Android/Quest branch or a mod folder with bundle/catalog
+        // payload; desktop binaries are a hard conservative stop.
+        val roots = archive.entries.mapNotNull {
+            it.substringBefore('/').takeIf(String::isNotBlank)
+        }.map(String::lowercase).toSet()
+        val hasQuestBranch = roots.any { it in QUEST_ROOTS } ||
+            archive.entries.any {
+                it.startsWith("Android/data/$BLADE_AND_SORCERY_PACKAGE_ID/")
+            }
+        val hasPcPayload = roots.any { it in PC_ONLY_ROOTS } ||
+            archive.entries.any(::isPcOnlyFile) ||
+            archive.entries.any { it.lowercase(Locale.ROOT).endsWith(".dll") }
+        if (hasPcPayload && !hasQuestBranch) return false
+
+        val evidence = documents.any { (path, json) -> isNomadDocumentEvidence(path, json) }
+        val payload = archive.entries.any { entry ->
+            entry !in archive.directories &&
+                (entry.lowercase(Locale.ROOT).endsWith(".assetbundle") ||
+                    entry.lowercase(Locale.ROOT).endsWith(".bundle") ||
+                    entry.lowercase(Locale.ROOT).endsWith(".manifest")) &&
+                entry.contains('/')
+        }
+        // App selection is not content evidence. A malformed or generic
+        // sidecar must not become a Nomad mod merely because Nomad is
+        // selected in the UI.
+        return payload && evidence
+    }
+
+    private fun analyzeNomadPayload(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?,
+        loaderDetection: ModLoaderDetection?
+    ): ModPackageAnalysis {
+        val profile = profileRegistry.findByPackageId(BLADE_AND_SORCERY_PACKAGE_ID)
+            ?: GameModProfile(
+                BLADE_AND_SORCERY_PACKAGE_ID,
+                "Blade & Sorcery: Nomad",
+                "/sdcard/Android/data/$BLADE_AND_SORCERY_PACKAGE_ID/files/Mods"
+            )
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        checkTarget(BLADE_AND_SORCERY_PACKAGE_ID, installedApp, "Blade & Sorcery: Nomad", preconditions)
+
+        // Unlike a generic profile proposal, Nomad's completed probe gives
+        // us an exact app fixture.  Do not install a structurally valid mod
+        // into a stale game build.
+        profile.compatibilityIssues(installedApp, requireApkEvidence = true).forEach { code ->
+            if (preconditions.none { it.code == code }) {
+                preconditions += blocked(
+                    code,
+                    when (code) {
+                        "GAME_VERSION_UNSUPPORTED" ->
+                            "Installed Nomad version is outside the verified content profile."
+                        "GAME_VERSION_CODE_UNSUPPORTED" ->
+                            "Installed Nomad version code is outside the verified content profile."
+                        else -> "Selected app does not match the verified Nomad content profile."
+                    }
+                )
+            }
+        }
+        val documents = contentDocuments(archive)
+        val declaredPackages = documents.mapNotNull { (_, json) -> metadataPackageId(json) }.toSet()
+        if (declaredPackages.any { it != BLADE_AND_SORCERY_PACKAGE_ID }) {
+            preconditions += blocked(
+                "TARGET_PACKAGE_MISMATCH",
+                "Nomad content metadata targets a different Android package."
+            )
+        }
+        val declaredVersion = documents.firstNotNullOfOrNull { (_, json) ->
+            listOf("gameVersion", "targetGameVersion", "versionName")
+                .firstNotNullOfOrNull { key ->
+                    json.optString(key, "").trim().takeIf(String::isNotBlank)
+                }
+        }
+        if (declaredVersion != null && installedApp?.versionName != declaredVersion) {
+            preconditions += blocked(
+                "GAME_VERSION_UNSUPPORTED",
+                "Nomad content targets game version '$declaredVersion', but the installed version is '${installedApp?.versionName}'."
+            )
+        }
+        addDangerousPayloadPrecondition(archive, preconditions)
+        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        val mappings = mutableListOf<ModFileMapping>()
+        val files = archive.entries.filterNot { it in archive.directories }
+        val afterMods = files.map { entry ->
+            if (entry.startsWith("Mods/", true) || entry.startsWith("mods/", true)) {
+                entry.substringAfter('/')
+            } else entry
+        }
+        val meaningfulDocuments = documents.filter { (path, json) ->
+            isNomadDocumentEvidence(path, json)
+        }
+        val manifestRoots = meaningfulDocuments.mapNotNull { (path, _) ->
+            val normalized = if (path.startsWith("Mods/", true) ||
+                path.startsWith("mods/", true)
+            ) path.substringAfter('/') else path
+            normalized.substringBefore('/').takeIf(String::isNotBlank)
+        }.distinct()
+        val roots = afterMods.mapNotNull {
+            it.substringBefore('/').takeIf(String::isNotBlank)
+        }.distinct()
+        val modRoot = manifestRoots.singleOrNull()
+        if (manifestRoots.size != 1) {
+            preconditions += blocked(
+                "MOD_FOLDER_REQUIRED",
+                "Nomad content must contain one meaningful manifest inside one mod folder."
+            )
+        } else if (roots.any { it != modRoot }) {
+            preconditions += blocked(
+                "UNRELATED_ARCHIVE_CONTENT",
+                "Archive contains files outside the evidenced Nomad mod folder."
+            )
+        }
+        if (modRoot == null || !isSafeModRelativePath(modRoot)) {
+            preconditions += blocked(
+                "MOD_FOLDER_REQUIRED",
+                "Nomad content must contain one safe mod folder beneath the archive wrapper."
+            )
+        } else {
+            files.forEachIndexed { index, entry ->
+                val normalized = afterMods[index]
+                val relative = when {
+                    normalized.startsWith("$modRoot/") ->
+                        normalized.removePrefix("$modRoot/")
+                    normalized == modRoot -> ""
+                    else -> normalized
+                }
+                if (relative.isBlank()) return@forEachIndexed
+                if (!normalized.startsWith("$modRoot/") && normalized != modRoot) {
+                    return@forEachIndexed
+                }
+                // Some distributors wrap a mod folder in itself.  Keep one
+                // copy of the actual folder name, never Mods/MyMod/MyMod.
+                val corrected = if (relative.startsWith("$modRoot/")) {
+                    relative.removePrefix("$modRoot/")
+                } else relative
+                val destination = "${profile.destination.trimEnd('/')}/$modRoot/$corrected"
+                addMapping(
+                    archive,
+                    profile,
+                    mappings,
+                    entry,
+                    destination,
+                    null,
+                    preconditions,
+                    allowFullDestination = true,
+                    targetPackageId = BLADE_AND_SORCERY_PACKAGE_ID
+                )
+            }
+        }
+        if (mappings.isEmpty()) {
+            preconditions += blocked("NO_COPY_MAPPINGS", "Nomad content contains no safe files to install.")
+        }
+        val plan = plan(
+            ModPackageType.KNOWN_GAME_PROFILE,
+            BLADE_AND_SORCERY_PACKAGE_ID,
+            profile,
+            mappings,
+            ModInstallStrategy.PROFILE_COPY,
+            preconditions,
+            archive.identity,
+            installedApp,
+            loaderRequirement = null,
+            resolution = resolution(
+                ModResolutionStrategy.KNOWN_GAME_PROFILE,
+                100,
+                "Verified Nomad manifest/module/catalog content profile."
+            )
+        )
+        return result(
+            ModPackageType.KNOWN_GAME_PROFILE,
+            if (plan.installable) {
+                "Recognized Blade & Sorcery: Nomad content mod."
+            } else blockingMessage(plan),
+            plan,
+            archive,
+            metadata = mapOf("platform" to "Quest content", "profile" to profile.packageId)
+        )
+    }
+
+    private fun isBonelabPayload(
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?
+    ): Boolean {
         val roots = archive.entries.mapNotNull { it.substringBefore('/').takeIf { root -> root.isNotBlank() } }.toSet()
         if (roots.isEmpty()) return false
-        if (archive.entries.any(::looksLikeCodeModPayload)) return true
-        return archive.entries.any { path ->
+        if (installedApp?.packageName == BONELAB_PACKAGE_ID &&
+            (archive.entries.any(::looksLikeCodeModPayload) ||
+                archive.entries.any { it.lowercase(Locale.ROOT).endsWith(".so") })
+        ) return true
+        val contentEvidence = contentDocuments(archive).any { (path, json) ->
+            isBonelabContentDocument(path, json)
+        }
+        val contentPayload = archive.entries.any { path ->
             val lower = path.lowercase(Locale.ROOT)
-            lower.endsWith(".pallet") ||
+            (lower.endsWith(".pallet") ||
                 lower.endsWith(".marrow") ||
                 lower.endsWith(".assetbundle") ||
                 lower.endsWith(".bundle") ||
-                lower.endsWith(".asset") ||
-                lower.endsWith("/manifest.json") ||
-                lower.endsWith("/pallet.json") ||
-                lower.endsWith("/catalog.json")
+                lower.endsWith(".asset")) && lower.contains('/')
         }
+        // App selection is not content evidence. A pallet basename or an
+        // arbitrary bundle cannot authorize the BONELAB destination.
+        return contentPayload && contentEvidence
+    }
+
+    private fun isBonelabContentDocument(path: String, json: JSONObject): Boolean {
+        val keys = json.keys().asSequence().map { it.lowercase(Locale.ROOT) }.toSet()
+        val hasIdentity = keys.any {
+            it in setOf("name", "title", "id", "barcode", "pallet", "author")
+        }
+        val hasContentSemantics = keys.any {
+            it in setOf(
+                "version", "gameversion", "sdkversion", "marrowversion",
+                "assetbundle", "assets", "files", "dependencies", "platform",
+                "crates"
+            )
+        }
+        val hasGameSignal = keys.any {
+            it in setOf(
+                "packageid", "gameversion", "sdkversion", "marrowversion",
+                "pallet", "barcode", "marrow", "assetbundle", "crates"
+            )
+        }
+        return hasIdentity && hasContentSemantics && hasGameSignal
     }
 
     private fun analyzeBonelabPayload(
@@ -1203,6 +1491,37 @@ class ModPackageAnalyzer(
             ?: GameModProfile(BONELAB_PACKAGE_ID, "BONELAB", "/sdcard/Android/data/$BONELAB_PACKAGE_ID/files/Mods")
         val preconditions = mutableListOf<ModInstallPrecondition>()
         checkTarget(BONELAB_PACKAGE_ID, installedApp, "BONELAB", preconditions)
+        val contentDocuments = contentDocuments(archive)
+        val declaredPackages = contentDocuments.mapNotNull { (_, json) -> metadataPackageId(json) }.toSet()
+        if (declaredPackages.any { it != BONELAB_PACKAGE_ID }) {
+            preconditions += blocked(
+                "TARGET_PACKAGE_MISMATCH",
+                "BONELAB content metadata targets a different Android package."
+            )
+        }
+        // Direct BONELAB readiness is bound to the completed probe fixture,
+        // even when an archive omits package/version fields.  An archive
+        // cannot downgrade this check by presenting itself as unversioned.
+        profile.compatibilityIssues(installedApp, requireApkEvidence = true).forEach { code ->
+            if (preconditions.none { it.code == code }) {
+                preconditions += blocked(
+                    code,
+                    "Selected BONELAB app does not match the verified content profile."
+                )
+            }
+        }
+        val declaredVersion = contentDocuments.firstNotNullOfOrNull { (_, json) ->
+            listOf("gameVersion", "targetGameVersion", "versionName")
+                .firstNotNullOfOrNull { key ->
+                    json.optString(key, "").trim().takeIf(String::isNotBlank)
+                }
+        }
+        if (declaredVersion != null && installedApp?.versionName != declaredVersion) {
+            preconditions += blocked(
+                "GAME_VERSION_UNSUPPORTED",
+                "BONELAB content targets game version '$declaredVersion', but the installed version is '${installedApp?.versionName}'."
+            )
+        }
         val roots = archive.entries
             .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
             .toMutableSet()
@@ -1219,7 +1538,44 @@ class ModPackageAnalyzer(
         // Choose the Quest/Android subset before classifying code or applying
         // payload policy. A desktop DLL/EXE/SO in a mixed archive must not
         // poison an otherwise valid Quest native-content branch.
-        val codeMod = selectedEntries.any(::looksLikeCodeModPayload)
+        val codeMod = selectedEntries.any(::looksLikeCodeModPayload) ||
+            selectedEntries.any { it.lowercase(Locale.ROOT).endsWith(".so") }
+        fun relativeEntry(entry: String): String {
+            val platformRelative = platformPrefix?.let {
+                entry.removePrefix("$it/")
+            } ?: entry
+            return stripBonelabWrappers(platformRelative)
+        }
+        val meaningfulManifestRoots = contentDocuments(archive)
+            .filter { (path, json) -> isBonelabContentDocument(path, json) }
+            .map { (path, _) -> relativeEntry(path).substringBefore('/') }
+            .filter(String::isNotBlank)
+            .distinct()
+        val codeRoot = selectedEntries
+            .asSequence()
+            .map(::relativeEntry)
+            .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
+            .firstOrNull()
+        val contentRoot = meaningfulManifestRoots.singleOrNull()
+        val evidencedRoot = contentRoot ?: if (codeMod) codeRoot else null
+        val selectedRoots = selectedEntries.asSequence()
+            .filterNot { it in archive.directories }
+            .map(::relativeEntry)
+            .mapNotNull { it.substringBefore('/').takeIf(String::isNotBlank) }
+            .distinct()
+            .toList()
+        if (!codeMod && meaningfulManifestRoots.size != 1) {
+            preconditions += blocked(
+                "MOD_FOLDER_REQUIRED",
+                "BONELAB content must contain one meaningful manifest inside one mod folder."
+            )
+        }
+        if (evidencedRoot != null && selectedRoots.any { it != evidencedRoot }) {
+            preconditions += blocked(
+                "UNRELATED_ARCHIVE_CONTENT",
+                "Archive contains files outside the evidenced BONELAB mod folder."
+            )
+        }
         val loaderRequirement = if (codeMod) {
             loaderRequirement(
                 setOf(ModLoaderKind.LEMON_LOADER, ModLoaderKind.MELON_LOADER),
@@ -1273,15 +1629,24 @@ class ModPackageAnalyzer(
                     // branch only; never copy the desktop half silently.
                     continue
                 }
-                val platformRelative = platformPrefix?.let {
-                    entry.removePrefix("$it/")
-                } ?: entry
-                val relative = stripBonelabWrappers(platformRelative)
+                val relative = relativeEntry(entry)
                 if (relative.isBlank() || !relative.contains('/')) {
                     preconditions += blocked("MOD_FOLDER_REQUIRED", "BONELAB content files must be inside a complete mod folder.")
                     continue
                 }
-                val destination = "${profile.destination}/${relative}"
+                if (evidencedRoot != null &&
+                    relative != evidencedRoot &&
+                    !relative.startsWith("$evidencedRoot/")
+                ) {
+                    continue
+                }
+                val deNestedRelative = if (
+                    evidencedRoot != null &&
+                    relative.startsWith("$evidencedRoot/$evidencedRoot/")
+                ) {
+                    relative.removePrefix("$evidencedRoot/")
+                } else relative
+                val destination = "${profile.destination}/${deNestedRelative}"
                 addMapping(
                     archive,
                     profile,
@@ -1354,7 +1719,12 @@ class ModPackageAnalyzer(
     ): Boolean {
         val profile = installedApp?.let { profileRegistry.findByPackageId(it.packageName) }
             ?: return false
-        if (profile.packageId == BONELAB_PACKAGE_ID) return false
+        // BONELAB and Nomad have dedicated, schema-driven classifiers.
+        // Never let the generic known-directory fallback authorize either
+        // game when their content evidence was ambiguous.
+        if (profile.packageId == BONELAB_PACKAGE_ID ||
+            profile.packageId == BLADE_AND_SORCERY_PACKAGE_ID
+        ) return false
         return archive.entries.any { entry ->
             profile.knownContentDirectories.any { root ->
                 entry == root || entry.startsWith("$root/")
@@ -2011,7 +2381,18 @@ class ModPackageAnalyzer(
             patchRequirement?.required == true ->
                 ModInstallOutcome.APK_PATCH_REQUIRED
             unsupportedLoader -> ModInstallOutcome.UNSUPPORTED
-            hardPayloadBlock -> ModInstallOutcome.UNSUPPORTED
+            // A managed/native code archive is still a meaningful code-mod
+            // classification when its loader is absent.  Preserve the
+            // loader-required outcome for the UI; once a loader is detected,
+            // invalid binaries remain blocked by the hard payload checks.
+            hardPayloadBlock && !(
+                type == ModPackageType.BONELAB_CODE_MOD &&
+                    requiresLoader &&
+                    preconditions.none {
+                        it.code == "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT"
+                    }
+                ) ->
+                ModInstallOutcome.UNSUPPORTED
             requiresLoader -> ModInstallOutcome.REQUIRES_MOD_LOADER
             installable -> ModInstallOutcome.DIRECT_INSTALL_READY
             else -> ModInstallOutcome.UNSUPPORTED
@@ -2280,11 +2661,12 @@ class ModPackageAnalyzer(
             )
         }
         if (payloadEntries.any {
-                it.lowercase(Locale.ROOT).endsWith(".so")
+                it.lowercase(Locale.ROOT).endsWith(".so") &&
+                    !isArm64Elf(archive, it)
             }) {
             preconditions += blocked(
                 "NATIVE_PAYLOAD_REQUIRES_LOADER_ROOT",
-                "BONELAB code plans do not accept unvalidated native SO payloads."
+                "BONELAB code plans require validated ARM64 native SO payloads."
             )
         }
     }

@@ -9,7 +9,12 @@ import kotlin.test.assertTrue
 
 class ModPackageAnalyzerTest {
     private val analyzer = ModPackageAnalyzer()
-    private val bonelab = InstalledQuestApp("com.StressLevelZero.BONELAB", "1.2.3", 123L)
+    private val bonelab = InstalledQuestApp(
+        "com.StressLevelZero.BONELAB",
+        "1.2974.57485",
+        2974L,
+        apkSha256 = "02adecc4af7354296205b4c2dbb50fba4132628aa0f0186ea9a7cf7419f670b1"
+    )
 
     @Test
     fun recognizesQmodAndBuildsVettedPlan() {
@@ -239,7 +244,7 @@ class ModPackageAnalyzerTest {
             assertTrue(analysis.installable)
             zip.appendText("changed-after-review")
             val adb = FakeAdb()
-            val result = ModsManager(adb).executeInstallPlan(
+            val result = ModsManager(adb, apkEvidenceRefresher = testApkEvidence()).executeInstallPlan(
                 "SERIAL",
                 zip,
                 analysis.installPlan.bindToDevice("SERIAL")
@@ -264,7 +269,7 @@ class ModPackageAnalyzerTest {
             val analysis = analyzer.analyze(zip, bonelab)
             assertTrue(analysis.installable)
             val adb = FakeAdb()
-            val result = ModsManager(adb).executeInstallPlan(
+            val result = ModsManager(adb, apkEvidenceRefresher = testApkEvidence()).executeInstallPlan(
                 "SERIAL",
                 zip,
                 analysis.installPlan.bindToDevice("SERIAL")
@@ -289,7 +294,10 @@ class ModPackageAnalyzerTest {
             val analysis = analyzer.analyze(zip, bonelab)
             val adb = FakeAdb()
 
-            val result = ModsManager(adb).executeInstallPlan("SERIAL", zip, analysis.installPlan)
+            val result = ModsManager(
+                adb,
+                apkEvidenceRefresher = testApkEvidence()
+            ).executeInstallPlan("SERIAL", zip, analysis.installPlan)
 
             assertFalse(result.success)
             assertTrue(result.message.contains("مرتبطة") || result.message.contains("ربط"))
@@ -310,6 +318,12 @@ class ModPackageAnalyzerTest {
         return file
     }
 
+    private fun testApkEvidence() = QuestApkEvidenceRefresher { _, app, _, _ ->
+        app.copy(
+            apkSha256 = GameModProfileRegistry.findByPackageId(app.packageName)?.apkSha256
+        )
+    }
+
     private class FakeAdb : AdbClient(BundledAdb(HostOs.LINUX)) {
         var pushCalls = 0
 
@@ -323,7 +337,7 @@ class ModPackageAnalyzerTest {
                     "package:/data/app/com.StressLevelZero.BONELAB/base.apk=com.StressLevelZero.BONELAB\n",
                     ""
                 )
-                "dumpsys" -> CmdResult(0, "versionName=1.2.3 versionCode=123\n", "")
+                "dumpsys" -> CmdResult(0, "versionName=1.2974.57485 versionCode=2974\n", "")
                 else -> CmdResult(0, "", "")
             }
 
@@ -334,6 +348,19 @@ class ModPackageAnalyzerTest {
             onProgress: (Long, Long) -> Unit
         ): CmdResult {
             pushCalls++
+            return CmdResult(0, "ok", "")
+        }
+
+        override fun pushModFileWithProgress(
+            serial: String,
+            from: File,
+            toDevicePath: String,
+            onProgress: (Long, Long) -> Unit,
+            cancelled: () -> Boolean
+        ): CmdResult {
+            pushCalls++
+            onProgress(0L, from.length())
+            onProgress(from.length(), from.length())
             return CmdResult(0, "ok", "")
         }
     }

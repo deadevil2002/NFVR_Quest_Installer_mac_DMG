@@ -379,14 +379,20 @@ private class BoundedTextCollector(private val maxChars: Int = 200_000) {
     override fun toString(): String = value.toString()
 }
 
-private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long = 120_000): CmdResult {
+private fun runProcess(
+    cmd: List<String>,
+    workDir: File? = null,
+    timeoutMs: Long = 120_000,
+    cancelled: () -> Boolean = { false },
+    maxOutputChars: Int = 200_000
+): CmdResult {
     val pb = ProcessBuilder(cmd)
     if (workDir != null) pb.directory(workDir)
     val p = pb.start()
     OwnedProcessRegistry.add(p)
 
-    val out = BoundedTextCollector()
-    val err = BoundedTextCollector()
+    val out = BoundedTextCollector(maxOutputChars)
+    val err = BoundedTextCollector(maxOutputChars)
 
     val tOut =
         Thread { p.inputStream.bufferedReader().useLines { it.forEach(out::appendLine) } }
@@ -396,10 +402,20 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
 
     return try {
         val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-        while (p.isAlive && System.nanoTime() < deadline) {
+        var wasCancelled = false
+        while (p.isAlive &&
+            System.nanoTime() < deadline &&
+            !(cancelled().also { wasCancelled = it })
+        ) {
             p.waitFor(100, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
-        if (p.isAlive) {
+        if (wasCancelled) {
+            p.destroyForcibly()
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            tOut.join(5_000)
+            tErr.join(5_000)
+            CmdResult(130, out.toString(), "Cancelled")
+        } else if (p.isAlive) {
             p.destroyForcibly()
             p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
             tOut.join(5_000)
@@ -419,6 +435,197 @@ private fun runProcess(cmd: List<String>, workDir: File? = null, timeoutMs: Long
         if (p.isAlive) p.destroyForcibly()
         OwnedProcessRegistry.remove(p)
     }
+}
+
+/**
+ * Execute a command whose stdout is an opaque byte stream.  APKs must never
+ * pass through a Kotlin String: doing so both corrupts arbitrary bytes and
+ * allows an unexpectedly large response to exhaust the desktop process.
+ */
+private fun runBinaryProcess(
+    cmd: List<String>,
+    outputFile: File,
+    workDir: File? = null,
+    timeoutMs: Long = 20 * 60_000,
+    maxBytes: Long = 512L * 1024 * 1024,
+    cancelled: () -> Boolean = { false }
+): CmdResult {
+    val parent = outputFile.absoluteFile.parentFile
+    if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
+        return CmdResult(1, "", "Unable to create binary output directory")
+    }
+    outputFile.delete()
+    val process = try {
+        ProcessBuilder(cmd).apply { if (workDir != null) directory(workDir) }.start()
+    } catch (error: Throwable) {
+        return CmdResult(1, "", error.message ?: "Unable to start process")
+    }
+    OwnedProcessRegistry.add(process)
+    val errorOutput = BoundedTextCollector()
+    val tooLarge = AtomicBoolean(false)
+    val stdoutThread = Thread {
+        var total = 0L
+        try {
+            process.inputStream.use { input ->
+                java.io.FileOutputStream(outputFile).use { file ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        if (total > maxBytes) {
+                            tooLarge.set(true)
+                            process.destroyForcibly()
+                            break
+                        }
+                        file.write(buffer, 0, count)
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // The process/stream is deliberately closed by the owner on
+            // timeout, cancellation, or bounded-output rejection.
+        }
+    }
+    val stderrThread = Thread {
+        process.errorStream.bufferedReader().useLines { it.forEach(errorOutput::appendLine) }
+    }
+    stdoutThread.start()
+    stderrThread.start()
+    return try {
+        val deadline = System.nanoTime() +
+            java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        var wasCancelled = false
+        while (process.isAlive &&
+            System.nanoTime() < deadline &&
+            !tooLarge.get() &&
+            !(cancelled().also { wasCancelled = it })
+        ) {
+            process.waitFor(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        if (wasCancelled && process.isAlive) process.destroyForcibly()
+        val timedOut = process.isAlive && !tooLarge.get() && !wasCancelled
+        if (timedOut) process.destroyForcibly()
+        if (process.isAlive) process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        stdoutThread.join(5_000)
+        stderrThread.join(5_000)
+        when {
+            tooLarge.get() -> {
+                outputFile.delete()
+                CmdResult(1, "", "Binary output exceeded safe limit")
+            }
+            wasCancelled -> {
+                outputFile.delete()
+                CmdResult(130, "", "Cancelled")
+            }
+            timedOut -> {
+                outputFile.delete()
+                CmdResult(124, "", "Timeout")
+            }
+            process.exitValue() != 0 -> {
+                outputFile.delete()
+                CmdResult(process.exitValue(), "", errorOutput.toString())
+            }
+            else -> CmdResult(0, "", errorOutput.toString())
+        }
+    } catch (interrupted: InterruptedException) {
+        process.destroyForcibly()
+        outputFile.delete()
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } finally {
+        if (process.isAlive) process.destroyForcibly()
+        runCatching { process.inputStream.close() }
+        runCatching { process.errorStream.close() }
+        OwnedProcessRegistry.remove(process)
+    }
+}
+
+private fun runPushProgressProcess(
+    cmd: List<String>,
+    totalBytes: Long,
+    onProgress: (Long, Long) -> Unit,
+    timeoutMs: Long = 20 * 60_000,
+    cancelled: () -> Boolean = { false }
+): CmdResult {
+    val process = try {
+        ProcessBuilder(cmd).redirectErrorStream(true).start()
+    } catch (error: Throwable) {
+        return CmdResult(1, "", error.message ?: "Unable to start push process")
+    }
+    OwnedProcessRegistry.add(process)
+    val output = StringBuilder()
+    var lastBytes = 0L
+    val safeTotal = totalBytes.coerceAtLeast(1L)
+    fun consume(chunk: String) {
+        output.append(chunk.take((200_000 - output.length).coerceAtLeast(0)))
+        Regex("""(?<!\d)(\d{1,3})%(?!\d)""").findAll(chunk).forEach { match ->
+            val parsed = adbPushProgressBytes(match.value, safeTotal, lastBytes)
+            if (parsed != null && parsed != lastBytes) {
+                lastBytes = parsed
+                onProgress(lastBytes, totalBytes)
+            }
+        }
+    }
+    return try {
+        onProgress(0L, totalBytes)
+        val buffer = ByteArray(4096)
+        val input = process.inputStream
+        val deadline = System.nanoTime() +
+            java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        var wasCancelled = false
+        while (process.isAlive &&
+            System.nanoTime() < deadline &&
+            !(cancelled().also { wasCancelled = it })
+        ) {
+            if (input.available() > 0) {
+                val count = input.read(buffer)
+                if (count > 0) consume(String(buffer, 0, count, Charsets.UTF_8))
+            } else {
+                process.waitFor(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+        }
+        if (wasCancelled) process.destroyForcibly()
+        val timedOut = process.isAlive && !wasCancelled
+        if (timedOut) process.destroyForcibly()
+        process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        while (input.available() > 0) {
+            val count = input.read(buffer)
+            if (count <= 0) break
+            consume(String(buffer, 0, count, Charsets.UTF_8))
+        }
+        when {
+            wasCancelled -> CmdResult(130, output.toString(), "Cancelled")
+            timedOut -> CmdResult(124, output.toString(), "Timeout")
+            process.exitValue() != 0 -> CmdResult(process.exitValue(), output.toString(), output.toString())
+            else -> CmdResult(0, output.toString(), "")
+        }
+    } catch (interrupted: InterruptedException) {
+        process.destroyForcibly()
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } finally {
+        if (process.isAlive) process.destroyForcibly()
+        runCatching { process.inputStream.close() }
+        runCatching { process.errorStream.close() }
+        OwnedProcessRegistry.remove(process)
+    }
+}
+
+internal fun adbPushProgressBytes(
+    output: String,
+    totalBytes: Long,
+    previousBytes: Long = 0L
+): Long? {
+    val percent = Regex("""(?:^\s*|\[\s*)(\d{1,3})%(?:\]|\s|$)""")
+        .find(output.trim())
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+        ?.coerceIn(0, 100)
+        ?: return null
+    val total = totalBytes.coerceAtLeast(1L)
+    return (total * percent / 100L).coerceIn(previousBytes.coerceAtLeast(0L), total)
 }
 
 open class AdbClient(private val bundled: BundledAdb) {
@@ -444,7 +651,15 @@ open class AdbClient(private val bundled: BundledAdb) {
      * read-only APK metadata inspection; the caller owns the temporary local
      * file and is responsible for deleting it.
      */
-    open fun pullReadOnly(serial: String, remotePath: String, localFile: File): CmdResult {
+    open fun pullReadOnly(serial: String, remotePath: String, localFile: File): CmdResult =
+        pullReadOnly(serial, remotePath, localFile) { false }
+
+    open fun pullReadOnly(
+        serial: String,
+        remotePath: String,
+        localFile: File,
+        cancelled: () -> Boolean
+    ): CmdResult {
         val destination = localFile.absoluteFile
         val parent = destination.parentFile
         if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
@@ -454,7 +669,61 @@ open class AdbClient(private val bundled: BundledAdb) {
         return runProcess(
             listOf(adb.absolutePath, "-s", serial, "pull", remotePath, destination.absolutePath),
             workDir = dir,
-            timeoutMs = 20 * 60_000
+            timeoutMs = 20 * 60_000,
+            cancelled = cancelled
+        )
+    }
+
+    /**
+     * Read a known remote file without a shell and without ever converting
+     * stdout to text.  This is a fallback for devices where adb pull cannot
+     * read an APK while exec-out cat is permitted.
+     */
+    open fun streamReadOnly(
+        serial: String,
+        remotePath: String,
+        localFile: File,
+        maxBytes: Long = 512L * 1024 * 1024
+    ): CmdResult = streamReadOnly(serial, remotePath, localFile, maxBytes) { false }
+
+    open fun streamReadOnly(
+        serial: String,
+        remotePath: String,
+        localFile: File,
+        maxBytes: Long,
+        cancelled: () -> Boolean
+    ): CmdResult {
+        val destination = localFile.absoluteFile
+        val (adb, dir) = adbBase()
+        return runBinaryProcess(
+            listOf(adb.absolutePath, "-s", serial, "exec-out", "cat", remotePath),
+            destination,
+            workDir = dir,
+            timeoutMs = 20 * 60_000,
+            maxBytes = maxBytes,
+            cancelled = cancelled
+        )
+    }
+
+    /**
+     * Read a small, explicitly selected metadata file without logging its
+     * contents. The collector is bounded one character beyond the requested
+     * byte limit; callers reject the result if UTF-8 encoding exceeds it.
+     */
+    open fun readTextReadOnly(
+        serial: String,
+        remotePath: String,
+        maxBytes: Int,
+        cancelled: () -> Boolean
+    ): CmdResult {
+        require(maxBytes in 1..64 * 1024) { "metadata limit out of range" }
+        val (adb, dir) = adbBase()
+        return runProcess(
+            listOf(adb.absolutePath, "-s", serial, "exec-out", "cat", remotePath),
+            workDir = dir,
+            timeoutMs = 120_000,
+            cancelled = cancelled,
+            maxOutputChars = maxBytes + 1
         )
     }
 
@@ -520,6 +789,9 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
     private val packagePattern = Regex("""^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$""")
     private val remoteFilePattern = Regex("""^/(?:data/app|system|product|vendor)/[A-Za-z0-9_./+@=~:-]+\.apk$""")
     private val remoteDirectoryPattern = Regex("""^/sdcard/(?:Android/(?:obb|data)|ModData)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$""")
+    private val remoteTextFilePattern = Regex(
+        """^/sdcard/(?:Android/data|ModData)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.@+=,-]+)+$"""
+    )
     private val serialPattern = Regex("""^[A-Za-z0-9._:-]+$""")
     private fun bounded(value: String, limit: Int = 200_000): String = value.take(limit)
     private fun checkedSerial(serial: String): String = serial.trim().also {
@@ -536,6 +808,11 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
     private fun checkedDirectory(path: String): String = path.trim().also {
         require(remoteDirectoryPattern.matches(it) && it.split('/').none { part -> part == "." || part == ".." }) {
             "unsupported remote directory"
+        }
+    }
+    private fun checkedTextFile(path: String): String = path.trim().also {
+        require(remoteTextFilePattern.matches(it) && it.split('/').none { part -> part == "." || part == ".." }) {
+            "unsupported remote metadata path"
         }
     }
     private fun command(serial: String, vararg args: String): CommandResult {
@@ -568,17 +845,48 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
     override fun packageInfo(serial: String, packageId: String): String =
         out(serial, "dumpsys", "package", checkedPackage(packageId))
 
+    override fun cmdPackagePath(serial: String, packageId: String): String =
+        command(serial, "cmd", "package", "path", checkedPackage(packageId)).out
+
     override fun packagePathResult(serial: String, packageId: String): QuestProbeApkPathResult {
-        val raw = out(serial, "pm", "path", checkedPackage(packageId))
-        val parsed = QuestProbeApkPaths.parse(raw)
+        val checkedPackageId = checkedPackage(packageId)
+        val pm = command(serial, "pm", "path", checkedPackageId)
+        val parsed = QuestProbeApkPaths.parse(pm.out)
         DiagnosticLogger.info(
-            "PM_PATH_RAW_LINE_COUNT=${parsed.diagnostics.rawLineCount} " +
+            "PM_PATH_SOURCE=PM_PATH " +
+                "PM_PATH_RAW_LINE_COUNT=${parsed.diagnostics.rawLineCount} " +
                 "PM_PATH_VALID_APK_COUNT=${parsed.diagnostics.validApkLineCount} " +
                 "PM_PATH_UNIQUE_APK_COUNT=${parsed.diagnostics.uniqueApkCount} " +
                 "PM_PATH_LIMIT=${parsed.diagnostics.limit} " +
                 "PM_PATH_LIMIT_EXCEEDED=${parsed.diagnostics.limitExceeded}"
         )
-        return parsed
+        val pmFiltered = parsed.filterForPackage(checkedPackageId)
+        if (pmFiltered.paths.isNotEmpty()) return pmFiltered
+
+        // Some Quest firmware returns a successful command with no usable
+        // pm-path lines.  Keep the fallbacks ordered and read-only.
+        val cmdPath = command(serial, "cmd", "package", "path", checkedPackageId)
+        val cmdParsed = QuestProbeApkPaths.parse(cmdPath.out)
+            .filterForPackage(checkedPackageId)
+            .copy(source = QuestProbeApkPathSource.CMD_PACKAGE_PATH)
+        if (cmdParsed.paths.isNotEmpty()) {
+            DiagnosticLogger.info(
+                "APK_PATH_SOURCE=CMD_PACKAGE_PATH count=${cmdParsed.paths.size}"
+            )
+            return cmdParsed
+        }
+
+        val dumpsys = command(serial, "dumpsys", "package", checkedPackageId)
+        val dumpPaths = dumpsysPackageApkPaths(dumpsys.out, checkedPackageId)
+        val dumpParsed = QuestProbeApkPaths.normalizeDirect(
+            dumpPaths.first,
+            dumpPaths.second
+        )
+        DiagnosticLogger.info(
+            "APK_PATH_SOURCE=${if (dumpParsed.paths.isEmpty()) "NONE" else "DUMPSYS_CODE_PATH"} " +
+                "DUMPSYS_APK_COUNT=${dumpParsed.paths.size}"
+        )
+        return dumpParsed
     }
 
     override fun packagePaths(serial: String, packageId: String): List<String> =
@@ -628,8 +936,171 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
         return RestrictedListResult(true, entries, exists = true)
     }
 
-    override fun pull(serial: String, remotePath: String, local: File): Boolean =
-        adb.pullReadOnly(checkedSerial(serial), checkedFile(remotePath), local).exit == 0
+    override fun readText(
+        serial: String,
+        remotePath: String,
+        maxBytes: Int,
+        cancelled: () -> Boolean
+    ): String? {
+        if (cancelled()) return null
+        require(maxBytes in 1..64 * 1024) { "metadata limit out of range" }
+        val result = adb.readTextReadOnly(
+            checkedSerial(serial),
+            checkedTextFile(remotePath),
+            maxBytes,
+            cancelled
+        )
+        if (result.exit != 0) return null
+        val bytes = result.out.toByteArray(Charsets.UTF_8)
+        if (bytes.size > maxBytes) return null
+        return result.out
+    }
+
+    override fun pull(serial: String, remotePath: String, local: File): Boolean {
+        val checkedSerial = checkedSerial(serial)
+        val checkedPath = checkedFile(remotePath)
+        val pulled = adb.pullReadOnly(checkedSerial, checkedPath, local)
+        if (pulled.exit == 0 && local.isFile && local.length() > 0L) return true
+        local.delete()
+        val streamed = adb.streamReadOnly(
+            checkedSerial,
+            checkedPath,
+            local,
+            QuestPreparationProbe.MAX_APK_BYTES
+        )
+        return streamed.exit == 0 && local.isFile && local.length() > 0L
+    }
+
+    override fun pull(
+        serial: String,
+        remotePath: String,
+        local: File,
+        cancelled: () -> Boolean
+    ): Boolean {
+        val checkedSerial = checkedSerial(serial)
+        val checkedPath = checkedFile(remotePath)
+        if (cancelled()) return false
+        val pulled = adb.pullReadOnly(checkedSerial, checkedPath, local, cancelled)
+        if (pulled.exit == 0 && local.isFile && local.length() > 0L) return true
+        DiagnosticLogger.info(
+            "APK_PULL_FAILED exit=${pulled.exit} stderr=${bounded(pulled.err, 500)}; trying EXEC_OUT_CAT"
+        )
+
+        // adb pull is preferred because it has a well-defined file transfer
+        // protocol.  exec-out is only a fallback and writes bytes directly to
+        // a bounded file stream; it is never represented as String stdout.
+        local.delete()
+        val streamed = adb.streamReadOnly(
+            checkedSerial,
+            checkedPath,
+            local,
+            maxBytes = QuestPreparationProbe.MAX_APK_BYTES,
+            cancelled = cancelled
+        )
+        if (streamed.exit != 0) {
+            DiagnosticLogger.info(
+                "EXEC_OUT_CAT_FAILED exit=${streamed.exit} stderr=${bounded(streamed.err, 500)}"
+            )
+        }
+        return streamed.exit == 0 && local.isFile && local.length() > 0L
+    }
+
+    override fun streamReadOnly(
+        serial: String,
+        remotePath: String,
+        local: File,
+        maxBytes: Long,
+        cancelled: () -> Boolean
+    ): Boolean {
+        val result = adb.streamReadOnly(
+            checkedSerial(serial),
+            checkedFile(remotePath),
+            local,
+            maxBytes,
+            cancelled
+        )
+        return result.exit == 0 && local.isFile && local.length() > 0L
+    }
+
+    private fun dumpsysPackageApkPaths(
+        output: String,
+        packageId: String
+    ): Pair<List<String>, QuestProbeApkPathSource> {
+        val candidates = linkedMapOf<String, QuestProbeApkPathSource>()
+        val apkRegex = Regex("""/data/app/[A-Za-z0-9._~+=@/-]+\.apk""")
+        fun accepts(path: String): Boolean {
+            if (!QuestProbeApkPaths.isSafeApkPath(path)) return false
+            // Do not turn an arbitrary dumpsys path into selected-app
+            // evidence. Android's install directory contains the package id,
+            // optionally followed by a version/hash suffix.
+            val marker = "/$packageId"
+            return path.contains(marker) &&
+                (path.contains("$marker/") ||
+                    path.contains("$marker-") ||
+                    path.contains("${marker}_"))
+        }
+        output.lineSequence().take(8_192).forEach { line ->
+            val rawKey = line.substringBefore('=').substringAfterLast(' ').trim()
+            val key = rawKey.trimEnd(':')
+            val value = when {
+                '=' in line -> line.substringAfter('=', "").trim()
+                ':' in line -> line.substringAfter(':', "").trim()
+                else -> ""
+            }
+            val values = when {
+                key in setOf("codePath", "resourcePath", "legacyNativeLibraryDir", "sourceDir", "publicSourceDir") ->
+                    apkRegex.findAll(value).map { it.value }.toList()
+                key == "splitSourceDirs" || key == "path" ->
+                    apkRegex.findAll(value).map { it.value }.toList()
+                else -> emptyList()
+            }
+            val source = if (key == "sourceDir" || key == "publicSourceDir" ||
+                key == "splitSourceDirs"
+            ) {
+                QuestProbeApkPathSource.DUMPSYS_SOURCE_DIR
+            } else {
+                QuestProbeApkPathSource.DUMPSYS_CODE_PATH
+            }
+            values.forEach { if (accepts(it)) candidates.putIfAbsent(it, source) }
+
+            if (key == "codePath" && value.isNotBlank() && !value.endsWith(".apk")) {
+                val base = value.trimEnd('/') + "/base.apk"
+                if (accepts(base)) {
+                    candidates.putIfAbsent(base, QuestProbeApkPathSource.DUMPSYS_CODE_PATH)
+                }
+            }
+        }
+        val source = candidates.values.firstOrNull()
+            ?: QuestProbeApkPathSource.DUMPSYS_CODE_PATH
+        return candidates.keys.toList() to source
+    }
+
+    private fun QuestProbeApkPathResult.filterForPackage(packageId: String): QuestProbeApkPathResult {
+        val marker = "/$packageId"
+        val paths = paths.filter { path ->
+            path.contains(marker) &&
+                (path.contains("$marker/") ||
+                    path.contains("$marker-") ||
+                    path.contains("${marker}_"))
+        }
+        // Preserve the source parser's raw-line diagnostics.  In particular,
+        // a valid pm response may contain warnings and duplicate lines that
+        // are useful when explaining a partial probe.
+        if (paths.size == this.paths.size) return this
+        val filteredDiagnostics = diagnostics.copy(
+            validApkLineCount = paths.size,
+            uniqueApkCount = paths.size
+        )
+        return copy(
+            paths = paths,
+            diagnostics = filteredDiagnostics,
+            error = when {
+                paths.isEmpty() -> "No APK paths returned"
+                paths.size > filteredDiagnostics.limit -> "APK count exceeds safe limit"
+                else -> null
+            }
+        )
+    }
 }
     open fun shell(serial: String, vararg args: String): CmdResult {
         val (adb, dir) = adbBase()
@@ -675,11 +1146,37 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
     return doPush()
 }
 
+    /**
+     * Mods-only file transfer. Unlike pushWithProgress (which intentionally
+     * serves legacy game installs), this uses adb's progress protocol and
+     * reports bytes observed during the transfer.
+     */
+    open fun pushModFileWithProgress(
+        serial: String,
+        from: File,
+        toDevicePath: String,
+        onProgress: (copiedBytes: Long, totalBytes: Long) -> Unit,
+        cancelled: () -> Boolean = { false }
+    ): CmdResult {
+        if (!from.isFile) return CmdResult(1, "", "Source file not found: ${from.absolutePath}")
+        val (adb, dir) = adbBase()
+        return runPushProgressProcess(
+            questModPushCommand(adb.absolutePath, serial, from.absolutePath, toDevicePath),
+            from.length(),
+            onProgress,
+            timeoutMs = estimatePushTimeoutMs(from.length()),
+            cancelled = cancelled
+        )
+    }
+
     fun reboot(serial: String): CmdResult {
         val (adb, dir) = adbBase()
         return runProcess(listOf(adb.absolutePath, "-s", serial, "reboot"), workDir = dir, timeoutMs = 30_000)
     }
 }
+
+internal fun questModPushCommand(adb: String, serial: String, local: String, remote: String): List<String> =
+    listOf(adb, "-s", serial, "push", local, remote)
 
 private fun parseDfToGb(dfOutput: String): Pair<Double, Double>? {
     val lines = dfOutput.lines().map { it.trim() }.filter { it.isNotBlank() }
@@ -774,7 +1271,12 @@ fun main() {
     val questPreparationEngine = remember { QuestPreparationEngine(adb) }
     val modAnalysisController = remember {
         QuestModAnalysisController { request ->
-            modsManager.analyzeModPackage(request.serial, request.archive, request.app)
+            modsManager.analyzeModPackage(
+                request.serial,
+                request.archive,
+                request.app,
+                request.onProgress
+            )
         }
     }
     LaunchedEffect(Unit) {
@@ -1335,7 +1837,23 @@ fun main() {
             )
             val controllerResult = withContext(Dispatchers.IO) {
                 modAnalysisController.analyze(
-                    QuestModAnalysisRequest(serial, app, file, archiveSha256),
+                    QuestModAnalysisRequest(
+                        serial,
+                        app,
+                        file,
+                        archiveSha256,
+                        onProgress = { message ->
+                            uiScope.launch(Dispatchers.Main.immediate) {
+                                if (modOperationGeneration == generation) {
+                                    modExecutionProgress = ModsManager.ModExecutionProgress(
+                                        ModsManager.ModInstallPhase.ANALYZING,
+                                        null,
+                                        message
+                                    )
+                                }
+                            }
+                        }
+                    ),
                     isCurrent = {
                         modOperationStillCurrent(generation, file, app, serial)
                     }

@@ -197,6 +197,8 @@ object QuestPreparationReportExporter {
                 apk.splitName?.let { put("splitName", it) }
                 apk.sizeBytes?.let { put("sizeBytes", it) }
                 apk.sha256?.let { put("sha256", it) }
+                 apk.inspectionStage?.let { put("inspectionStage", it) }
+                 apk.inspectionFailureCode?.let { put("inspectionFailureCode", it) }
                 if (apk.nativeHashes.isNotEmpty()) put("nativeHashes", JSONObject(apk.nativeHashes))
                 apk.manifestSha256?.let { put("manifestSha256", it) }
             }
@@ -255,6 +257,9 @@ object QuestPreparationReportExporter {
         put("androidData", safeDataJson(game.androidData))
         put("modData", safeDataJson(game.modData))
         put("preparationState", game.preparationState.name)
+         game.apkPathSource?.let { put("apkPathSource", it.name) }
+         game.apkInspectionStage?.let { put("apkInspectionStage", it) }
+         game.apkInspectionFailureCode?.let { put("apkInspectionFailureCode", it) }
         put("warnings", JSONArray(game.warnings))
         put("diagnostics", JSONObject().apply {
             game.apkPathDiagnostics?.let { paths ->
@@ -263,7 +268,10 @@ object QuestPreparationReportExporter {
                     .put("validApkLineCount", paths.validApkLineCount)
                     .put("uniqueApkCount", paths.uniqueApkCount)
                     .put("limit", paths.limit)
-                    .put("limitExceeded", paths.limitExceeded))
+                     .put("limitExceeded", paths.limitExceeded))
+                game.apkPathSource?.let { put("apkPathSource", it.name) }
+                game.apkInspectionStage?.let { put("apkInspectionStage", it) }
+                game.apkInspectionFailureCode?.let { put("apkInspectionFailureCode", it) }
             }
             put("warnings", JSONArray(game.warnings))
         })
@@ -336,6 +344,12 @@ object QuestPreparationReportExporter {
             appendLine("  الإصدار: ${game.optString("versionName", "غير متوفر")} / ${game.opt("versionCode") ?: "غير متوفر"}")
             appendLine("  الحالة: ${game.optString("preparationState")}")
             appendLine("  أدلة APK/native: ${game.optJSONArray("apkInventory")?.length() ?: 0} ملف تقني")
+             if (game.has("apkInspectionStage")) {
+                 appendLine("  مرحلة فحص APK: ${game.optString("apkInspectionStage")}")
+             }
+             if (game.has("apkInspectionFailureCode")) {
+                 appendLine("  فشل فحص APK: ${game.optString("apkInspectionFailureCode")}")
+             }
             val warnings = game.optJSONArray("warnings")
             if (warnings != null) for (i in 0 until warnings.length()) {
                 val warning = warnings.opt(i)

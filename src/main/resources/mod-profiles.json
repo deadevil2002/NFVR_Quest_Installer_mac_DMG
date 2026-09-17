@@ -24,6 +24,9 @@
       "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods"
     ],
     "knownContentDirectories": ["Mods"],
+    "supportedVersionNames": ["1.2974.57485"],
+    "supportedVersionCodes": [2974],
+    "apkSha256": "02adecc4af7354296205b4c2dbb50fba4132628aa0f0186ea9a7cf7419f670b1",
     "supportedPackageTypes": [
       "BONELAB_NATIVE_CONTENT",
       "BONELAB_CODE_MOD",
@@ -50,6 +53,33 @@
     "evidenceLevel": "AUTHORITATIVE",
     "evidenceSources": [
       "https://github.com/StressLevelZero/MarrowSDK/blob/main/Docs/BuildPallet.md"
+    ]
+  },
+  {
+    "packageId": "com.Warpfrog.BladeAndSorcery",
+    "displayName": "Blade & Sorcery: Nomad",
+    "engine": "Unity IL2CPP",
+    "destination": "/sdcard/Android/data/com.Warpfrog.BladeAndSorcery/files/Mods",
+    "authoritativePaths": [
+      "/sdcard/Android/data/com.Warpfrog.BladeAndSorcery/files/Mods"
+    ],
+    "knownContentDirectories": ["Mods", "mods"],
+    "supportedPackageTypes": ["KNOWN_GAME_PROFILE"],
+    "modTypes": ["KNOWN_GAME_PROFILE"],
+    "installationStrategies": ["KNOWN_GAME_PROFILE"],
+    "recognizedArchiveSignatures": [
+      "manifest.json",
+      "module.json",
+      "catalog.json",
+      ".assetbundle",
+      ".bundle"
+    ],
+    "supportedVersionNames": ["1.0.7"],
+    "supportedVersionCodes": [682],
+    "apkSha256": "48e49e3d88590ae572df1885f67f4a5f2d9d8397dae16475c25b4d471e6e2324",
+    "evidenceLevel": "AUTHORITATIVE",
+    "evidenceSources": [
+      "device probe fixture: Quest Mods directory and APK inspection"
     ]
   },
   {

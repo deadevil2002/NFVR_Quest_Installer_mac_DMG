@@ -9,14 +9,20 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ModEngineTest {
-    private val bonelab = InstalledQuestApp("com.StressLevelZero.BONELAB", "1.2.3", 123L)
+    private val bonelab = InstalledQuestApp(
+        "com.StressLevelZero.BONELAB",
+        "1.2974.57485",
+        2974L,
+        apkSha256 = "02adecc4af7354296205b4c2dbb50fba4132628aa0f0186ea9a7cf7419f670b1"
+    )
     private val analyzer = ModPackageAnalyzer()
 
     @Test
     fun recognizesBonelabNativePalletAndPreservesCompleteFolderDestination() {
         val zip = zipOf(
             "Author.Mod/" to "",
-            "Author.Mod/pallet.json" to "{}",
+            "Author.Mod/pallet.json" to
+                """{"name":"Author Mod","pallet":"avatar","version":"1.0","files":["avatar.assetbundle"]}""",
             "Author.Mod/Assets/avatar.assetbundle" to "asset"
         )
         val analysis = analyzer.analyze(zip, bonelab)
@@ -33,6 +39,8 @@ class ModEngineTest {
     @Test
     fun bonelabDesktopPayloadIsNotAcceptedAsQuestContent() {
         val zip = zipOf(
+            "PC/manifest.json" to
+                """{"name":"Desktop Export","packageId":"com.StressLevelZero.BONELAB","gameVersion":"1.2974.57485"}""",
             "PC/readme.assetbundle" to "desktop",
             "PC/game.pdb" to "symbols"
         )
@@ -50,6 +58,9 @@ class ModEngineTest {
             "PC/Desktop.exe" to pcExePayload(),
             "PC/Native.dll" to managedPeCliPayload(),
             "PC/Native.so" to pcElfPayload(),
+            "Quest/Mods/Mods/Author.Mod/manifest.json" to
+                """{"name":"Author Mod","packageId":"com.StressLevelZero.BONELAB","gameVersion":"1.2974.57485"}"""
+                    .toByteArray(),
             "Quest/Mods/Mods/Author.Mod/content.assetbundle" to "quest".toByteArray()
         )
         val analysis = analyzer.analyze(zip, bonelab)
@@ -57,7 +68,9 @@ class ModEngineTest {
         assertTrue(analysis.installable)
         assertEquals(
             "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods/Author.Mod/content.assetbundle",
-            analysis.plan.mappings.single().destinationPath
+            analysis.plan.mappings.single {
+                it.destinationPath.endsWith("/Author.Mod/content.assetbundle")
+            }.destinationPath
         )
         zip.delete()
     }
@@ -68,6 +81,9 @@ class ModEngineTest {
             "PC/Desktop.exe" to pcExePayload(),
             "PC/Native.dll" to managedPeCliPayload(),
             "PC/Native.so" to pcElfPayload(),
+            "Quest/Mods/Mods/Author.Mod/manifest.json" to
+                """{"name":"Author Mod","packageId":"com.StressLevelZero.BONELAB","gameVersion":"1.2974.57485"}"""
+                    .toByteArray(),
             "Quest/Mods/Mods/Author.Mod/content.assetbundle" to "quest".toByteArray(),
             "Quest/Mods/Mods/Author.Mod/native.so" to "not-an-elf".toByteArray()
         )
@@ -128,7 +144,7 @@ class ModEngineTest {
             "mod.json" to """
                 {"_QPVersion":"1.2.0","name":"Loader mod","id":"loader-mod",
                  "author":"NFVR","version":"1.0.0",
-                 "packageId":"com.StressLevelZero.BONELAB","packageVersion":"1.2.3",
+                 "packageId":"com.StressLevelZero.BONELAB","packageVersion":"1.2974.57485",
                  "modloader":"QuestLoader","modFiles":["lib/mod.dat"],
                  "libraryFiles":["libdep.dat"]}
             """.trimIndent(),
@@ -159,7 +175,7 @@ class ModEngineTest {
             "mod.json" to """
                 {"_QPVersion":"1.2.0","name":"Needs dependency","id":"needs-dependency",
                  "author":"NFVR","version":"1.0.0","packageId":"com.StressLevelZero.BONELAB",
-                 "packageVersion":"1.2.3","dependencies":[{"id":"other","version":"1"}],
+                 "packageVersion":"1.2974.57485","dependencies":[{"id":"other","version":"1"}],
                  "modFiles":["mod.so"]}
             """.trimIndent(),
             "mod.so" to "mod"
@@ -284,7 +300,7 @@ class ModEngineTest {
             "mod.json" to """
                 {"_QPVersion":"1.2.0","name":"Copy","id":"copy","author":"NFVR",
                  "version":"1.0.0","packageId":"com.StressLevelZero.BONELAB",
-                 "packageVersion":"1.2.3",
+                 "packageVersion":"1.2974.57485",
                  "fileCopies":[{"name":"cover.png",
                  "destination":"/sdcard/ModData/com.StressLevelZero.BONELAB/cover.png"}]}
             """.trimIndent(),
@@ -433,7 +449,9 @@ class ModEngineTest {
 
         val safeZip = zipOf(
             "./Author.Mod/" to "",
-            "Author.Mod/../Author.Mod/pallet.json" to "{}"
+            "Author.Mod/../Author.Mod/pallet.json" to
+                """{"name":"Author Mod","pallet":"avatar","version":"1.0","files":["avatar.assetbundle"]}""",
+            "Author.Mod/avatar.assetbundle" to "asset"
         )
         val safeAnalysis = analyzer.analyze(safeZip, bonelab)
         assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, safeAnalysis.outcome)
@@ -509,7 +527,7 @@ class ModEngineTest {
             "AndroidManifest.xml" to """<manifest package="com.example.game"/>""",
             "modded.json" to
                 """{"patcherName":"QuestPatcher","patcherVersion":"2.0.0",
-                   "modloaderName":"QuestLoader","modloaderVersion":"1.2.3"}"""
+                   "modloaderName":"QuestLoader","modloaderVersion":"1.2974.57485"}"""
         )
         val app = InstalledQuestApp("com.example.game", "1")
         val adb = ArtifactAdb(apk, "/data/app/~~foo==/com.example.game-bar==/base.apk")
@@ -584,7 +602,11 @@ class ModEngineTest {
                     )
                 }
             }
-            val result = ModsManager(adb, detector)
+            val result = ModsManager(
+                adb,
+                detector,
+                apkEvidenceRefresher = testApkEvidence()
+            )
                 .executeInstallPlan("SERIAL", zip, analysis.plan.bindToDevice("SERIAL"))
 
             assertFalse(result.success)
@@ -611,7 +633,10 @@ class ModEngineTest {
                 destinationRoot = "/sdcard/Android/data/com.StressLevelZero.BONELAB/files"
             )
             val adb = RecordingAdb()
-            val result = ModsManager(adb)
+            val result = ModsManager(
+                adb,
+                apkEvidenceRefresher = testApkEvidence()
+            )
                 .executeInstallPlan("SERIAL", zip, tampered)
 
             assertFalse(result.success)
@@ -630,6 +655,12 @@ class ModEngineTest {
             }
         }
         return file
+    }
+
+    private fun testApkEvidence() = QuestApkEvidenceRefresher { _, app, _, _ ->
+        app.copy(
+            apkSha256 = GameModProfileRegistry.findByPackageId(app.packageName)?.apkSha256
+        )
     }
 
     private fun zipOfBytes(vararg entries: Pair<String, ByteArray>): File {
@@ -698,7 +729,7 @@ class ModEngineTest {
                     "package:/data/app/com.StressLevelZero.BONELAB/base.apk=com.StressLevelZero.BONELAB\n",
                     ""
                 )
-                "dumpsys" -> CmdResult(0, "versionName=1.2.3 versionCode=123\n", "")
+                "dumpsys" -> CmdResult(0, "versionName=1.2974.57485 versionCode=2974\n", "")
                 else -> CmdResult(0, "", "")
             }
 
@@ -709,6 +740,19 @@ class ModEngineTest {
             onProgress: (Long, Long) -> Unit
         ): CmdResult {
             pushCalls++
+            return CmdResult(0, "ok", "")
+        }
+
+        override fun pushModFileWithProgress(
+            serial: String,
+            from: File,
+            toDevicePath: String,
+            onProgress: (Long, Long) -> Unit,
+            cancelled: () -> Boolean
+        ): CmdResult {
+            pushCalls++
+            onProgress(0L, from.length())
+            onProgress(from.length(), from.length())
             return CmdResult(0, "ok", "")
         }
     }

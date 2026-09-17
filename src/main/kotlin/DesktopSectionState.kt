@@ -156,7 +156,8 @@ data class QuestModAnalysisRequest(
     val serial: String,
     val app: InstalledQuestApp,
     val archive: java.io.File,
-    val archiveSha256: String
+    val archiveSha256: String,
+    val onProgress: (String) -> Unit = {}
 )
 
 sealed class QuestModAnalysisResult {
