@@ -119,7 +119,7 @@ class ModsWorkflowPureTest {
             )
         )
         assertEquals(ModsUiStatusTone.INFO, result.tone)
-        assertTrue(result.action.contains("لا يحتاج"))
+        assertTrue(result.action.contains("عقد الاستيراد"))
         assertTrue(result.changedFiles.contains("لم يتم تغيير"))
     }
 
@@ -140,7 +140,7 @@ class ModsWorkflowPureTest {
         assertFalse(state.planReviewed)
         assertFalse(state.installCompleted)
         assertFalse(modsWorkflowSemantics(builtIn, false, false, true).installCompleted)
-        assertTrue(modInstallUnavailableReason(builtIn, false, false)!!.contains("تديره اللعبة"))
+        assertTrue(modInstallUnavailableReason(builtIn, false, false)!!.contains("عقد الاستيراد"))
     }
 
     @Test

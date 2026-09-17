@@ -35,6 +35,23 @@ interface RestrictedQuestTransport {
         check(!cancelled()) { "probe cancelled" }
         return pull(serial, remotePath, local, cancelled)
     }
+    /**
+     * Bounded pull contract. Production ADB adapters should enforce maxBytes
+     * while the subprocess is running (and terminate an over-limit transfer),
+     * rather than relying on the remote stat or a post-transfer length check.
+     * The default preserves compatibility with older test/transport adapters.
+     */
+    fun pullReadOnly(
+        serial: String,
+        remotePath: String,
+        local: File,
+        maxBytes: Long,
+        cancelled: () -> Boolean
+    ): Boolean {
+        require(maxBytes > 0L) { "pull size limit must be positive" }
+        check(!cancelled()) { "probe cancelled" }
+        return pullReadOnly(serial, remotePath, local, cancelled)
+    }
     fun streamReadOnly(
         serial: String,
         remotePath: String,
@@ -163,7 +180,7 @@ data class QuestPreparationProbeReport(
     fun toJson(): String {
         fun q(s: String?) = if (s == null) "null" else "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
         val gs = games.joinToString(",") { g ->
-            """{"displayName":${q(g.displayName)},"packageId":${q(g.packageId)},"discoveryState":${q(g.discoveryState.name)},"probeState":${q(g.probeState.name)},"versionName":${q(g.versionName)},"versionCode":${g.versionCode ?: "null"},"firstInstallTime":${q(g.firstInstallTime)},"lastUpdateTime":${q(g.lastUpdateTime)},"installer":${q(g.installer)},"engine":${q(g.engine.engine.name)},"engineEvidence":[${g.engine.evidence.joinToString(",") { q(it) }}],"preparationState":${q(g.preparationState.name)},"loader":${q(g.loader.name)},"apkPathSource":${q(g.apkPathSource?.name)},"apkInspectionStage":${q(g.apkInspectionStage)},"apkInspectionFailureCode":${q(g.apkInspectionFailureCode)},"apkPathDiagnostics":${g.apkPathDiagnostics?.let { d -> """{"rawLineCount":${d.rawLineCount},"validApkLineCount":${d.validApkLineCount},"uniqueApkCount":${d.uniqueApkCount},"limit":${d.limit}}""" } ?: "null"},"apkInventory":[${g.apks.joinToString(",") { a -> """{"remotePath":${q(a.remotePath)},"splitName":${q(a.splitName)},"sizeBytes":${a.sizeBytes ?: "null"},"sha256":${q(a.sha256)},"inspectionStage":${q(a.inspectionStage)},"inspectionFailureCode":${q(a.inspectionFailureCode)}}""" }}],"manifestSha256":${q(g.manifest?.sha256)},"signing":{"metaInfEntries":[${g.signing.entries.joinToString(",") { q(it) }}],"certificateFingerprints":[${g.signing.certificateFingerprints.joinToString(",") { q(it) }}],"baseSplitsConsistent":${g.signing.baseSplitsConsistent ?: "null"}},"obb":{"exists":${g.obb.exists},"accessible":${g.obb.accessible},"totalBytes":${g.obb.totalBytes},"entries":[${g.obb.entries.joinToString(",") { q(it.path) }}]},"androidData":{"exists":${g.androidData.exists},"accessible":${g.androidData.accessible},"paths":[${g.androidData.paths.joinToString(",") { q(it) }}]},"modData":{"exists":${g.modData.exists},"accessible":${g.modData.accessible},"paths":[${g.modData.paths.joinToString(",") { q(it) }}]},"loaderEvidence":{"loader":${q(g.loader.name)},"contentModState":${q(g.contentModState)},"codeModLoaderState":${q(g.codeModLoaderState)}},"warnings":[${g.warnings.joinToString(",") { q(it) }}]}"""
+            """{"displayName":${q(g.displayName)},"packageId":${q(g.packageId)},"discoveryState":${q(g.discoveryState.name)},"probeState":${q(g.probeState.name)},"versionName":${q(g.versionName)},"versionCode":${g.versionCode ?: "null"},"firstInstallTime":${q(g.firstInstallTime)},"lastUpdateTime":${q(g.lastUpdateTime)},"installer":${q(g.installer)},"engine":${q(g.engine.engine.name)},"engineEvidence":[${g.engine.evidence.joinToString(",") { q(it) }}],"preparationState":${q(g.preparationState.name)},"loader":${q(g.loader.name)},"contentModState":${q(g.contentModState)},"codeModLoaderState":${q(g.codeModLoaderState)},"apkPathSource":${q(g.apkPathSource?.name)},"apkInspectionStage":${q(g.apkInspectionStage)},"apkInspectionFailureCode":${q(g.apkInspectionFailureCode)},"apkPathDiagnostics":${g.apkPathDiagnostics?.let { d -> """{"rawLineCount":${d.rawLineCount},"validApkLineCount":${d.validApkLineCount},"uniqueApkCount":${d.uniqueApkCount},"limit":${d.limit}}""" } ?: "null"},"apkInventory":[${g.apks.joinToString(",") { a -> """{"remotePath":${q(a.remotePath)},"splitName":${q(a.splitName)},"sizeBytes":${a.sizeBytes ?: "null"},"sha256":${q(a.sha256)},"inspectionStage":${q(a.inspectionStage)},"inspectionFailureCode":${q(a.inspectionFailureCode)}}""" }}],"manifestSha256":${q(g.manifest?.sha256)},"signing":{"metaInfEntries":[${g.signing.entries.joinToString(",") { q(it) }}],"certificateFingerprints":[${g.signing.certificateFingerprints.joinToString(",") { q(it) }}],"baseSplitsConsistent":${g.signing.baseSplitsConsistent ?: "null"}},"obb":{"exists":${g.obb.exists},"accessible":${g.obb.accessible},"totalBytes":${g.obb.totalBytes},"entries":[${g.obb.entries.joinToString(",") { q(it.path) }}]},"androidData":{"exists":${g.androidData.exists},"accessible":${g.androidData.accessible},"paths":[${g.androidData.paths.joinToString(",") { q(it) }}]},"modData":{"exists":${g.modData.exists},"accessible":${g.modData.accessible},"paths":[${g.modData.paths.joinToString(",") { q(it) }}]},"loaderEvidence":{"loader":${q(g.loader.name)},"contentModState":${q(g.contentModState)},"codeModLoaderState":${q(g.codeModLoaderState)}},"warnings":[${g.warnings.joinToString(",") { q(it) }}]}"""
         }
         return """{"schemaVersion":$schemaVersion,"device":{"serial":${q(device.serial)},"model":${q(device.model)},"android":${q(device.android)},"abi":${q(device.abi)},"abis":[${device.abis.joinToString(",") { q(it) }}],"architecture":${q(device.architecture)},"authorized":${device.authorized}},"cancelled":$cancelled,"stale":$stale,"games":[$gs]}"""
     }
@@ -172,6 +189,8 @@ data class QuestPreparationProbeReport(
         appendLine("Device: ${device.model ?: "unknown"} / Android ${device.android ?: "unknown"} / ${device.serial}")
         games.forEach {
             appendLine("${it.displayName} (${it.packageId}) — ${it.preparationState}; ${it.engine.engine}; loader=${it.loader}")
+            it.contentModState?.let { state -> appendLine("  Data-only content readiness: $state") }
+            it.codeModLoaderState?.let { state -> appendLine("  Code/loader readiness: $state") }
             it.apkInspectionFailureCode?.let { code ->
                 appendLine("  APK inspection: ${it.apkInspectionStage ?: "unknown"} / $code")
             }
@@ -186,11 +205,21 @@ class QuestPreparationProbe(
     companion object {
         const val MAX_CANDIDATES = 256
         const val MAX_APKS_PER_GAME = QuestProbeApkPaths.DEFAULT_LIMIT
-        const val MAX_APK_BYTES = 512L * 1024 * 1024
-        const val MAX_TOTAL_APK_BYTES = 1024L * 1024 * 1024
+        /*
+         * Quest game APKs are not small application payloads. In particular,
+         * the current Gorilla Tag APK is 570253943 bytes. Keep these limits
+         * high enough for real split installs, while retaining a hard bound
+         * before anything is copied to the probe workspace.
+         */
+        const val MAX_APK_BYTES = 2L * 1024 * 1024 * 1024
+        const val MAX_TOTAL_APK_BYTES = 4L * 1024 * 1024 * 1024
         const val MAX_DIRECTORY_ENTRIES = 512
         const val MAX_ZIP_ENTRIES = 25_000
-        const val MAX_ZIP_BYTES = 1024L * 1024 * 1024
+        const val MAX_ZIP_BYTES = 2L * 1024 * 1024 * 1024
+        const val MAX_ZIP_ENTRY_BYTES = 1024L * 1024 * 1024
+        const val MAX_ZIP_METADATA_BYTES = 16L * 1024 * 1024
+        const val MAX_META_INF_ENTRIES = 256
+        const val MAX_META_INF_BYTES = 64L * 1024 * 1024
         const val MAX_LOADER_METADATA_FILES = 32
         const val MAX_LOADER_METADATA_BYTES = 64 * 1024
     }
@@ -362,7 +391,14 @@ class QuestPreparationProbe(
                             null
                         }.also { ensureLive(device.serial, cancelled) }
                 }
-                val totalExceeded = sizes.filterNotNull().sum() > MAX_TOTAL_APK_BYTES
+                val knownTotal = sizes.filterNotNull().fold(0L) { total, size ->
+                    if (size < 0L || total > MAX_TOTAL_APK_BYTES - size) {
+                        MAX_TOTAL_APK_BYTES + 1L
+                    } else {
+                        total + size
+                    }
+                }
+                val totalExceeded = knownTotal > MAX_TOTAL_APK_BYTES
                 val inspected = normalized.paths.zip(sizes).map { (path, size) ->
                     if (size == null || size !in 1..MAX_APK_BYTES || totalExceeded) {
                         val code = when {
@@ -439,14 +475,20 @@ class QuestPreparationProbe(
             loader == ProbeLoader.LEMONLOADER || loader == ProbeLoader.MELONLOADER_ANDROID -> loader.name
             else -> "NONE"
         } else null
-        val completeEvidence = data.accessible && mod.accessible && apks.isNotEmpty() &&
-            engine.engine != ProbeEngine.UNKNOWN
+        /*
+         * Content installation and APK/native evidence are separate security
+         * domains. A verified writable game data directory is enough to report
+         * content readiness; APK hashes/signatures are only required for
+         * loader/native preparation. This also keeps a large or otherwise
+         * partially inspected APK from masking a valid data-only destination.
+         */
+        val completeApkEvidence = apks.isNotEmpty() && engine.engine != ProbeEngine.UNKNOWN
         val state = when {
-            !completeEvidence -> ProbePreparationState.UNKNOWN
             loader in setOf(ProbeLoader.QUESTLOADER, ProbeLoader.SCOTLAND2, ProbeLoader.LEMONLOADER,
                 ProbeLoader.MELONLOADER_ANDROID, ProbeLoader.OTHER_KNOWN_LOADER) -> ProbePreparationState.LOADER_READY
-            loader == ProbeLoader.UNKNOWN -> ProbePreparationState.POSSIBLY_PATCHED
             content == "READY" -> ProbePreparationState.CONTENT_MOD_READY
+            loader == ProbeLoader.UNKNOWN && completeApkEvidence -> ProbePreparationState.POSSIBLY_PATCHED
+            !data.accessible || !mod.accessible || !completeApkEvidence -> ProbePreparationState.UNKNOWN
             else -> ProbePreparationState.STOCK_UNPREPARED
         }
         val probeState = when {
@@ -513,7 +555,9 @@ class QuestPreparationProbe(
         var result = ApkInspectionResult(QuestProbeApk(path, split(path), size, null))
         try {
             ensureLive(s, cancelled)
-            val pulled = runCatching { transport.pullReadOnly(s, path, f, cancelled) }.getOrDefault(false)
+            val pulled = runCatching {
+                transport.pullReadOnly(s, path, f, MAX_APK_BYTES, cancelled)
+            }.getOrDefault(false)
             val retrieved = if (pulled) true else runCatching {
                 transport.streamReadOnly(s, path, f, MAX_APK_BYTES, cancelled)
             }.getOrDefault(false)
@@ -529,7 +573,10 @@ class QuestPreparationProbe(
                     stage = "APK_LOCAL_SIZE_VERIFY", failureCode = "APK_LOCAL_SIZE_MISMATCH"
                 )
             } else {
-                val hash = runCatching { f.inputStream().use(::sha) }.getOrNull()
+                val hash = runCatching { f.inputStream().use { sha(it, cancelled) } }.getOrElse {
+                    if (isProbeAbort(it)) throw it
+                    null
+                }
                 if (hash == null) {
                     result = result.copy(
                         apk = result.apk.copy(inspectionStage = "APK_SHA256", inspectionFailureCode = "APK_HASH_FAILED"),
@@ -541,20 +588,28 @@ class QuestPreparationProbe(
                     var failureStage = zip.stage
                     var failureCode = zip.failureCode
                     if (failureCode == null) {
-                        val manifest = manifestSha(f)
+                        val manifest = manifestSha(f, cancelled)
                         if (manifest == null) {
                             failureStage = "MANIFEST_EXTRACT"
                             failureCode = "APK_MANIFEST_READ_FAILED"
                         } else apk = apk.copy(manifestSha256 = manifest)
                     }
-                    val signatures = signingEvidenceChecked(f)
-                    apk = apk.copy(
-                        signingEntries = signatures.entries,
-                        certificateFingerprints = signatures.certificateFingerprints
-                    )
-                    if (failureCode == null && signatures.failureCode != null) {
-                        failureStage = signatures.stage
-                        failureCode = signatures.failureCode
+                    /*
+                     * Do not reopen the archive for manifest/signature work
+                     * after the central-directory scan rejected it.  Besides
+                     * being redundant, that could let a hostile META-INF
+                     * tree bypass the primary ZIP bounds.
+                     */
+                    if (failureCode == null) {
+                        val signatures = signingEvidenceChecked(f, cancelled)
+                        apk = apk.copy(
+                            signingEntries = signatures.entries,
+                            certificateFingerprints = signatures.certificateFingerprints
+                        )
+                        if (signatures.failureCode != null) {
+                            failureStage = signatures.stage
+                            failureCode = signatures.failureCode
+                        }
                     }
                     result = ApkInspectionResult(
                         apk.copy(inspectionStage = failureStage, inspectionFailureCode = failureCode),
@@ -598,11 +653,15 @@ class QuestPreparationProbe(
                 val e = entries.nextElement()
                 if (++count > MAX_ZIP_ENTRIES) error("ZIP entry count exceeds safe limit")
                 require(e.name.length <= 512) { "ZIP entry name exceeds safe limit" }
-                require(e.compressedSize <= MAX_ZIP_BYTES && e.size <= MAX_ZIP_BYTES) { "ZIP entry exceeds safe limit" }
-                total += e.size.coerceAtLeast(0L)
-                require(total <= MAX_ZIP_BYTES) { "ZIP uncompressed bytes exceed safe limit" }
+                require(e.compressedSize >= 0L && e.size >= 0L) { "ZIP entry size is unavailable" }
+                require(e.compressedSize <= MAX_ZIP_ENTRY_BYTES && e.size <= MAX_ZIP_ENTRY_BYTES) {
+                    "ZIP entry exceeds safe limit"
+                }
+                require(total <= MAX_ZIP_BYTES - e.size) { "ZIP uncompressed bytes exceed safe limit" }
+                total += e.size
                 if (!e.isDirectory && e.name.startsWith("lib/") && e.name.endsWith(".so") && result.size < 128) {
-                    val nativeHash = runCatching { sha(z.getInputStream(e)) }.getOrElse {
+                    val nativeHash = runCatching { sha(z.getInputStream(e), cancelled) }.getOrElse {
+                        if (isProbeAbort(it)) throw it
                         return ZipScanResult(result, "NATIVE_LIBRARY_SCAN", "APK_NATIVE_SCAN_FAILED")
                     }
                     result[e.name] = nativeHash
@@ -615,19 +674,55 @@ class QuestPreparationProbe(
             ZipScanResult(emptyMap(), "APK_ENTRY_SCAN", "APK_ENTRY_SCAN_FAILED")
         }
     }
-    private fun manifestSha(f: File): String? = runCatching {
-        ZipFile(f).use { z -> z.getEntry("AndroidManifest.xml")?.let { e -> sha(z.getInputStream(e)) } }
-    }.getOrNull()
-    private fun signingEvidenceChecked(f: File): SigningScanResult {
+    private fun manifestSha(f: File, cancelled: () -> Boolean): String? = runCatching {
+        ZipFile(f).use { z ->
+            z.getEntry("AndroidManifest.xml")?.let { e ->
+                require(e.size in 0L..MAX_ZIP_METADATA_BYTES)
+                sha(z.getInputStream(e), cancelled, MAX_ZIP_METADATA_BYTES)
+            }
+        }
+    }.getOrElse {
+        if (isProbeAbort(it)) throw it
+        null
+    }
+    private fun signingEvidenceChecked(f: File, cancelled: () -> Boolean): SigningScanResult {
         return try {
         ZipFile(f).use { z ->
-            val names = z.entries().asSequence().filter { it.name.startsWith("META-INF/") && !it.isDirectory }
-                .map { it.name }.toList()
+            val names = mutableListOf<String>()
             val certs = mutableListOf<String>()
-            names.filter { it.endsWith(".RSA", true) || it.endsWith(".DSA", true) || it.endsWith(".EC", true) }.forEach { name ->
-                val cert = java.security.cert.CertificateFactory.getInstance("X.509")
-                    .generateCertificate(z.getInputStream(z.getEntry(name)))
-                certs += sha(cert.encoded.inputStream())
+            var metadataBytes = 0L
+            var metadataEntries = 0
+            val entries = z.entries()
+            while (entries.hasMoreElements()) {
+                check(!cancelled()) { "probe cancelled" }
+                val entry = entries.nextElement()
+                if (entry.isDirectory || !entry.name.startsWith("META-INF/")) continue
+                if (++metadataEntries > MAX_META_INF_ENTRIES) {
+                    return@use SigningScanResult(
+                        names, certs, "SIGNATURE_SCAN", "APK_SIGNATURE_SCAN_LIMIT_EXCEEDED"
+                    )
+                }
+                require(entry.name.length <= 512)
+                require(entry.size >= 0L)
+                if (metadataBytes > MAX_META_INF_BYTES - entry.size) {
+                    return@use SigningScanResult(
+                        names, certs, "SIGNATURE_SCAN", "APK_SIGNATURE_SCAN_LIMIT_EXCEEDED"
+                    )
+                }
+                metadataBytes += entry.size
+                val name = entry.name
+                names += name
+                if (name.endsWith(".RSA", true) || name.endsWith(".DSA", true) || name.endsWith(".EC", true)) {
+                    require(entry.size <= MAX_ZIP_METADATA_BYTES)
+                    val limited = LimitedInputStream(z.getInputStream(entry), MAX_ZIP_METADATA_BYTES)
+                    val cert = limited.use {
+                        val certificate = java.security.cert.CertificateFactory.getInstance("X.509")
+                            .generateCertificate(it)
+                        it.ensureExhausted()
+                        certificate
+                    }
+                    certs += sha(cert.encoded.inputStream(), cancelled, MAX_ZIP_METADATA_BYTES)
+                }
             }
             SigningScanResult(names, certs)
         }
@@ -636,17 +731,63 @@ class QuestPreparationProbe(
             SigningScanResult(emptyList(), emptyList(), "SIGNATURE_SCAN", "APK_SIGNATURE_SCAN_FAILED")
         }
     }
-    private fun sha(input: java.io.InputStream): String {
+    private fun sha(input: java.io.InputStream): String = sha(input, { false }, Long.MAX_VALUE)
+
+    /**
+     * Hashes a file/ZIP entry incrementally. APK bytes never become a
+     * ByteArray, and cancellation is checked between reads so a cancelled
+     * probe does not keep consuming a large transfer or entry.
+     */
+    private fun sha(
+        input: java.io.InputStream,
+        cancelled: () -> Boolean,
+        maxBytes: Long = Long.MAX_VALUE
+    ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         input.use { stream ->
             val buffer = ByteArray(64 * 1024)
+            var total = 0L
             while (true) {
+                check(!cancelled()) { "probe cancelled" }
                 val count = stream.read(buffer)
                 if (count < 0) break
+                require(total <= maxBytes - count) { "stream exceeds safe hash limit" }
+                total += count
                 digest.update(buffer, 0, count)
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private class LimitedInputStream(
+        input: java.io.InputStream,
+        private var remaining: Long
+    ) : java.io.FilterInputStream(input) {
+        override fun read(): Int {
+            if (remaining == 0L) {
+                val extra = super.read()
+                check(extra < 0) { "stream exceeds safe metadata limit" }
+                return -1
+            }
+            val value = super.read()
+            if (value >= 0) remaining--
+            return value
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (remaining == 0L) {
+                val extra = super.read()
+                check(extra < 0) { "stream exceeds safe metadata limit" }
+                return -1
+            }
+            val count = super.read(buffer, offset, minOf(length.toLong(), remaining).toInt())
+            if (count > 0) remaining -= count
+            return count
+        }
+
+        fun ensureExhausted() {
+            read()
+        }
     }
     private fun engine(a: List<QuestProbeApk>): QuestProbeEngineEvidence {
         val n = a.flatMap { it.nativeHashes.keys }
@@ -688,8 +829,13 @@ class QuestPreparationProbe(
         fun has(vararg markers: String) = names.any { name ->
             markers.any { marker -> name == marker || name.startsWith(marker) && name.endsWith(".so") }
         }
+        val scotland2Library = m.paths.any { path ->
+            path.substringAfterLast('/').equals("libsl2.so", true) &&
+                path.contains("/modloader/", true)
+        }
         return when {
-            has("libscotland2.so", "scotland2.json", "scotland2.dll") ||
+            scotland2Library ||
+                has("libscotland2.so", "scotland2.json", "scotland2.dll") ||
                 metadata.contains("scotland2") -> ProbeLoader.SCOTLAND2
             has("libquestloader.so", "questloader.json") ||
                 metadata.contains("questloader") -> ProbeLoader.QUESTLOADER

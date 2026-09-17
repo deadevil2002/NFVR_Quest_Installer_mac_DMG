@@ -5,6 +5,7 @@ import java.util.zip.ZipOutputStream
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class QuestPreparationProbeEvidenceTest {
     private class Transport(
@@ -15,6 +16,7 @@ class QuestPreparationProbeEvidenceTest {
         private val loaderText: String? = null
     ) : RestrictedQuestTransport {
         private val path = "/data/app/com.AnotherAxiom.GorillaTag-1/base.apk"
+        var pullMaxBytes: Long? = null
         override fun devices() = "List of devices attached\nquest\tdevice\n"
         override fun getprop(serial: String, name: String) = when (name) {
             "ro.product.model" -> "Quest 3"
@@ -42,6 +44,18 @@ class QuestPreparationProbeEvidenceTest {
             local.writeBytes(bytes)
             return true
         }
+        override fun pullReadOnly(
+            serial: String,
+            remotePath: String,
+            local: File,
+            maxBytes: Long,
+            cancelled: () -> Boolean
+        ): Boolean {
+            pullMaxBytes = maxBytes
+            if (!pullWorks || bytes.size.toLong() > maxBytes) return false
+            local.writeBytes(bytes)
+            return true
+        }
         override fun streamReadOnly(serial: String, remotePath: String, local: File, maxBytes: Long): Boolean {
             if (!streamWorks || bytes.size.toLong() > maxBytes) return false
             local.writeBytes(bytes)
@@ -61,6 +75,19 @@ class QuestPreparationProbeEvidenceTest {
             zip.closeEntry()
         }
     }.toByteArray()
+
+    private fun archiveWithEntries(count: Int, prefix: String): ByteArray =
+        ByteArrayOutputStream().also { out ->
+            ZipOutputStream(out).use { zip ->
+                zip.putNextEntry(ZipEntry("AndroidManifest.xml"))
+                zip.write("manifest".toByteArray())
+                zip.closeEntry()
+                repeat(count) {
+                    zip.putNextEntry(ZipEntry("$prefix-$it"))
+                    zip.closeEntry()
+                }
+            }
+        }.toByteArray()
 
     private fun probe(transport: RestrictedQuestTransport) =
         QuestPreparationProbe(transport, createTempDir(prefix = "probe-evidence-")).probe()
@@ -83,6 +110,13 @@ class QuestPreparationProbeEvidenceTest {
     }
 
     @Test
+    fun `APK pull adapter receives the two GiB hard bound`() {
+        val transport = Transport(archive())
+        probe(transport)
+        assertEquals(QuestPreparationProbe.MAX_APK_BYTES, transport.pullMaxBytes)
+    }
+
+    @Test
     fun `invalid zip and missing manifest preserve distinct stages`() {
         val invalid = probe(Transport("not an apk".toByteArray()))
         assertEquals("APK_ZIP_OPEN", invalid.apkInspectionStage)
@@ -91,6 +125,25 @@ class QuestPreparationProbeEvidenceTest {
         val noManifest = probe(Transport(archive(withManifest = false)))
         assertEquals("MANIFEST_EXTRACT", noManifest.apkInspectionStage)
         assertEquals("APK_MANIFEST_READ_FAILED", noManifest.apkInspectionFailureCode)
+    }
+
+    @Test
+    fun `central directory rejection skips manifest and signing follow-up`() {
+        val game = probe(
+            Transport(archiveWithEntries(QuestPreparationProbe.MAX_ZIP_ENTRIES + 1, "payload"))
+        )
+        assertEquals("APK_ENTRY_SCAN", game.apkInspectionStage)
+        assertEquals("APK_ENTRY_SCAN_FAILED", game.apkInspectionFailureCode)
+        assertTrue(game.signing.entries.isEmpty())
+        assertTrue(game.signing.certificateFingerprints.isEmpty())
+    }
+
+    @Test
+    fun `many META-INF entries are bounded and produce partial evidence`() {
+        val game = probe(Transport(archiveWithEntries(QuestPreparationProbe.MAX_META_INF_ENTRIES + 1, "META-INF/item")))
+        assertEquals("SIGNATURE_SCAN", game.apkInspectionStage)
+        assertEquals("APK_SIGNATURE_SCAN_LIMIT_EXCEEDED", game.apkInspectionFailureCode)
+        assertTrue(game.signing.entries.size <= QuestPreparationProbe.MAX_META_INF_ENTRIES)
     }
 
     @Test
@@ -127,6 +180,17 @@ class QuestPreparationProbeEvidenceTest {
                 archive(),
                 loaderFile = "loader.json",
                 loaderText = """{"loader":"scotland2","version":"1"}"""
+            )
+        )
+        assertEquals(ProbeLoader.SCOTLAND2, game.loader)
+    }
+
+    @Test
+    fun `Scotland2 library evidence is recognized without directory-only guessing`() {
+        val game = probe(
+            Transport(
+                archive(),
+                loaderFile = "libsl2.so"
             )
         )
         assertEquals(ProbeLoader.SCOTLAND2, game.loader)

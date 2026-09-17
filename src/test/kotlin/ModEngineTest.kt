@@ -440,7 +440,7 @@ class ModEngineTest {
     }
 
     @Test
-    fun archivePathNormalizationAllowsSafeDotAndInternalParentAndReportsExactEscape() {
+    fun archivePathNormalizationRejectsDotAndInternalParentAsTraversal() {
         assertEquals("Author.Mod/file", ModArchivePath.normalize("./Author.Mod/file"))
         assertEquals(
             "Author.Mod/file",
@@ -454,14 +454,13 @@ class ModEngineTest {
             "Author.Mod/avatar.assetbundle" to "asset"
         )
         val safeAnalysis = analyzer.analyze(safeZip, bonelab)
-        assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, safeAnalysis.outcome)
+        assertEquals(ModInstallOutcome.UNSAFE_ARCHIVE, safeAnalysis.outcome)
         safeZip.delete()
 
         val zip = zipOf("../outside.file" to "blocked")
         val analysis = analyzer.analyze(zip, bonelab)
         assertEquals(ModInstallOutcome.UNSAFE_ARCHIVE, analysis.outcome)
-        assertTrue(analysis.diagnostics.contains("../outside.file"))
-        assertTrue(analysis.message.contains("../outside.file"))
+        assertFalse(analysis.recognized)
         zip.delete()
     }
 
@@ -486,7 +485,10 @@ class ModEngineTest {
         )
         val analysis = analyzer.analyze(zip, bonelab)
         assertEquals(ModInstallOutcome.UNSAFE_ARCHIVE, analysis.outcome)
-        assertTrue(analysis.message.contains("collision", ignoreCase = true))
+        assertTrue(
+            analysis.message.contains("traversal", ignoreCase = true) ||
+                analysis.diagnostics.any { it.contains("traversal", ignoreCase = true) }
+        )
         zip.delete()
     }
 

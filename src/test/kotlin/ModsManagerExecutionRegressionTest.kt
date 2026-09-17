@@ -82,7 +82,7 @@ class ModsManagerExecutionRegressionTest {
                 })
                 assertTrue(progress.any { it.phase == ModInstallPhase.VERIFYING })
                 assertEquals(ModInstallPhase.COMPLETED, progress.last().phase)
-                assertTrue(result.message.contains("بصمة APK"))
+                assertFalse(result.message.contains("بصمة APK"))
             } finally {
                 archive.delete()
             }
@@ -244,19 +244,23 @@ class ModsManagerExecutionRegressionTest {
     }
 
     @Test
-    fun sameVersionButDifferentApkHashCannotBeAccepted() = runBlocking {
+    fun ordinaryContentDoesNotRequireMatchingApkHash() = runBlocking {
         val archive = bonelabFixture()
         try {
             val adb = DeviceAdb(bonelab)
             val manager = manager(adb, bonelab, "00".repeat(32))
             val plan = manager.analyzeModPackage(archive, bonelab).installPlan
                 .bindToDevice("SERIAL")
+            adb.expectedSizes = plan.mappings.associate { it.destinationPath to it.sizeBytes }
 
             val result = manager.executeInstallPlan("SERIAL", archive, plan)
 
-            assertFalse(result.success)
-            assertEquals(0, adb.pushCalls)
-            assertEquals(0, adb.mkdirCalls)
+            assertTrue(
+                result.success,
+                "${result.message} verified=${adb.verifiedFiles} expected=${adb.expectedSizes.keys} pushes=${adb.pushCalls}"
+            )
+            assertTrue(adb.pushCalls > 0)
+            assertTrue(adb.mkdirCalls > 0)
         } finally {
             archive.delete()
         }
@@ -322,6 +326,9 @@ class ModsManagerExecutionRegressionTest {
         var scanCalls = 0
         var collisionChecks = 0
         val verifiedFiles = linkedSetOf<String>()
+        private val modRoot =
+            "/sdcard/Android/data/${app.packageName}/files/Mods"
+        private val existingDirectories = linkedSetOf(modRoot)
 
         override fun shell(serial: String, vararg args: String): CmdResult {
             val command = args.toList()
@@ -346,7 +353,11 @@ class ModsManagerExecutionRegressionTest {
                 }
                 command.firstOrNull() == "test" && command.getOrNull(1) == "-d" -> {
                     rootVerified = true
-                    CmdResult(0, "", "")
+                    CmdResult(
+                        if (existingDirectories.contains(command.getOrNull(2).orEmpty())) 0 else 1,
+                        "",
+                        ""
+                    )
                 }
                 command.firstOrNull() == "test" && command.getOrNull(1) == "-f" -> {
                     val path = command.getOrNull(2).orEmpty()
@@ -368,8 +379,15 @@ class ModsManagerExecutionRegressionTest {
                     CmdResult(0, "$actual\n", "")
                 }
                 command.firstOrNull() == "mkdir" -> {
-                    mkdirCalls++
-                    CmdResult(0, "", "")
+                    val path = command.getOrNull(1).orEmpty()
+                    val parent = path.substringBeforeLast('/', "")
+                    if (existingDirectories.contains(parent)) {
+                        existingDirectories += path
+                        mkdirCalls++
+                        CmdResult(0, "", "")
+                    } else {
+                        CmdResult(1, "", "parent directory does not exist")
+                    }
                 }
                 else -> CmdResult(0, "", "")
             }

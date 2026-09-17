@@ -541,6 +541,101 @@ private fun runBinaryProcess(
     }
 }
 
+/**
+ * Run adb pull while watching the destination file itself. adb pull writes
+ * directly to that file, so a post-completion length check is too late: a
+ * malicious/oversized APK could consume the desktop disk before the caller
+ * gets control back. The child is killed as soon as the bound or cancellation
+ * callback is observed, and partial output is always removed.
+ */
+internal fun runBoundedPullProcess(
+    cmd: List<String>,
+    outputFile: File,
+    workDir: File? = null,
+    timeoutMs: Long = 20 * 60_000,
+    maxBytes: Long,
+    cancelled: () -> Boolean = { false }
+): CmdResult {
+    require(maxBytes > 0L) { "pull size limit must be positive" }
+    val parent = outputFile.absoluteFile.parentFile
+    if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
+        return CmdResult(1, "", "Unable to create pull destination directory")
+    }
+    outputFile.delete()
+    val process = try {
+        ProcessBuilder(cmd).apply { if (workDir != null) directory(workDir) }.start()
+    } catch (error: Throwable) {
+        return CmdResult(1, "", error.message ?: "Unable to start pull process")
+    }
+    OwnedProcessRegistry.add(process)
+    val stdout = BoundedTextCollector()
+    val stderr = BoundedTextCollector()
+    val stdoutThread = Thread {
+        process.inputStream.bufferedReader().useLines { lines ->
+            lines.forEach(stdout::appendLine)
+        }
+    }
+    val stderrThread = Thread {
+        process.errorStream.bufferedReader().useLines { lines ->
+            lines.forEach(stderr::appendLine)
+        }
+    }
+    stdoutThread.start()
+    stderrThread.start()
+    return try {
+        val deadline = System.nanoTime() +
+            java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        var cancelledNow = false
+        var tooLarge = false
+        while (process.isAlive &&
+            System.nanoTime() < deadline &&
+            !tooLarge &&
+            !(cancelled().also { cancelledNow = it })
+        ) {
+            tooLarge = outputFile.isFile && outputFile.length() > maxBytes
+            if (!tooLarge) process.waitFor(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        if (process.isAlive && (tooLarge || cancelledNow)) process.destroyForcibly()
+        val timedOut = process.isAlive && !tooLarge && !cancelledNow
+        if (timedOut) process.destroyForcibly()
+        process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        stdoutThread.join(5_000)
+        stderrThread.join(5_000)
+        // The process can write one final buffer between the last poll and
+        // termination; enforce the same bound after waiting as a second line.
+        tooLarge = tooLarge || (outputFile.isFile && outputFile.length() > maxBytes)
+        when {
+            tooLarge -> {
+                outputFile.delete()
+                CmdResult(1, stdout.toString(), "APK pull exceeded safe limit")
+            }
+            cancelledNow -> {
+                outputFile.delete()
+                CmdResult(130, stdout.toString(), "Cancelled")
+            }
+            timedOut -> {
+                outputFile.delete()
+                CmdResult(124, stdout.toString(), "Timeout")
+            }
+            process.exitValue() != 0 -> {
+                outputFile.delete()
+                CmdResult(process.exitValue(), stdout.toString(), stderr.toString())
+            }
+            else -> CmdResult(0, stdout.toString(), stderr.toString())
+        }
+    } catch (interrupted: InterruptedException) {
+        process.destroyForcibly()
+        outputFile.delete()
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } finally {
+        if (process.isAlive) process.destroyForcibly()
+        runCatching { process.inputStream.close() }
+        runCatching { process.errorStream.close() }
+        OwnedProcessRegistry.remove(process)
+    }
+}
+
 private fun runPushProgressProcess(
     cmd: List<String>,
     totalBytes: Long,
@@ -628,6 +723,8 @@ internal fun adbPushProgressBytes(
     return (total * percent / 100L).coerceIn(previousBytes.coerceAtLeast(0L), total)
 }
 
+private const val MAX_READ_ONLY_PULL_BYTES: Long = 2L * 1024L * 1024L * 1024L
+
 open class AdbClient(private val bundled: BundledAdb) {
     private fun adbBase(): Pair<File, File> {
         val adb = bundled.ensureReady()
@@ -652,24 +749,41 @@ open class AdbClient(private val bundled: BundledAdb) {
      * file and is responsible for deleting it.
      */
     open fun pullReadOnly(serial: String, remotePath: String, localFile: File): CmdResult =
-        pullReadOnly(serial, remotePath, localFile) { false }
+        pullReadOnly(
+            serial,
+            remotePath,
+            localFile,
+            maxBytes = MAX_READ_ONLY_PULL_BYTES
+        ) { false }
 
     open fun pullReadOnly(
         serial: String,
         remotePath: String,
         localFile: File,
         cancelled: () -> Boolean
+    ): CmdResult = pullReadOnly(
+        serial,
+        remotePath,
+        localFile,
+        maxBytes = MAX_READ_ONLY_PULL_BYTES,
+        cancelled = cancelled
+    )
+
+    open fun pullReadOnly(
+        serial: String,
+        remotePath: String,
+        localFile: File,
+        maxBytes: Long,
+        cancelled: () -> Boolean = { false }
     ): CmdResult {
         val destination = localFile.absoluteFile
-        val parent = destination.parentFile
-        if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
-            return CmdResult(1, "", "Unable to create pull destination directory")
-        }
         val (adb, dir) = adbBase()
-        return runProcess(
+        return runBoundedPullProcess(
             listOf(adb.absolutePath, "-s", serial, "pull", remotePath, destination.absolutePath),
+            outputFile = destination,
             workDir = dir,
             timeoutMs = 20 * 60_000,
+            maxBytes = maxBytes,
             cancelled = cancelled
         )
     }
@@ -956,10 +1070,37 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
         return result.out
     }
 
+    override fun pullReadOnly(
+        serial: String,
+        remotePath: String,
+        local: File,
+        maxBytes: Long,
+        cancelled: () -> Boolean
+    ): Boolean {
+        require(maxBytes > 0L) { "APK pull size limit must be positive" }
+        if (cancelled()) return false
+        val result = adb.pullReadOnly(
+            checkedSerial(serial),
+            checkedFile(remotePath),
+            local,
+            maxBytes = maxBytes,
+            cancelled = cancelled
+        )
+        val valid = result.exit == 0 &&
+            local.isFile &&
+            local.length() in 1..maxBytes
+        if (!valid) local.delete()
+        return valid
+    }
+
     override fun pull(serial: String, remotePath: String, local: File): Boolean {
         val checkedSerial = checkedSerial(serial)
         val checkedPath = checkedFile(remotePath)
-        val pulled = adb.pullReadOnly(checkedSerial, checkedPath, local)
+        val pulled = adb.pullReadOnly(
+            checkedSerial,
+            checkedPath,
+            local
+        )
         if (pulled.exit == 0 && local.isFile && local.length() > 0L) return true
         local.delete()
         val streamed = adb.streamReadOnly(
@@ -980,7 +1121,13 @@ class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestT
         val checkedSerial = checkedSerial(serial)
         val checkedPath = checkedFile(remotePath)
         if (cancelled()) return false
-        val pulled = adb.pullReadOnly(checkedSerial, checkedPath, local, cancelled)
+        val pulled = adb.pullReadOnly(
+            checkedSerial,
+            checkedPath,
+            local,
+            maxBytes = QuestPreparationProbe.MAX_APK_BYTES,
+            cancelled = cancelled
+        )
         if (pulled.exit == 0 && local.isFile && local.length() > 0L) return true
         DiagnosticLogger.info(
             "APK_PULL_FAILED exit=${pulled.exit} stderr=${bounded(pulled.err, 500)}; trying EXEC_OUT_CAT"
@@ -1891,7 +2038,12 @@ fun main() {
             modOperationBinding = executablePlan?.operationBinding
             appendModLog(
                 "تحليل الحزمة: ${customerPackageTypeMessage(analysis.packageType)} — " +
-                    customerAnalysisMessage(analysis)
+                    modCustomerFailureReason(analysis)
+            )
+            appendModLog(
+                "خطة النقل: ${analysis.installPlan.totalFiles} ملف، " +
+                    "${analysis.installPlan.totalBytes} بايت" +
+                    (analysis.installPlan.destinationRoot?.let { " → $it" } ?: "")
             )
             modAnalysisStatus = "اكتمل تحليل الحزمة."
         } catch (e: Exception) {
@@ -2480,7 +2632,7 @@ fun main() {
                 return
             }
             if (!analysis.installPlan.installable || analysis.installPlan.hasBlockingPreconditions) {
-                appendModLog("تم إيقاف التثبيت: الخطة غير متوافقة أو غير آمنة.")
+                appendModLog("تم إيقاف التثبيت: ${modCustomerFailureReason(analysis)}")
                 return
             }
             val reviewedBinding = modOperationBinding

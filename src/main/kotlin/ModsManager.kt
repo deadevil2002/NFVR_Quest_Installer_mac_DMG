@@ -299,15 +299,31 @@ class ModsManager(
         installedApp: InstalledQuestApp,
         onProgress: (String) -> Unit = {}
     ): ModPackageAnalysis = withContext(Dispatchers.IO) {
-        val evidencedApp = refreshApkEvidenceIfRequired(serial, installedApp, onProgress)
-        val detection = loaderDetector.detect(serial, evidencedApp)
-        val discovery = discoverModDirectoriesInternal(serial, evidencedApp, detection)
-        val analysis = ModPackageAnalyzer().analyze(
+        /*
+         * Content analysis is deliberately independent from APK acquisition.
+         * A verified package/version, destination discovery, archive identity,
+         * and the loader check (when the package declares one) are sufficient
+         * for data-only content.  APK evidence remains a second pass reserved
+         * for patching and native-loader plans.
+         */
+        val detection = loaderDetector.detect(serial, installedApp)
+        val discovery = discoverModDirectoriesInternal(serial, installedApp, detection)
+        var reviewedApp = installedApp
+        var analysis = ModPackageAnalyzer().analyze(
             zipFile,
-            evidencedApp,
+            reviewedApp,
             detection,
             discovery
         )
+        if (requiresStrictApkEvidence(analysis.installPlan)) {
+            reviewedApp = refreshApkEvidenceIfRequired(serial, reviewedApp, onProgress)
+            analysis = ModPackageAnalyzer().analyze(
+                zipFile,
+                reviewedApp,
+                detection,
+                discovery
+            )
+        }
         // Classification must remain displayable without an executable
         // operation binding (for example Gorilla APK patch requirements).
         val deviceAwarePlan = analysis.installPlan.copy(reviewedDeviceSerial = serial)
@@ -472,12 +488,16 @@ class ModsManager(
         val scannedCurrentApp = scanInstalledQuestApps(serial)
             .firstOrNull { it.packageName == reviewedApp.packageName }
             ?: return ModInstallResult(false, "التطبيق المستهدف لم يعد مثبتًا؛ أعد تحليل الحزمة.")
-        val currentApp = try {
-            refreshApkEvidenceIfRequired(serial, scannedCurrentApp) { message ->
-                onProgress(ModExecutionProgress(ModInstallPhase.ANALYZING, null, message))
+        var currentApp = try {
+            if (requiresStrictApkEvidence(plan)) {
+                refreshApkEvidenceIfRequired(serial, scannedCurrentApp) { message ->
+                    onProgress(ModExecutionProgress(ModInstallPhase.ANALYZING, null, message))
+                }
+            } else {
+                scannedCurrentApp
             }
         } catch (error: Throwable) {
-            return ModInstallResult(false, error.message ?: "تعذر التحقق من بصمة APK.")
+            return ModInstallResult(false, error.message ?: "تعذر التحقق من متطلبات تجهيز اللعبة.")
         }
         if (!sameAppState(reviewedApp, currentApp)) {
             return ModInstallResult(false, "تغيرت حالة التطبيق المستهدف منذ التحليل؛ أعد تحليل الحزمة.")
@@ -494,11 +514,12 @@ class ModsManager(
                 "تحتاج اللعبة إلى تصحيح APK قبل تثبيت هذا النوع من المودات؛ لم يتم تنفيذ أي تصحيح."
             )
         }
+        val inspectedDiscovery = discoverModDirectoriesInternal(serial, currentApp, loaderDetection)
         val discovery = if (
             plan.strategy == ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY &&
             plan.confirmation != null
         ) {
-            val inspected = discoverModDirectoriesInternal(serial, currentApp, loaderDetection)
+            val inspected = inspectedDiscovery
             val destination = plan.confirmation.destination
             if (!AndroidPathValidator.isSafe(destination) ||
                 plan.destinationRoot != destination ||
@@ -524,14 +545,48 @@ class ModsManager(
                 candidates = listOf(exact)
             )
         } else {
-            null
+            /*
+             * Dedicated content analyzers also consume this read-only evidence.
+             * Do not let them turn a profile destination into an implicit mkdir
+             * target merely because the package itself looks valid.
+             */
+            inspectedDiscovery
         }
-        val freshAnalysis = ModPackageAnalyzer().analyze(
+        var freshAnalysis = ModPackageAnalyzer().analyze(
             zipFile,
             currentApp,
             loaderDetection,
             discovery
         )
+        /*
+         * The first pass is intentionally APK-free for content.  If the fresh
+         * archive classification proves that this is a patch/native-loader
+         * operation, acquire and bind the strict APK evidence before any
+         * destination check or write.
+         */
+        if (requiresStrictApkEvidence(freshAnalysis.installPlan) &&
+            currentApp.apkSha256.isNullOrBlank()
+        ) {
+            currentApp = try {
+                refreshApkEvidenceIfRequired(serial, currentApp) { message ->
+                    onProgress(ModExecutionProgress(ModInstallPhase.ANALYZING, null, message))
+                }
+            } catch (error: Throwable) {
+                return ModInstallResult(
+                    false,
+                    error.message ?: "تعذر التحقق من متطلبات تجهيز اللعبة."
+                )
+            }
+            if (!sameAppState(reviewedApp, currentApp)) {
+                return ModInstallResult(false, "تغيرت حالة التطبيق المستهدف؛ أعد تحليل الحزمة.")
+            }
+            freshAnalysis = ModPackageAnalyzer().analyze(
+                zipFile,
+                currentApp,
+                loaderDetection,
+                discovery
+            )
+        }
         var freshPlan = freshAnalysis.installPlan.tryBindToDevice(serial)
             ?: freshAnalysis.installPlan
         if (plan.confirmation != null && !plan.requiresExplicitConfirmation) {
@@ -563,7 +618,8 @@ class ModsManager(
         )
         val profile = executionProfile(executionPlan)
             ?: return ModInstallResult(false, "لا يوجد ملف تعريف موثوق للعبة المستهدفة.")
-        if (profile.supportedApkSha256.isNotEmpty() &&
+        if (requiresStrictApkEvidence(executionPlan) &&
+            profile.supportedApkSha256.isNotEmpty() &&
             !profile.acceptsApkSha256(currentApp.apkSha256)
         ) {
             return ModInstallResult(
@@ -604,8 +660,12 @@ class ModsManager(
                 .firstOrNull { it.packageName == reviewedApp.packageName }
             val appBeforeTransfer = scannedBeforeTransfer?.let {
                 runCatching {
-                    refreshApkEvidenceIfRequired(serial, it) { message ->
-                        onProgress(ModExecutionProgress(ModInstallPhase.VALIDATING, null, message))
+                    if (requiresStrictApkEvidence(executionPlan)) {
+                        refreshApkEvidenceIfRequired(serial, it) { message ->
+                            onProgress(ModExecutionProgress(ModInstallPhase.VALIDATING, null, message))
+                        }
+                    } else {
+                        it
                     }
                 }.getOrNull()
             }
@@ -630,23 +690,31 @@ class ModsManager(
             // Refuse collisions before the first mkdir/push. A direct install
             // is additive only; replacing a file could destroy an unrelated
             // mod and cannot be audited or rolled back safely.
-            val destinationRoot = destinationModRoot(executionPlan)
+            val destinationRoot = executionPlan.destinationRoot
             if (destinationRoot != null &&
                 executionPlan.strategy != ModInstallStrategy.GENERIC_EXISTING_DIRECTORY_COPY
             ) {
-                val rootAvailable = adbClient.shell(serial, "test", "!", "-e", destinationRoot)
-                if (rootAvailable.exit == 1) {
-                    DiagnosticLogger.info("Mod install destination root already exists: $destinationRoot")
-                    return ModInstallResult(
-                        false,
-                        "مجلد المود موجود مسبقًا؛ لم يتم دمج ملفات داخل مجلد موجود."
-                    )
-                }
-                if (rootAvailable.exit != 0) {
-                    return ModInstallResult(
-                        false,
-                        customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
-                    )
+                /*
+                 * Reserve every first-level mod root, not just the common root.
+                 * A package can legitimately contain multiple mod roots; checking
+                 * only one common root would permit an unrelated sibling to be
+                 * merged or replaced.
+                 */
+                for (modRoot in destinationModRoots(executionPlan)) {
+                    val rootAvailable = adbClient.shell(serial, "test", "!", "-e", modRoot)
+                    if (rootAvailable.exit == 1) {
+                        DiagnosticLogger.info("Mod install destination root already exists: $modRoot")
+                        return ModInstallResult(
+                            false,
+                            "مجلد المود موجود مسبقًا ($modRoot)؛ لم يتم دمج ملفات داخل مجلد موجود."
+                        )
+                    }
+                    if (rootAvailable.exit != 0) {
+                        return ModInstallResult(
+                            false,
+                            customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                        )
+                    }
                 }
             }
             for (mapping in executionPlan.mappings) {
@@ -677,6 +745,19 @@ class ModsManager(
                     }
                 }
             }
+            if (isDedicatedContentPlan(executionPlan)) {
+                val base = executionPlan.destinationRoot
+                if (base.isNullOrBlank() || !AndroidPathValidator.isSafe(base)) {
+                    return ModInstallResult(false, "لم يتم إثبات جذر محتوى معتمد قبل النقل.")
+                }
+                val baseExists = adbClient.shell(serial, "test", "-d", base)
+                if (baseExists.exit != 0) {
+                    return ModInstallResult(
+                        false,
+                        "اختفى مجلد المحتوى المعتمد ($base) قبل النقل؛ لم يتم إنشاء مجلد بديل."
+                    )
+                }
+            }
 
             for (mapping in executionPlan.mappings) {
                 val destination = mapping.destinationPath
@@ -684,7 +765,11 @@ class ModsManager(
                     return ModInstallResult(false, "تم رفض وجهة غير معتمدة: $destination")
                 }
                 val parent = destination.substringBeforeLast('/', profile.destination)
-                val mkdir = createModPath(serial, parent)
+                val mkdir = createModPath(
+                    serial,
+                    parent,
+                    approvedBase = executionPlan.destinationRoot
+                )
                 if (mkdir.exit != 0) {
                     DiagnosticLogger.info(
                         "ADB mkdir failed for mod destination: exit=${mkdir.exit}, stderr=${mkdir.err}, stdout=${mkdir.out}"
@@ -700,7 +785,7 @@ class ModsManager(
                     ModExecutionProgress(
                         ModInstallPhase.TRANSFERRING,
                         executionPlan.progress(copiedBytes, copiedFiles).fraction.coerceAtMost(0.94),
-                        "نقل ${source.name}"
+                        transferProgressMessage(source, copiedFiles, executionPlan)
                     )
                 )
                 val pushed = adbClient.pushModFileWithProgress(
@@ -714,7 +799,12 @@ class ModsManager(
                             ModExecutionProgress(
                                 ModInstallPhase.TRANSFERRING,
                                 fraction,
-                                "نقل ${source.name}"
+                                transferProgressMessage(
+                                    source,
+                                    copiedFiles,
+                                    executionPlan,
+                                    currentBytes = current
+                                )
                             )
                         )
                     }
@@ -732,7 +822,13 @@ class ModsManager(
                 copiedFiles++
             }
 
-            onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, 0.95, "التحقق من الملفات على النظارة"))
+            onProgress(
+                ModExecutionProgress(
+                    ModInstallPhase.VERIFYING,
+                    0.95,
+                    "التحقق من الملفات على النظارة (0/${executionPlan.totalFiles})"
+                )
+            )
             val verificationErrors = buildList {
                 val root = executionPlan.destinationRoot
                 if (root.isNullOrBlank() || !AndroidPathValidator.isSafe(root)) {
@@ -743,7 +839,20 @@ class ModsManager(
                         add("فشل التحقق: مجلد الوجهة غير موجود في $root")
                     }
                 }
-                executionPlan.mappings.mapNotNullTo(this) { mapping ->
+                executionPlan.mappings.mapIndexedNotNullTo(this) { index, mapping ->
+                    val verificationFraction = if (executionPlan.totalFiles == 0) {
+                        0.95
+                    } else {
+                        0.95 + (0.05 * (index + 1).toDouble() / executionPlan.totalFiles)
+                    }
+                    onProgress(
+                        ModExecutionProgress(
+                            ModInstallPhase.VERIFYING,
+                            verificationFraction.coerceAtMost(0.99),
+                            "التحقق من ${mapping.sourcePath.substringAfterLast('/')} " +
+                                "(${index + 1}/${executionPlan.totalFiles})"
+                        )
+                    )
                     verifyRemoteFile(serial, mapping)
                 }
             }
@@ -760,8 +869,12 @@ class ModsManager(
                 .firstOrNull { it.packageName == reviewedApp.packageName }
             val appAfterVerification = scannedAfterVerification?.let {
                 runCatching {
-                    refreshApkEvidenceIfRequired(serial, it) { message ->
-                        onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, null, message))
+                    if (requiresStrictApkEvidence(executionPlan)) {
+                        refreshApkEvidenceIfRequired(serial, it) { message ->
+                            onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, null, message))
+                        }
+                    } else {
+                        it
                     }
                 }.getOrNull()
             }
@@ -771,7 +884,9 @@ class ModsManager(
 
             onProgress(ModExecutionProgress(ModInstallPhase.COMPLETED, 1.0, "اكتمل التثبيت والتحقق"))
             ModInstallHistory.record(executionPlan, true, "verified")
-            val successMessage = if (profile.supportedApkSha256.isNotEmpty()) {
+            val successMessage = if (requiresStrictApkEvidence(executionPlan) &&
+                profile.supportedApkSha256.isNotEmpty()
+            ) {
                 "تم تثبيت المود والتحقق من الملفات وبصمة APK بنجاح."
             } else {
                 "تم تثبيت المود والتحقق من الملفات بنجاح."
@@ -899,22 +1014,44 @@ class ModsManager(
     /**
      * Direct installs are whole-mod directory operations. Even if each file
      * path is new, merging into an existing sibling directory can leave stale
-     * files from a different archive. Derive the common first directory below
-     * the profile root and reserve it as an atomic destination.
+     * files from a different archive. Reserve every first directory below the
+     * approved content root, including all roots in a multi-root archive.
      */
-    private fun destinationModRoot(plan: ModInstallPlan): String? {
+    private fun destinationModRoots(plan: ModInstallPlan): List<String> {
         val root = plan.destinationRoot?.trimEnd('/').takeIf { !it.isNullOrBlank() }
-            ?: return null
-        val children = plan.mappings.mapNotNull { mapping ->
+            ?: return emptyList()
+        return plan.mappings.mapNotNull { mapping ->
             val relative = mapping.destinationPath.removePrefix("$root/")
             if (relative == mapping.destinationPath || relative.isBlank()) null
             else relative.substringBefore('/').takeIf(String::isNotBlank)
-        }.distinct()
-        return when {
-            children.size == 1 -> "$root/${children.single()}"
-            children.isEmpty() -> root
-            else -> null
+        }.distinct().map { "$root/$it" }
+    }
+
+    private fun requiresStrictApkEvidence(plan: ModInstallPlan): Boolean =
+        plan.patchRequirement?.required == true ||
+            plan.loaderRequirement?.requested?.isNotEmpty() == true
+
+    private fun isDedicatedContentPlan(plan: ModInstallPlan): Boolean =
+        plan.packageType in setOf(
+            ModPackageType.BONELAB_NATIVE_CONTENT,
+            ModPackageType.BONELAB_CODE_MOD
+        ) ||
+            (plan.packageType == ModPackageType.KNOWN_GAME_PROFILE &&
+                plan.targetPackageId == ModPackageAnalyzer.BLADE_AND_SORCERY_PACKAGE_ID)
+
+    private fun transferProgressMessage(
+        source: File,
+        copiedFiles: Int,
+        plan: ModInstallPlan,
+        currentBytes: Long? = null
+    ): String {
+        val current = currentBytes?.coerceAtLeast(0L)
+        val byteText = if (current == null) {
+            "${source.length()} بايت"
+        } else {
+            "$current/${source.length()} بايت"
         }
+        return "نقل ${source.name} — ملف ${copiedFiles + 1}/${plan.totalFiles}، $byteText"
     }
 
     private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
@@ -1054,11 +1191,42 @@ class ModsManager(
         return result.exit == 0
     }
     
-    suspend fun createModPath(serial: String, path: String): CmdResult {
-        if (!AndroidPathValidator.isSafe(path)) {
+    suspend fun createModPath(
+        serial: String,
+        path: String,
+        approvedBase: String? = null
+    ): CmdResult {
+        val base = approvedBase?.trimEnd('/')?.takeIf { it.isNotBlank() }
+        if (!AndroidPathValidator.isSafe(path) ||
+            base == null ||
+            !AndroidPathValidator.isSafe(base) ||
+            (path != base && !path.startsWith("$base/"))
+        ) {
             return CmdResult(1, "", "unsafe destination path")
         }
-        return adbClient.shell(serial, "mkdir", "-p", path)
+        if (path == base) return CmdResult(0, "", "")
+
+        var current = base
+        val relative = path.removePrefix("$base/").trim('/')
+        for (segment in relative.split('/').filter(String::isNotBlank)) {
+            current = "$current/$segment"
+            val existing = adbClient.shell(serial, "test", "-d", current)
+            when {
+                existing.exit == 0 -> continue
+                existing.exit != 1 ->
+                    return CmdResult(1, "", "unable to inspect destination parent")
+                else -> {
+                    /*
+                     * Deliberately do not use mkdir -p. If the approved base
+                     * disappears between the immediate base check and this
+                     * operation, mkdir fails instead of recreating it.
+                     */
+                    val created = adbClient.shell(serial, "mkdir", current)
+                    if (created.exit != 0) return created
+                }
+            }
+        }
+        return CmdResult(0, "", "")
     }
     
     suspend fun getGameModPath(serial: String, gameInfo: GameInfo): String? {

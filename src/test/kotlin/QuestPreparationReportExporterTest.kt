@@ -167,4 +167,34 @@ class QuestPreparationReportExporterTest {
             games.getJSONObject(0).getString("discoveryState") == "FOUND"
         )
     }
+
+    @Test
+    fun `data-only readiness is exported separately from APK evidence`() {
+        val dir = Files.createTempDirectory("quest-report-data-only-")
+        val report = QuestPreparationProbeReport(
+            device = QuestProbeDevice("serial", "Quest 3", "13", "arm64-v8a", emptyList(), "arm64", true),
+            discoveries = listOf(
+                QuestProbeDiscovery(
+                    "BONELAB",
+                    ProbeTargetState.FOUND,
+                    listOf(QuestProbeCandidate("com.StressLevelZero.BONELAB", null, emptyList()))
+                )
+            ),
+            games = listOf(
+                QuestProbeGame(
+                    "BONELAB",
+                    "com.StressLevelZero.BONELAB",
+                    contentModState = "READY",
+                    apkInspectionFailureCode = "APK_SIGNATURE_SCAN_FAILED"
+                )
+            )
+        )
+
+        val game = JSONObject(Files.readString(QuestPreparationReportExporter.export(report, dir).json))
+            .getJSONArray("games").getJSONObject(0)
+
+        assertTrue(game.getString("contentModState") == "READY")
+        assertTrue(game.getString("apkInspectionFailureCode") == "APK_SIGNATURE_SCAN_FAILED")
+        assertTrue(game.getJSONObject("loaderEvidence").getString("contentModState") == "READY")
+    }
 }

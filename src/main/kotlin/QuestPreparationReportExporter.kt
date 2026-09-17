@@ -237,6 +237,11 @@ object QuestPreparationReportExporter {
             put("certificateFingerprints", JSONArray(game.signing.certificateFingerprints))
             game.signing.baseSplitsConsistent?.let { put("baseSplitsConsistent", it) }
         })
+        // Data-only readiness is intentionally exported separately from APK
+        // hashes/signing. A content mod can be safe to copy to a verified
+        // writable Mods directory even when APK evidence is partial.
+        putNullable("contentModState", game.contentModState)
+        putNullable("codeModLoaderState", game.codeModLoaderState)
         put("loaderEvidence", JSONObject()
             .put("loader", game.loader.name)
             .put("contentModState", game.contentModState)

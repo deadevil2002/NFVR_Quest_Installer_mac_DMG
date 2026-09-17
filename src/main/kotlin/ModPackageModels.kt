@@ -1,3 +1,5 @@
+import org.json.JSONObject
+
 /**
  * A package reported by `pm list packages` plus the version information needed
  * when checking a manifest.  The version is deliberately nullable: ADB can
@@ -131,6 +133,18 @@ fun customerPreconditionMessage(code: String): String = when {
 }
 
 fun customerAnalysisMessage(analysis: ModPackageAnalysis): String = when {
+    analysis.installPlan.preconditions.any {
+        !it.satisfied && it.code == "NOMAD_GAME_VERSION_UNVERIFIED"
+    } ->
+        "إصدار Nomad لهذا المود غير متحقق: بيانات GameVersion لا تثبت توافقه مع إصدار اللعبة المحدد."
+    analysis.installPlan.preconditions.any {
+        !it.satisfied && it.code == "BUILT_IN_IMPORTER_UNVERIFIED"
+    } ->
+        "هذا محتوى Gorilla Tag مخصص لمستورد الخرائط المدمج؛ لا يملك NFVR حاليًا عقد استيراد موثقًا وآمنًا."
+    analysis.installPlan.preconditions.any {
+        !it.satisfied && it.code == "NESTED_ARCHIVE_REQUIRES_REVIEW"
+    } ->
+        "يحتوي الأرشيف على ZIP متداخل؛ يجب مراجعته كحزمة مستقلة ولا يقوم NFVR بفكّه أو تثبيته تلقائيًا."
     analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED ->
         customerPreconditionMessage("APK_PATCH_REQUIRED")
     analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ->
@@ -138,7 +152,7 @@ fun customerAnalysisMessage(analysis: ModPackageAnalysis): String = when {
     analysis.outcome == ModInstallOutcome.UNSAFE_ARCHIVE ->
         customerPreconditionMessage("UNSAFE_ARCHIVE")
     analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ->
-        "هذا المحتوى مدمج وتديره اللعبة؛ لا يحتاج إلى نقل مباشر."
+        "تم التعرف على الحزمة، لكن عقد الاستيراد الموثق والآمن غير متاح في NFVR؛ لم يتم نقل أي ملف."
     analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
         analysis.packageType == ModPackageType.UNKNOWN || !analysis.recognized ->
         customerPreconditionMessage("UNSUPPORTED")
@@ -529,6 +543,56 @@ data class ModInstallProgress(
         get() = (fraction * 100.0).toInt()
 }
 
+/**
+ * The archive normalizer deliberately describes packaging without deciding
+ * where a game-specific installer may write.  This keeps wrapper handling,
+ * dependency discovery, and nested-archive policy reusable for every Quest
+ * game while leaving code/content and loader decisions to the analyzer.
+ */
+enum class QuestModArchiveRootKind {
+    MOD_ROOT,
+    PACKAGING_METADATA,
+    DEPENDENCY,
+    NESTED_ARCHIVE,
+    UNKNOWN
+}
+
+data class QuestModArchiveRoot(
+    val path: String,
+    val kind: QuestModArchiveRootKind,
+    val fileCount: Int,
+    val totalBytes: Long
+)
+
+data class QuestModArchiveTree(
+    val entries: List<String> = emptyList(),
+    val fileEntries: List<String> = emptyList(),
+    val directoryEntries: List<String> = emptyList(),
+    val wrapperRoot: String? = null,
+    val roots: List<QuestModArchiveRoot> = emptyList(),
+    val metadata: Map<String, JSONObject> = emptyMap(),
+    val dependencyPaths: List<String> = emptyList(),
+    val nestedArchivePaths: List<String> = emptyList(),
+    val multipleModRoots: Boolean = false
+) {
+    /**
+     * A wrapper is a packaging detail, never an additional destination level.
+     * Callers should use this value only when their game-specific contract
+     * says that the root itself is the installable mod directory.
+     */
+    val normalizedRoot: String?
+        get() = wrapperRoot
+
+    val metadataPaths: List<String>
+        get() = metadata.keys.toList()
+
+    val hasNestedArchives: Boolean
+        get() = nestedArchivePaths.isNotEmpty()
+
+    val hasMultipleRoots: Boolean
+        get() = multipleModRoots
+}
+
 data class ModPackageAnalysis(
     val packageType: ModPackageType,
     val recognized: Boolean,
@@ -538,7 +602,8 @@ data class ModPackageAnalysis(
     val metadata: Map<String, Any?> = emptyMap(),
     val entries: List<String> = emptyList(),
     val externalWorkflow: ModExternalWorkflow? = null,
-    val diagnostics: List<String> = emptyList()
+    val diagnostics: List<String> = emptyList(),
+    val archiveTree: QuestModArchiveTree? = null
 ) {
     val installable: Boolean
         get() = installPlan.installable
@@ -653,6 +718,18 @@ data class GameModProfile(
         apkSha256: String? = app?.apkSha256,
         requireApkEvidence: Boolean = true
     ): Boolean = compatibilityIssues(app, apkSha256, requireApkEvidence).isEmpty()
+
+    /**
+     * Data-only content copies do not mutate or reinstall the APK.  Their
+     * compatibility gate is package identity, supported version evidence, and
+     * the verified destination; APK hashes remain available to strict
+     * preparation/patching callers.
+     */
+    fun isContentCompatible(app: InstalledQuestApp?): Boolean =
+        contentCompatibilityIssues(app).isEmpty()
+
+    fun contentCompatibilityIssues(app: InstalledQuestApp?): List<String> =
+        compatibilityIssues(app, requireApkEvidence = false)
 
     /** Stable precondition codes for manager/device-aware callers. */
     fun compatibilityIssues(

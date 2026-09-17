@@ -114,9 +114,9 @@ class ModPackageAnalyzer(
                 isAndroidObbLayout(archive) ->
                     analyzeAndroidLayout(archive, installedApp, obb = true)
                 isNomadPayload(archive, installedApp) ->
-                    analyzeNomadPayload(archive, installedApp, loaderDetection)
+                    analyzeNomadPayload(archive, installedApp, loaderDetection, directoryDiscovery)
                 isBonelabPayload(archive, installedApp) ->
-                    analyzeBonelabPayload(archive, installedApp, loaderDetection)
+                    analyzeBonelabPayload(archive, installedApp, loaderDetection, directoryDiscovery)
                 isKnownGameProfilePayload(archive, installedApp) ->
                     analyzeKnownGameProfile(archive, installedApp, loaderDetection)
                 directoryDiscovery != null && directoryDiscovery.existingCandidates.isNotEmpty() ->
@@ -157,6 +157,11 @@ class ModPackageAnalyzer(
 
     private fun inspectArchive(zipFile: File): ArchiveMetadata {
         require(zipFile.isFile) { "Selected mod archive does not exist." }
+        val normalizedTree = try {
+            QuestModArchiveNormalizer.normalize(zipFile)
+        } catch (e: QuestModArchiveNormalizer.UnsafeArchiveException) {
+            throw ModPackageException(e.message ?: "ZIP archive is unsafe.")
+        }
         val metadata = linkedMapOf<String, JSONObject>()
         val entries = mutableListOf<String>()
         val sizes = linkedMapOf<String, Long>()
@@ -223,7 +228,7 @@ class ModPackageAnalyzer(
                 // basenames; arbitrary archive filenames remain data, not
                 // evidence of a game or an installation destination.
                 if (!entry.isDirectory &&
-                    safeName.substringAfterLast('/').lowercase(Locale.ROOT) in CONTENT_METADATA_BASENAMES &&
+                    isContentMetadataName(safeName) &&
                     safeName !in metadata
                 ) {
                     val content = runCatching {
@@ -274,8 +279,17 @@ class ModPackageAnalyzer(
             directories,
             prefixes,
             identity,
-            traversalEntries
+            traversalEntries,
+            normalizedTree
         )
+    }
+
+    private fun isContentMetadataName(path: String): Boolean {
+        val basename = path.substringAfterLast('/').lowercase(Locale.ROOT)
+        return basename in CONTENT_METADATA_BASENAMES ||
+            basename.endsWith(".pallet.json") ||
+            (basename.startsWith("catalog_") && basename.endsWith(".json")) ||
+            basename.endsWith(".catalog.json")
     }
 
     private fun digestPrefix(existing: ByteArray?, buffer: ByteArray, read: Int): ByteArray {
@@ -1200,7 +1214,7 @@ class ModPackageAnalyzer(
 
     private fun contentDocuments(archive: ArchiveMetadata): List<Pair<String, JSONObject>> =
         archive.metadata.entries.filter { (path, _) ->
-            path.substringAfterLast('/').lowercase(Locale.ROOT) in CONTENT_METADATA_BASENAMES
+            isContentMetadataName(path)
         }.map { it.key to it.value }
 
     private fun metadataPackageId(json: JSONObject): String? =
@@ -1242,17 +1256,46 @@ class ModPackageAnalyzer(
         return hasMeaningfulModFields && (hasThunderRoadType || hasGameVersion)
     }
 
+    /**
+     * Nomad's built-in managed-mod format can contain an intentionally empty
+     * manifest alongside a managed assembly and symbols.  A DLL by itself is
+     * not evidence of a loader, so require the manifest/assembly shape and
+     * reject native/desktop executable payloads before treating it as content.
+     */
+    private fun isNomadManagedAssemblyEvidence(
+        archive: ArchiveMetadata,
+        path: String
+    ): Boolean {
+        if (path.substringAfterLast('/').lowercase(Locale.ROOT) != "manifest.json") {
+            return false
+        }
+        val root = path.substringBeforeLast('/', "")
+        val siblings = archive.entries.filter { entry ->
+            entry !in archive.directories &&
+                (root.isBlank() || entry.startsWith("$root/"))
+        }
+        val hasManagedAssembly = siblings.any {
+            it.lowercase(Locale.ROOT).endsWith(".dll")
+        }
+        val hasNativeOrDesktopExecutable = siblings.any {
+            val lower = it.lowercase(Locale.ROOT)
+            lower.endsWith(".so") || lower.endsWith(".exe")
+        }
+        return hasManagedAssembly && !hasNativeOrDesktopExecutable
+    }
+
     private fun isNomadPayload(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?
     ): Boolean {
         val documents = contentDocuments(archive)
         if (documents.isEmpty()) return false
-        val explicitNomad = documents.any { (path, json) ->
-            metadataIndicatesNomad(path, json)
-        }
+        val explicitNomad = documents.any { (path, json) -> metadataIndicatesNomad(path, json) }
         val selectedNomad = installedApp?.packageName == BLADE_AND_SORCERY_PACKAGE_ID
         if (!explicitNomad && !selectedNomad) return false
+        val managedAssemblyPayload = documents.any { (path, _) ->
+            isNomadManagedAssemblyEvidence(archive, path)
+        }
 
         // A Windows/PC export must not become a Nomad package merely because
         // it contains a generic manifest.json.  Quest content has either an
@@ -1266,11 +1309,15 @@ class ModPackageAnalyzer(
                 it.startsWith("Android/data/$BLADE_AND_SORCERY_PACKAGE_ID/")
             }
         val hasPcPayload = roots.any { it in PC_ONLY_ROOTS } ||
-            archive.entries.any(::isPcOnlyFile) ||
-            archive.entries.any { it.lowercase(Locale.ROOT).endsWith(".dll") }
+            (!managedAssemblyPayload && archive.entries.any(::isPcOnlyFile)) ||
+            (!managedAssemblyPayload &&
+                archive.entries.any { it.lowercase(Locale.ROOT).endsWith(".dll") })
         if (hasPcPayload && !hasQuestBranch) return false
 
-        val evidence = documents.any { (path, json) -> isNomadDocumentEvidence(path, json) }
+        val evidence = documents.any { (path, json) ->
+            isNomadDocumentEvidence(path, json) ||
+                isNomadManagedAssemblyEvidence(archive, path)
+        }
         val payload = archive.entries.any { entry ->
             entry !in archive.directories &&
                 (entry.lowercase(Locale.ROOT).endsWith(".assetbundle") ||
@@ -1281,13 +1328,14 @@ class ModPackageAnalyzer(
         // App selection is not content evidence. A malformed or generic
         // sidecar must not become a Nomad mod merely because Nomad is
         // selected in the UI.
-        return payload && evidence
+        return (payload || managedAssemblyPayload) && evidence
     }
 
     private fun analyzeNomadPayload(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?,
-        loaderDetection: ModLoaderDetection?
+        loaderDetection: ModLoaderDetection?,
+        directoryDiscovery: ModDirectoryDiscovery?
     ): ModPackageAnalysis {
         val profile = profileRegistry.findByPackageId(BLADE_AND_SORCERY_PACKAGE_ID)
             ?: GameModProfile(
@@ -1297,11 +1345,21 @@ class ModPackageAnalyzer(
             )
         val preconditions = mutableListOf<ModInstallPrecondition>()
         checkTarget(BLADE_AND_SORCERY_PACKAGE_ID, installedApp, "Blade & Sorcery: Nomad", preconditions)
+        requireExistingDedicatedDestination(
+            profile,
+            directoryDiscovery,
+            preconditions,
+            "Nomad"
+        )
 
         // Unlike a generic profile proposal, Nomad's completed probe gives
         // us an exact app fixture.  Do not install a structurally valid mod
         // into a stale game build.
-        profile.compatibilityIssues(installedApp, requireApkEvidence = true).forEach { code ->
+        // Ordinary data/content copies are authorized by the selected app,
+        // verified content destination, supported version fixture, and safe
+        // archive structure.  Exact APK hashes remain a preparation/patching
+        // gate, not an unnecessary blocker for copying content.
+        profile.contentCompatibilityIssues(installedApp).forEach { code ->
             if (preconditions.none { it.code == code }) {
                 preconditions += blocked(
                     code,
@@ -1324,19 +1382,43 @@ class ModPackageAnalyzer(
             )
         }
         val declaredVersion = documents.firstNotNullOfOrNull { (_, json) ->
-            listOf("gameVersion", "targetGameVersion", "versionName")
-                .firstNotNullOfOrNull { key ->
-                    json.optString(key, "").trim().takeIf(String::isNotBlank)
+            json.keys().asSequence()
+                .firstOrNull { key ->
+                    key.equals("gameVersion", true) ||
+                        key.equals("targetGameVersion", true) ||
+                        key.equals("versionName", true)
                 }
+                ?.let { key -> json.optString(key, "").trim().takeIf(String::isNotBlank) }
         }
-        if (declaredVersion != null && installedApp?.versionName != declaredVersion) {
+        val managedAssemblyPayload = documents.any { (path, _) ->
+            isNomadManagedAssemblyEvidence(archive, path)
+        }
+        addDangerousPayloadPrecondition(archive, preconditions)
+        if (!managedAssemblyPayload) {
+            addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
+        }
+        if (managedAssemblyPayload) {
+            // Research confirms that this AnyCPU managed DLL is an Android
+            // supported Nomad mod loaded by the game's built-in scripting
+            // system.  The remaining safety gate is game-version evidence,
+            // not a guessed external loader or a PC-only classification.
+            val selectedVersion = installedApp?.versionName
+            if (declaredVersion == null || selectedVersion == null ||
+                declaredVersion != selectedVersion
+            ) {
+                val manifestVersion = declaredVersion ?: "missing"
+                val gameVersion = selectedVersion ?: "missing"
+                preconditions += blocked(
+                    "NOMAD_GAME_VERSION_UNVERIFIED",
+                    "Nomad manifest GameVersion '$manifestVersion' is not verified with selected game version '$gameVersion'; NFVR will not install this managed content yet."
+                )
+            }
+        } else if (declaredVersion != null && installedApp?.versionName != declaredVersion) {
             preconditions += blocked(
                 "GAME_VERSION_UNSUPPORTED",
                 "Nomad content targets game version '$declaredVersion', but the installed version is '${installedApp?.versionName}'."
             )
         }
-        addDangerousPayloadPrecondition(archive, preconditions)
-        addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
         val mappings = mutableListOf<ModFileMapping>()
         val files = archive.entries.filterNot { it in archive.directories }
         val afterMods = files.map { entry ->
@@ -1345,7 +1427,8 @@ class ModPackageAnalyzer(
             } else entry
         }
         val meaningfulDocuments = documents.filter { (path, json) ->
-            isNomadDocumentEvidence(path, json)
+            isNomadDocumentEvidence(path, json) ||
+                isNomadManagedAssemblyEvidence(archive, path)
         }
         val manifestRoots = meaningfulDocuments.mapNotNull { (path, _) ->
             val normalized = if (path.startsWith("Mods/", true) ||
@@ -1462,6 +1545,26 @@ class ModPackageAnalyzer(
     }
 
     private fun isBonelabContentDocument(path: String, json: JSONObject): Boolean {
+        val basename = path.substringAfterLast('/').lowercase(Locale.ROOT)
+        val root = json.optJSONObject("root")
+        val objects = json.optJSONObject("objects")
+        val rootRef = root?.opt("ref")?.toString()?.takeIf { it.isNotBlank() }
+        val rootObject = rootRef?.let { objects?.optJSONObject(it) }
+        val isRootScopedPallet =
+            basename.endsWith(".pallet.json") &&
+                root?.optString("type", "").equals("pallet#0", true) &&
+                rootObject?.optString("barcode", "").orEmpty().isNotBlank() &&
+                rootObject?.optJSONArray("crates") != null &&
+                rootObject?.optString("sdkVersion", "").orEmpty().isNotBlank()
+        val internalIds = json.optJSONArray("m_InternalIds")
+        val isPalletAddressablesCatalog = internalIds != null &&
+            (0 until internalIds.length()).any { index ->
+                internalIds.optString(index).startsWith("PALLET_BARCODE:", true)
+            } &&
+            (0 until internalIds.length()).any { index ->
+                internalIds.optString(index).lowercase(Locale.ROOT).contains(".bundle")
+            }
+        if (isRootScopedPallet || isPalletAddressablesCatalog) return true
         val keys = json.keys().asSequence().map { it.lowercase(Locale.ROOT) }.toSet()
         val hasIdentity = keys.any {
             it in setOf("name", "title", "id", "barcode", "pallet", "author")
@@ -1485,12 +1588,19 @@ class ModPackageAnalyzer(
     private fun analyzeBonelabPayload(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?,
-        loaderDetection: ModLoaderDetection?
+        loaderDetection: ModLoaderDetection?,
+        directoryDiscovery: ModDirectoryDiscovery?
     ): ModPackageAnalysis {
         val profile = profileRegistry.findByPackageId(BONELAB_PACKAGE_ID)
             ?: GameModProfile(BONELAB_PACKAGE_ID, "BONELAB", "/sdcard/Android/data/$BONELAB_PACKAGE_ID/files/Mods")
         val preconditions = mutableListOf<ModInstallPrecondition>()
         checkTarget(BONELAB_PACKAGE_ID, installedApp, "BONELAB", preconditions)
+        requireExistingDedicatedDestination(
+            profile,
+            directoryDiscovery,
+            preconditions,
+            "BONELAB"
+        )
         val contentDocuments = contentDocuments(archive)
         val declaredPackages = contentDocuments.mapNotNull { (_, json) -> metadataPackageId(json) }.toSet()
         if (declaredPackages.any { it != BONELAB_PACKAGE_ID }) {
@@ -1502,7 +1612,10 @@ class ModPackageAnalyzer(
         // Direct BONELAB readiness is bound to the completed probe fixture,
         // even when an archive omits package/version fields.  An archive
         // cannot downgrade this check by presenting itself as unversioned.
-        profile.compatibilityIssues(installedApp, requireApkEvidence = true).forEach { code ->
+        // APK identity is intentionally not a prerequisite for ordinary
+        // content installation.  Patching/native preparation keeps its own
+        // strict hash gate elsewhere.
+        profile.contentCompatibilityIssues(installedApp).forEach { code ->
             if (preconditions.none { it.code == code }) {
                 preconditions += blocked(
                     code,
@@ -1991,7 +2104,11 @@ class ModPackageAnalyzer(
             preconditions = listOf(
                 satisfied(
                     "BUILT_IN_GAME_CONTENT",
-                    "Virtual Stump content is managed by Gorilla Tag's built-in custom-content system; NFVR has no safe direct destination."
+                    "Virtual Stump content is imported by Gorilla Tag's built-in custom-map workflow; NFVR has no safe direct destination or importer contract."
+                ),
+                blocked(
+                    "BUILT_IN_IMPORTER_UNVERIFIED",
+                    "The archive is recognized as built-in Virtual Stump content, but NFVR has no confirmed implementation of Gorilla Tag's importer workflow."
                 ),
                 // Kept as a stable compatibility code for existing callers;
                 // it no longer implies a browser or external URL workflow.
@@ -2005,7 +2122,7 @@ class ModPackageAnalyzer(
         )
         return result(
             ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
-            "Recognized Gorilla Tag Virtual Stump content; manage it through the game's built-in custom-content system.",
+            "Recognized Gorilla Tag Virtual Stump content; use the game's built-in custom-map importer because no safe direct Quest copy workflow is verified.",
             plan,
             archive,
             json.toMap()
@@ -2416,6 +2533,33 @@ class ModPackageAnalyzer(
             resolution = resolution,
             diagnostics = preconditions.filterNot { it.satisfied }.map { it.message }
         )
+    }
+
+    private fun requireExistingDedicatedDestination(
+        profile: GameModProfile,
+        discovery: ModDirectoryDiscovery?,
+        preconditions: MutableList<ModInstallPrecondition>,
+        gameName: String
+    ) {
+        /*
+         * Offline analysis has no device evidence to inspect.  Leave that
+         * preview honest but unresolved; device-aware analysis must provide a
+         * discovery snapshot and is blocked unless the exact authoritative
+         * root was observed there.
+         */
+        if (discovery == null) return
+        val verified = discovery.existingCandidates.any {
+            it.packageId == profile.packageId &&
+                it.path == profile.destination &&
+                it.readOnly
+        } == true
+        if (!verified) {
+            preconditions += blocked(
+                "MOD_DESTINATION_REQUIRED",
+                "$gameName content requires the verified existing directory " +
+                    "${profile.destination}; NFVR will not create the approved base."
+            )
+        }
     }
 
     private fun resolution(
@@ -2866,8 +3010,113 @@ class ModPackageAnalyzer(
                 ),
                 diagnostics = listOfNotNull(diagnosticEntry)
             ),
-            diagnostics = listOfNotNull(diagnosticEntry)
+            diagnostics = listOfNotNull(diagnosticEntry),
+            archiveTree = null
         )
+
+    private fun applyArchiveStructure(
+        plan: ModInstallPlan,
+        tree: QuestModArchiveTree?
+    ): ModInstallPlan {
+        if (tree == null) return plan
+        val preconditions = plan.preconditions.toMutableList()
+        if (tree.hasNestedArchives &&
+            preconditions.none { it.code == "NESTED_ARCHIVE_REQUIRES_REVIEW" }
+        ) {
+            preconditions += blocked(
+                "NESTED_ARCHIVE_REQUIRES_REVIEW",
+                "Archive contains nested ZIP content; NFVR will not flatten or install nested archives automatically."
+            )
+        }
+        val discoveredDependencies = archiveDependencies(tree)
+        if (tree.dependencyPaths.isNotEmpty() &&
+            preconditions.none { it.code == "ARCHIVE_DEPENDENCIES_DISCOVERED" }
+        ) {
+            preconditions += satisfied(
+                "ARCHIVE_DEPENDENCIES_DISCOVERED",
+                "Archive dependency metadata was discovered; NFVR will not download or execute dependency instructions automatically."
+            )
+        }
+        val dependencies = (plan.dependencies + discoveredDependencies)
+            .distinctBy { it.id.lowercase(Locale.ROOT) to it.version.orEmpty() }
+        val installable = plan.mappings.isNotEmpty() &&
+            preconditions.none { !it.satisfied }
+        val outcome = if (plan.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+            !installable
+        ) {
+            ModInstallOutcome.UNSUPPORTED
+        } else {
+            plan.outcome
+        }
+        return plan.copy(
+            installable = installable,
+            outcome = outcome,
+            preconditions = preconditions,
+            dependencies = dependencies,
+            diagnostics = (plan.diagnostics +
+                preconditions.filterNot { it.satisfied }.map { it.message }).distinct()
+        )
+    }
+
+    private fun archiveDependencies(tree: QuestModArchiveTree): List<ModPackageDependency> {
+        val result = mutableListOf<ModPackageDependency>()
+        tree.metadata.values.forEach { json ->
+            val key = json.keys().asSequence().firstOrNull {
+                it.equals("dependencies", true) || it.equals("dependency", true)
+            } ?: return@forEach
+            val value = json.opt(key)
+            when (value) {
+                is JSONArray -> {
+                    for (index in 0 until value.length()) {
+                        addArchiveDependency(result, value.opt(index), null)
+                    }
+                }
+                is JSONObject -> {
+                    value.keys().forEach { id ->
+                        addArchiveDependency(result, value.opt(id), id)
+                    }
+                }
+                else -> addArchiveDependency(result, value, null)
+            }
+        }
+        if (result.isEmpty()) {
+            tree.dependencyPaths.forEach { path ->
+                result += ModPackageDependency(
+                    id = path,
+                    downloadRequired = false,
+                    optional = true
+                )
+            }
+        }
+        return result.distinctBy { it.id.lowercase(Locale.ROOT) to it.version.orEmpty() }
+    }
+
+    private fun addArchiveDependency(
+        result: MutableList<ModPackageDependency>,
+        value: Any?,
+        fallbackId: String?
+    ) {
+        val dependency = when (value) {
+            is JSONObject -> {
+                val id = listOf("id", "packageId", "name", "modId")
+                    .firstNotNullOfOrNull { key ->
+                        value.optString(key, "").trim().takeIf(String::isNotBlank)
+                    } ?: fallbackId
+                id?.let {
+                    ModPackageDependency(
+                        id = it,
+                        version = value.optString("version", "").trim().takeIf(String::isNotBlank),
+                        optional = value.optBoolean("optional", false),
+                        downloadRequired = false
+                    )
+                }
+            }
+            else -> value?.toString()?.trim()?.takeIf(String::isNotBlank)?.let {
+                ModPackageDependency(id = it, downloadRequired = false, optional = true)
+            }
+        }
+        if (dependency != null) result += dependency
+    }
 
     private fun result(
         type: ModPackageType,
@@ -2880,8 +3129,11 @@ class ModPackageAnalyzer(
         // Every classified result carries the selected app identity.  Keeping
         // this normalization at the result boundary protects less common
         // analyzer branches from accidentally dropping it.
-        val normalizedPlan = plan.copy(
-            targetPackageId = plan.targetPackageId ?: plan.reviewedApp?.packageName
+        val normalizedPlan = applyArchiveStructure(
+            plan.copy(
+                targetPackageId = plan.targetPackageId ?: plan.reviewedApp?.packageName
+            ),
+            archive.normalizedTree
         )
         return ModPackageAnalysis(
         packageType = type,
@@ -2896,7 +3148,8 @@ class ModPackageAnalyzer(
         metadata = metadata,
         entries = archive.entries,
         externalWorkflow = externalWorkflow,
-        diagnostics = normalizedPlan.diagnostics.distinct()
+            diagnostics = normalizedPlan.diagnostics.distinct(),
+            archiveTree = archive.normalizedTree
     )
     }
 
@@ -2972,7 +3225,8 @@ class ModPackageAnalyzer(
         val directories: Set<String> = emptySet(),
         val prefixes: Map<String, ByteArray> = emptyMap(),
         val identity: ModArchiveIdentity? = null,
-        val traversalEntries: List<String> = emptyList()
+        val traversalEntries: List<String> = emptyList(),
+        val normalizedTree: QuestModArchiveTree? = null
     )
 
     private class ModPackageException(

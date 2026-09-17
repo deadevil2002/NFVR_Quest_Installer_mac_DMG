@@ -1,7 +1,11 @@
 object AndroidPathValidator {
     private val allowedPrefixes = listOf("/sdcard/", "/storage/emulated/0/")
     private val unsafeCharacters = Regex("""[;&|`$><\r\n\u0000]""")
-    private val allowedCharacters = Regex("""^[A-Za-z0-9._/ -]+$""")
+    // Unity/Marrow bundle names commonly contain parentheses (for example
+    // bl_plane(night).bundle). They are ordinary path characters, not shell
+    // syntax; retain the existing control/separator checks while accepting
+    // them in verified destination paths.
+    private val allowedCharacters = Regex("""^[A-Za-z0-9._/ ()-]+$""")
 
     fun isSafe(path: String): Boolean {
         val value = path.trim()

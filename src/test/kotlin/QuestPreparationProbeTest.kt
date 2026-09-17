@@ -9,6 +9,7 @@ import kotlin.test.assertTrue
 class QuestPreparationProbeTest {
     private class FakeTransport(private val packages: String, private val files: Map<String, ByteArray>,
         private val rowOnlyDevices: Boolean = false, private val failPathFor: Set<String> = emptySet(),
+        private val sizeOverrides: Map<String, Long> = emptyMap(),
         private val deviceOutput: (() -> String)? = null) :
         RestrictedQuestTransport {
         val calls = mutableListOf<String>()
@@ -30,7 +31,10 @@ class QuestPreparationProbeTest {
             check(packageId !in failPathFor) { "simulated APK path failure" }
             return files.keys.filter { it.contains(packageId) }
         }
-        override fun stat(serial: String, path: String): Long? { calls += "$serial stat $path"; return files[path]?.size?.toLong() }
+        override fun stat(serial: String, path: String): Long? {
+            calls += "$serial stat $path"
+            return sizeOverrides[path] ?: files[path]?.size?.toLong()
+        }
         override fun list(serial: String, path: String): List<RemoteEntry> {
             calls += "$serial ls $path"
             return emptyList()
@@ -101,6 +105,36 @@ class QuestPreparationProbeTest {
             assertEquals(ProbeEngine.UNREAL_ENGINE, game.engine.engine)
             assertTrue(root.listFiles().orEmpty().none { it.exists() })
         } finally { root.deleteRecursively() }
+    }
+
+    @Test fun `real sized Gorilla APK passes remote safety stage without allocating it`() {
+        val (path, bytes) = apk("com.AnotherAxiom.GorillaTag", true)
+        val fake = FakeTransport(
+            "package:com.AnotherAxiom.GorillaTag",
+            mapOf(path to bytes),
+            sizeOverrides = mapOf(path to 570_253_943L)
+        )
+
+        val game = QuestPreparationProbe(fake, createTempDir(prefix = "probe-large-stat-")).probe().games.single()
+
+        assertEquals(570_253_943L, game.apkInventory.single().sizeBytes)
+        assertTrue(game.apkInspectionFailureCode != "APK_REMOTE_SIZE_LIMIT_EXCEEDED")
+        assertTrue(fake.calls.any { it.endsWith("stat $path") })
+    }
+
+    @Test fun `APK over two GiB is rejected before transfer`() {
+        val (path, bytes) = apk("com.AnotherAxiom.GorillaTag", true)
+        val fake = FakeTransport(
+            "package:com.AnotherAxiom.GorillaTag",
+            mapOf(path to bytes),
+            sizeOverrides = mapOf(path to QuestPreparationProbe.MAX_APK_BYTES + 1L)
+        )
+
+        val game = QuestPreparationProbe(fake, createTempDir(prefix = "probe-over-limit-")).probe().games.single()
+
+        assertEquals("APK_REMOTE_SIZE_VERIFY", game.apkInspectionStage)
+        assertEquals("APK_REMOTE_SIZE_LIMIT_EXCEEDED", game.apkInspectionFailureCode)
+        assertTrue(fake.calls.none { it.endsWith("pull $path") })
     }
 
     @Test fun `one APK failure preserves metadata and does not abort later found games`() {

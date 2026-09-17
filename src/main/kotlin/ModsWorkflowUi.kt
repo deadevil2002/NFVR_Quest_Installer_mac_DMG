@@ -97,6 +97,86 @@ internal data class ModsUiOutcome(
 )
 
 /**
+ * Keep the customer copy actionable without exposing analyzer enum names.
+ * The archive may be recognized while still being blocked for a precise,
+ * security-relevant reason (PC payload, loader, version, collision, etc.).
+ */
+internal fun modCustomerFailureReason(analysis: ModPackageAnalysis): String {
+    if (analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT) {
+        return "تم التعرف على الحزمة، لكن عقد الاستيراد الموثق والآمن للعبة غير متاح في NFVR؛ لم يتم نقل أي ملف."
+    }
+    val blocked = analysis.installPlan.preconditions
+        .filterNot { it.satisfied }
+        .firstOrNull {
+            it.code == "NOMAD_GAME_VERSION_UNVERIFIED" ||
+                it.code == "GAME_VERSION_UNSUPPORTED" ||
+                it.code == "GAME_VERSION_CODE_UNSUPPORTED"
+        }
+        ?: analysis.installPlan.preconditions.firstOrNull { !it.satisfied }
+    val code = blocked?.code?.uppercase(Locale.ROOT).orEmpty()
+    return when {
+        code == "PC_ONLY_PAYLOAD" ->
+            "هذا الملف مود PCVR وليس Quest؛ لم يتم نقل أي ملف."
+        code == "APK_PATCH_REQUIRED" ->
+            "تحتاج هذه الحزمة إلى تجهيز APK آمن قبل التثبيت؛ لم يتم تنفيذ أي تعديل."
+        code == "NOMAD_GAME_VERSION_UNVERIFIED" ->
+            Regex("""GameVersion '([^']+)'.*?selected game version '([^']+)'""")
+                .find(blocked?.message.orEmpty())
+                ?.let {
+                    "إصدار Framework المعلن ${it.groupValues[1]} لا يطابق إصدار اللعبة المثبت ${it.groupValues[2]}؛ لم يتم نقل أي ملف."
+                }
+                ?: "تعذر إثبات توافق إصدار Framework مع إصدار اللعبة المثبت؛ لم يتم نقل أي ملف."
+        code == "GAME_VERSION_UNSUPPORTED" || code == "GAME_VERSION_CODE_UNSUPPORTED" ->
+            blocked?.let(::modPreconditionDetail)
+                ?: "إصدار اللعبة المثبت لا يطابق الإصدار المطلوب لهذه الحزمة."
+        code.contains("LOADER") || code.contains("NATIVE_PAYLOAD") ->
+            "هذا المود يحتاج محمّلًا متوافقًا وأدلة قراءة مكتملة قبل النقل."
+        code.contains("VERSION") ->
+            "هذا المود يحتاج إصدار لعبة مختلفًا عن الإصدار المثبت."
+        code.contains("TARGET_PACKAGE") ->
+            "الحزمة موجهة إلى لعبة أخرى؛ اختر اللعبة المطابقة."
+        code.contains("DIRECTORY") || code.contains("DESTINATION") ->
+            "لم يتم إثبات مجلد مود آمن ومعتمد لهذه اللعبة."
+        code.contains("DEPEND") ->
+            "الحزمة تعلن اعتماديات لم يتم التحقق منها؛ لم يتم تنزيل أي اعتماد تلقائيًا."
+        code.contains("UNSAFE") || code.contains("CORRUPT") ||
+            code.contains("MALFORMED") || code.contains("TRAVERSAL") ->
+            "الأرشيف غير آمن أو تالف؛ لم يتم نقل أي ملف."
+        code == "UNKNOWN_FORMAT" || code == "UNSUPPORTED_FORMAT" ||
+            analysis.packageType == ModPackageType.UNKNOWN || !analysis.recognized ->
+            "لم يتعرف NFVR على بنية الحزمة الآمنة؛ راجع نوع الملفات والبنية الداخلية."
+        blocked != null ->
+            "تعذر تجهيز الحزمة: ${customerPreconditionMessage(blocked.code)}"
+        analysis.installable ->
+            "الحزمة جاهزة للتثبيت الآمن."
+        else ->
+            "تعذر تجهيز خطة نقل آمنة لهذه الحزمة؛ لم يتم تغيير أي ملف."
+    }
+}
+
+private fun modPreconditionDetail(precondition: ModInstallPrecondition): String? {
+    val message = precondition.message
+    return when (precondition.code.uppercase(Locale.ROOT)) {
+        "NOMAD_GAME_VERSION_UNVERIFIED" ->
+            Regex("""GameVersion '([^']+)'.*?selected game version '([^']+)'""")
+                .find(message)
+                ?.let {
+                    "Framework المعلن ${it.groupValues[1]} لا يطابق إصدار اللعبة المثبت ${it.groupValues[2]}."
+                }
+                ?: "تعذر إثبات توافق Framework مع إصدار اللعبة."
+        "MOD_DESTINATION_REQUIRED" ->
+            "يجب أن يكون مجلد المحتوى المعتمد موجودًا مسبقًا؛ لن ينشئ NFVR الجذر."
+        "UNRELATED_ARCHIVE_CONTENT" ->
+            "يحتوي الأرشيف ملفات خارج جذر المود المثبت بالأدلة."
+        "NESTED_ARCHIVE" ->
+            "يوجد أرشيف متداخل ولم يتم فكّه أو تثبيته تلقائيًا."
+        "GAME_VERSION_UNSUPPORTED", "GAME_VERSION_CODE_UNSUPPORTED" ->
+            "إصدار اللعبة المثبت خارج الإصدارات المتوافقة الموثقة."
+        else -> null
+    }
+}
+
+/**
  * Maps the engine's explicit outcome to presentation only.  The precondition
  * fallback keeps an unsafe archive red even if an older analysis object did
  * not populate the outcome field.
@@ -131,7 +211,7 @@ internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
         builtInContent -> ModsUiOutcome(
             ModsUiStatusTone.INFO,
             "تم التعرف على نوع المود",
-            "لا يحتاج تثبيتًا يدويًا عبر NFVR"
+            "تم التعرف على الحزمة، لكن عقد الاستيراد الموثق والآمن غير متاح في NFVR؛ لم يتم نقل أي ملف."
         )
         analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED -> ModsUiOutcome(
             ModsUiStatusTone.WARNING,
@@ -153,13 +233,15 @@ internal fun modsUiOutcome(analysis: ModPackageAnalysis): ModsUiOutcome {
             analysis.packageType == ModPackageType.UNKNOWN ||
             !analysis.recognized -> ModsUiOutcome(
             ModsUiStatusTone.WARNING,
-            "غير مدعوم حاليًا",
-            "لا توجد وجهة آمنة معروفة — لم يتم نقل أي ملف"
+            "تعذر تجهيز التثبيت",
+            modCustomerFailureReason(analysis),
+            "لم يتم نقل أي ملف"
         )
         else -> ModsUiOutcome(
             ModsUiStatusTone.WARNING,
             "تحتاج الخطة إلى متطلبات",
-            "لا يمكن التثبيت بهذه الخطة"
+            modCustomerFailureReason(analysis),
+            "لم يتم نقل أي ملف"
         )
     }
 }
@@ -196,7 +278,7 @@ internal fun modInstallUnavailableReason(
     destinationConfirmed: Boolean
 ): String? = when {
     analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ->
-        "هذا المحتوى تديره اللعبة داخليًا؛ لا يوجد تثبيت مباشر لهذا النوع."
+        "تم التعرف على الحزمة، لكن عقد الاستيراد الموثق والآمن غير متاح في NFVR؛ لم يتم نقل أي ملف."
     analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED ->
         "تحتاج اللعبة إلى Patch وتجهيز نظام المودات أولًا؛ لا توجد أداة تصحيح مفعّلة في NFVR."
     analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ->
@@ -208,7 +290,7 @@ internal fun modInstallUnavailableReason(
     analysis.outcome == ModInstallOutcome.UNSUPPORTED ||
         analysis.packageType == ModPackageType.UNKNOWN ||
         !analysis.recognized ->
-        "بنية الحزمة غير معروفة أو غير مدعومة؛ لا يوجد مسار تثبيت مباشر."
+        modCustomerFailureReason(analysis)
     !analysis.installable || !analysis.compatibility.compatible ->
         "الخطة غير متوافقة مع اللعبة المحددة."
     analysis.installPlan.hasBlockingPreconditions ->
@@ -864,7 +946,14 @@ private fun QuestPreparationProbeSection(
                              }
                          }
                         if (completed?.warnings?.isNotEmpty() == true) {
-                            Text("تحذير: تعذر إكمال بعض الأدلة.", style = MaterialTheme.typography.bodySmall, color = warningColor())
+                             Text(
+                                 questProbeFailureLabel(
+                                     completed.apkInspectionFailureCode
+                                         ?: completed.warnings.firstOrNull()
+                                 ) ?: "تعذر إكمال بعض الأدلة؛ بقي اكتشاف اللعبة منفصلًا عن فحص APK.",
+                                 style = MaterialTheme.typography.bodySmall,
+                                 color = warningColor()
+                             )
                         }
                     }
                     OutlinedButton(
@@ -1189,7 +1278,7 @@ private fun Modifier.registerDesktopDropTargetIf(
                 }
             }
             Text(
-                customerAnalysisMessage(analysis),
+                modCustomerFailureReason(analysis),
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             StatusNote(outcome.action, Icons.Default.Info, tone)
@@ -1214,7 +1303,7 @@ private fun AnalysisResultCard(analysis: ModPackageAnalysis) {
             Text("نتيجة التحليل", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(outcome.title, style = MaterialTheme.typography.headlineSmall, color = tone)
             Text("النوع: ${displayModPackageType(analysis.packageType)}", style = MaterialTheme.typography.titleMedium)
-            Text(customerAnalysisMessage(analysis), style = MaterialTheme.typography.bodyLarge)
+             Text(modCustomerFailureReason(analysis), style = MaterialTheme.typography.bodyLarge)
             StatusNote(outcome.action, Icons.Default.Info, tone)
             StatusNote(outcome.changedFiles, Icons.Default.Info, tone)
         }
@@ -1289,7 +1378,7 @@ private fun InstallationSuccessCard() {
                 Column(Modifier.weight(1f)) {
                     Text(outcome.title, style = MaterialTheme.typography.titleMedium, color = tone)
                     Text(
-                        customerAnalysisMessage(analysis),
+                         modCustomerFailureReason(analysis),
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -1297,6 +1386,45 @@ private fun InstallationSuccessCard() {
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             InfoGrid(analysis)
+            val archiveTree = analysis.archiveTree
+            if (analysis.installPlan.dependencies.isNotEmpty() ||
+                analysis.installPlan.optionalDependencies.isNotEmpty() ||
+                archiveTree?.dependencyPaths?.isNotEmpty() == true ||
+                archiveTree?.nestedArchivePaths?.isNotEmpty() == true
+            ) {
+                Text("اعتماديات وبنية الأرشيف", style = MaterialTheme.typography.titleMedium)
+                analysis.installPlan.dependencies.forEach { dependency ->
+                    StatusNote(
+                        "اعتمادية مطلوبة: ${dependency.id}" +
+                            (dependency.version?.let { " — الإصدار $it" } ?: "") +
+                            " — يلزم التحقق قبل النقل.",
+                        Icons.Default.Warning,
+                        warningColor()
+                    )
+                }
+                analysis.installPlan.optionalDependencies.forEach { dependency ->
+                    StatusNote(
+                        "اعتمادية اختيارية: ${dependency.id}" +
+                            (dependency.version?.let { " — الإصدار $it" } ?: ""),
+                        Icons.Default.Info,
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                archiveTree?.dependencyPaths?.forEach { path ->
+                    StatusNote(
+                        "ملف اعتماد داخل الأرشيف: $path",
+                        Icons.Default.Info,
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                archiveTree?.nestedArchivePaths?.forEach { path ->
+                    StatusNote(
+                        "أرشيف متداخل لم يُفك تلقائيًا: $path",
+                        Icons.Default.Warning,
+                        warningColor()
+                    )
+                }
+            }
             if (genericDestinationNeedsConfirmation(analysis) ||
                 analysis.installPlan.confirmation != null
             ) {
@@ -1337,7 +1465,9 @@ private fun InstallationSuccessCard() {
                 Text("المتطلبات والتنبيهات", style = MaterialTheme.typography.titleMedium)
                 warnings.forEach { pre ->
                     StatusNote(
-                        customerPreconditionMessage(pre.code),
+                        "${customerPreconditionMessage(pre.code)}${modPreconditionDetail(pre)?.let {
+                            " — $it"
+                        } ?: ""}",
                         if (pre.satisfied) Icons.Default.CheckCircle else Icons.Default.Warning,
                         if (pre.satisfied) MaterialTheme.colorScheme.tertiary else warningColor()
                     )
@@ -1481,6 +1611,24 @@ private fun LoaderRequirementDetails(
                 )
                 Text(destination, style = MaterialTheme.typography.bodyMedium)
             }
+        }
+        Text(
+            "التحقق: ${if (analysis.installPlan.mappings.isNotEmpty()) {
+                "وجود الوجهة والملفات ومطابقة الحجم"
+            } else {
+                "لا توجد ملفات قابلة للتحقق"
+            }}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (analysis.installPlan.dependencies.isNotEmpty()) {
+            Text(
+                "الاعتماديات: " + analysis.installPlan.dependencies.joinToString { dependency ->
+                    dependency.id + (dependency.version?.let { " ($it)" } ?: "")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = warningColor()
+            )
         }
     }
 }

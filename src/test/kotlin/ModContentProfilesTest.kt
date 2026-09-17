@@ -50,7 +50,7 @@ class ModContentProfilesTest {
     }
 
     @Test
-    fun directReadinessRequiresFreshMatchingApkHash() {
+    fun directContentReadinessDoesNotRequireExactApkHash() {
         val archive = zipOf(
             "AvatarPallet/manifest.json" to
                 """{"name":"Avatar Pallet","packageId":"com.StressLevelZero.BONELAB","gameVersion":"1.2974.57485","version":"1.0.0"}""",
@@ -59,11 +59,11 @@ class ModContentProfilesTest {
             "AvatarPallet/avatar.assetbundle" to "bundle"
         )
         val missingHash = analyzer.analyze(archive, bonelab.copy(apkSha256 = null))
-        assertFalse(missingHash.installable)
-        assertTrue(missingHash.plan.preconditions.any { it.code == "APK_SHA256_REQUIRED" })
+        assertTrue(missingHash.installable)
+        assertFalse(missingHash.plan.preconditions.any { it.code == "APK_SHA256_REQUIRED" })
         val wrongHash = analyzer.analyze(archive, bonelab.copy(apkSha256 = "00".repeat(32)))
-        assertFalse(wrongHash.installable)
-        assertTrue(wrongHash.plan.preconditions.any { it.code == "APK_SHA256_UNSUPPORTED" })
+        assertTrue(wrongHash.installable)
+        assertFalse(wrongHash.plan.preconditions.any { it.code == "APK_SHA256_UNSUPPORTED" })
         archive.delete()
 
         val nomadArchive = zipOf(
@@ -73,8 +73,8 @@ class ModContentProfilesTest {
             "NomadMod/content.assetbundle" to "bundle"
         )
         val nomadMissingHash = analyzer.analyze(nomadArchive, nomad.copy(apkSha256 = null))
-        assertFalse(nomadMissingHash.installable)
-        assertTrue(nomadMissingHash.plan.preconditions.any {
+        assertTrue(nomadMissingHash.installable)
+        assertFalse(nomadMissingHash.plan.preconditions.any {
             it.code == "APK_SHA256_REQUIRED"
         })
         nomadArchive.delete()

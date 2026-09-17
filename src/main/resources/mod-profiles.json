@@ -9,6 +9,8 @@
     "modTypes": ["QMOD"],
     "loaderRequirements": ["QUEST_LOADER"],
     "installationStrategies": ["QMOD"],
+    "supportedVersionNames": ["1.1.145"],
+    "supportedVersionCodes": [29679],
     "evidenceLevel": "OPEN_SOURCE_PROJECT",
     "evidenceSources": [
       "https://github.com/Lauriethefish/QuestPatcher",
@@ -107,6 +109,8 @@
     ],
     "loaderRequirements": ["QUEST_LOADER", "SCOTLAND2"],
     "recognizedArchiveSignatures": ["mod.json", "qmod.json"],
+    "supportedVersionNames": ["1.42.2_13885"],
+    "supportedVersionCodes": [2182],
     "evidenceLevel": "OPEN_SOURCE_PROJECT",
     "evidenceSources": [
       "https://github.com/Lauriethefish/QuestPatcher",

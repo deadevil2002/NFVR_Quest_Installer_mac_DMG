@@ -118,6 +118,18 @@ internal fun questProbeLoaderLabel(loader: ProbeLoader): String = when (loader) 
     ProbeLoader.UNKNOWN -> "محمّل غير معروف"
 }
 
+internal fun questProbeFailureLabel(code: String?): String? = when {
+    code.isNullOrBlank() -> null
+    code == "APK_REMOTE_SIZE_LIMIT_EXCEEDED" ->
+        "تعذر فحص APK كبير بالحجم الكامل؛ هذا حد أمان للفحص وليس دليلًا على أن اللعبة غير مدعومة."
+    code == "APK_REMOTE_STAT_UNAVAILABLE" ->
+        "تعذر قراءة حجم APK من النظارة؛ بقيت اللعبة مكتشفة لكن أدلة APK غير مكتملة."
+    code.contains("PATH", ignoreCase = true) ->
+        "تعذر تحديد مسار APK بدقة؛ بقيت نتيجة اكتشاف اللعبة منفصلة عن فشل الدليل."
+    else ->
+        "تعذر إكمال بعض أدلة APK؛ لا تُعد اللعبة غير مثبتة بسبب هذا الفشل."
+}
+
 /**
  * Content-only games are usable when the verified Mods directory exists even
  * if no APK code loader is present. Keep that customer-facing distinction out
@@ -130,6 +142,8 @@ internal fun questProbeGameReadinessLabel(game: QuestProbeGame): String {
     val contentDirectory = (game.androidData.paths + game.modData.paths)
         .any { it.endsWith("/files/Mods") || it.endsWith("/files/mods") }
     return when {
+        contentDirectory && game.loader !in setOf(ProbeLoader.UNKNOWN, ProbeLoader.NONE) ->
+            "مودات المحتوى جاهزة؛ دليل المحمّل متاح أيضًا"
         contentDirectory -> "مودات المحتوى جاهزة للتثبيت"
         game.codeModLoaderState?.let { it != "NONE" && it != "UNKNOWN" } == true ->
             "مود يحتاج محمل"
