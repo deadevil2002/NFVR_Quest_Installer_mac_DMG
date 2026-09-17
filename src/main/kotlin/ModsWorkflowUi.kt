@@ -290,6 +290,8 @@ fun ModsWorkflowUi(
     operationBound: Boolean = false,
     installSucceeded: Boolean = false,
     onInstall: () -> Unit,
+     questPreparation: QuestPreparationUiState? = null,
+     onQuestPreparationAction: () -> Unit = {},
     // Kept for source compatibility with the host screen.  It is intentionally
     // not invoked; built-in content is informational in this UI.
     onOpenExternalUrl: (String) -> Unit = {},
@@ -330,13 +332,16 @@ fun ModsWorkflowUi(
         genericDestinationConfirmed,
         installSucceeded
     )
-    val currentStep = when {
-        selectedApp == null -> 1
-        selectedZipFilename.isNullOrBlank() -> 2
-        analysis == null -> 3
-        workflowSemantics.installCompleted -> 5
-        else -> 4
-    }
+    val overallWorkflow = modsOverallWorkflowState(
+        selectedApp = selectedApp,
+        selectedZipFilename = selectedZipFilename,
+        analysis = analysis,
+        semantics = workflowSemantics,
+        preparation = questPreparation,
+        installing = installing
+    )
+    val currentStep = overallWorkflow.currentStage.ordinal + 1
+    val installActionVisible = modsInstallActionVisible(analysis)
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             LazyColumn(
@@ -368,11 +373,7 @@ fun ModsWorkflowUi(
                 item {
                     WorkflowRail(
                         connected,
-                        selectedApp != null,
-                        !selectedZipFilename.isNullOrBlank(),
-                        workflowSemantics.analysisCompleted,
-                        workflowSemantics.planReviewed,
-                        workflowSemantics.installCompleted
+                        overallWorkflow
                     )
                 }
                 if (deviceSerial != null || deviceModel != null) {
@@ -496,11 +497,7 @@ fun ModsWorkflowUi(
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         CompletedSummaryCard(
                             "التحليل",
-                            if (analysis.isBuiltInGameContent || analysis.isExternalWorkflow) {
-                                "محتوى تديره اللعبة"
-                            } else {
-                                "اكتمل فحص الحزمة"
-                            }
+                             modsAnalysisCompletionLabel(analysis)
                         )
                         OutlinedButton(
                             onClick = {
@@ -531,13 +528,31 @@ fun ModsWorkflowUi(
                 if (selectedApp != null && modSupport != null) {
                     item { ModSupportCard(modSupport) }
                 }
-                item { StepTitle("04", "راجع خطة التثبيت", "لا يبدأ النقل إلا بعد فحص النوع والتوافق والوجهات") }
+                item { StepTitle("04", "الجاهزية", "توضح النتيجة ما إذا كانت الخطة قابلة للتنفيذ الآمن") }
                 if (analysis != null) {
                     item {
                         AnalysisResultCard(analysis)
                     }
                 }
-                if (currentStep == 4 && analysis != null) {
+                item { StepTitle("05", "التحضير عند الحاجة", "جمع أدلة APK ونسخة محلية للقراءة فقط؛ لا يغيّر اللعبة") }
+                if (selectedApp != null && questPreparation != null) {
+                    item {
+                        QuestPreparationCard(
+                            selectedApp = selectedApp,
+                            state = questPreparation,
+                            actionEnabled = questPreparationActionEnabled(
+                                connected = connected,
+                                installing = installing,
+                                analyzing = analyzing,
+                                pickerOpen = pickerOpen,
+                                busy = questPreparation.busy
+                            ),
+                            onAction = onQuestPreparationAction
+                        )
+                    }
+                }
+                item { StepTitle("06", "راجع الخطة", "لا يبدأ النقل إلا بعد فحص النوع والتوافق والوجهات") }
+                if (analysis != null) {
                     item {
                         AnalysisCard(
                             analysis,
@@ -549,7 +564,7 @@ fun ModsWorkflowUi(
                             }
                         )
                     }
-                    if (analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY) {
+                    if (currentStep == 6 && installActionVisible) {
                         item {
                             Button(
                                 onClick = {
@@ -582,32 +597,173 @@ fun ModsWorkflowUi(
                         }
                     }
                 }
-                item { StepTitle("05", "الإجراء", "لا يكتمل إلا بعد نقل الملفات والتحقق منها على النظارة") }
+                item { StepTitle("07", "التثبيت", "يتم نقل الملفات فقط بعد اعتماد خطة مباشرة قابلة للتحقق") }
                 if (analysis != null) item {
-                    if (workflowSemantics.installCompleted) {
-                        InstallationSuccessCard()
+                    val unavailable = modInstallUnavailableReason(
+                        analysis,
+                        operationBound,
+                        genericDestinationConfirmed
+                    )
+                    val outcome = modsUiOutcome(analysis)
+                    val actionText = unavailable ?: if (installing) {
+                        "جارٍ نقل الملفات والتحقق منها على النظارة."
+                    } else if (workflowSemantics.installCompleted) {
+                        "اكتمل نقل الملفات؛ انتقل إلى التحقق."
                     } else {
-                        val unavailable = modInstallUnavailableReason(
-                            analysis,
-                            operationBound,
-                            genericDestinationConfirmed
-                        )
-                        val outcome = modsUiOutcome(analysis)
-                        val actionText = unavailable ?: if (installing) {
-                            "جارٍ نقل الملفات والتحقق منها على النظارة."
-                        } else {
-                            "الخطة جاهزة؛ استخدم زر بدء التثبيت بعد مراجعتها."
-                        }
+                        "الخطة جاهزة؛ استخدم زر اعتماد الخطة بعد مراجعتها."
+                    }
+                    StatusNote(
+                        actionText,
+                        if (unavailable == null) Icons.Default.Info else Icons.Default.Warning,
+                        outcomeColor(outcome.tone)
+                    )
+                }
+                if (installing || executionProgress != null) item { ProgressCard(executionProgress) }
+                item { StepTitle("08", "التحقق", "يُعلن النجاح فقط بعد التحقق البعيد من العملية المباشرة") }
+                if (analysis != null && workflowSemantics.installCompleted) {
+                    item { InstallationSuccessCard() }
+                } else if (analysis != null) {
+                    item {
                         StatusNote(
-                            actionText,
-                            if (unavailable == null) Icons.Default.Info else Icons.Default.Warning,
-                            outcomeColor(outcome.tone)
+                            "لم يكتمل التحقق من تثبيت مباشر.",
+                            Icons.Default.Info,
+                            MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
-                if (installing || executionProgress != null) item { ProgressCard(executionProgress) }
                 item { LogCard(sanitizeModsLogText(logText)) }
                 item { Spacer(Modifier.height(20.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuestPreparationCard(
+    selectedApp: InstalledQuestApp,
+    state: QuestPreparationUiState,
+    actionEnabled: Boolean,
+    onAction: () -> Unit
+) {
+    val report = state.report
+    val rows = questPreparationStageRows(report)
+    val blocked = report?.blockers.orEmpty()
+    val backup = report?.backup
+    var diagnosticsExpanded by remember { mutableStateOf(false) }
+    val actionLabel = when {
+        state.busy -> "جارٍ الفحص…"
+        report == null -> "فحص جاهزية APK — قراءة فقط"
+        backup?.integrityVerified != true -> "إنشاء نسخة APK محلية والتحقق منها"
+        else -> "إعادة فحص نسخة APK المحلية"
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("تحضير اختياري للعبة", style = MaterialTheme.typography.titleMedium)
+            Text(
+                questPreparationSelectedPackageLabel(report?.app ?: selectedApp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                "الفحص والنسخ محليان فقط. النسخة الاحتياطية تشمل APK الأساسي وملفات APK المجزأة فقط؛ لا تشمل OBB أو بيانات التطبيق.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            StatusNote(
+                "لا ينفّذ NFVR تصحيح APK أو توقيعًا أو إلغاء تثبيت أو إعادة تثبيت، ولا يوفّر rollback تنفيذيًا.",
+                Icons.Default.Info,
+                MaterialTheme.colorScheme.primary
+            )
+            StatusNote(
+                questPreparationResultLabel(report),
+                if (report?.readyForModInstall == true) Icons.Default.CheckCircle else Icons.Default.Info,
+                if (report?.readyForModInstall == true) {
+                    MaterialTheme.colorScheme.tertiary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+            rows.forEach { row ->
+                val color = when (row.state) {
+                    QuestStageState.COMPLETE -> MaterialTheme.colorScheme.tertiary
+                    QuestStageState.BLOCKED -> MaterialTheme.colorScheme.error
+                    QuestStageState.NOT_STARTED -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(
+                        if (row.state == QuestStageState.COMPLETE) "✓" else "•",
+                        color = color,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Column(Modifier.weight(1f)) {
+                         Row(
+                             Modifier.fillMaxWidth(),
+                             horizontalArrangement = Arrangement.SpaceBetween,
+                             verticalAlignment = Alignment.CenterVertically
+                         ) {
+                             Text(
+                                 questPreparationStageTitle(row.stage),
+                                 style = MaterialTheme.typography.labelLarge,
+                                 color = color
+                             )
+                             Text(
+                                 questPreparationStageStateLabel(row.state),
+                                 style = MaterialTheme.typography.labelSmall,
+                                 color = color
+                             )
+                         }
+                         Text(
+                             questPreparationStageSummary(row),
+                             style = MaterialTheme.typography.bodySmall
+                         )
+                    }
+                }
+            }
+            backup?.let {
+                StatusNote(
+                     questPreparationBackupLabel(it),
+                    Icons.Default.Info,
+                    if (it.integrityVerified) MaterialTheme.colorScheme.tertiary else warningColor()
+                )
+            }
+             blocked.take(3).forEach { blocker ->
+                StatusNote(
+                     questPreparationBlockerLabel(blocker),
+                    Icons.Default.Warning,
+                    MaterialTheme.colorScheme.error
+                )
+            }
+             if (state.busy) {
+                 Text("جارٍ جمع أدلة القراءة والتحقق المحلي…", style = MaterialTheme.typography.bodySmall)
+             }
+             OutlinedButton(
+                 onClick = { diagnosticsExpanded = !diagnosticsExpanded },
+                 enabled = questPreparationDiagnostics(report).isNotEmpty()
+             ) {
+                 Text(if (diagnosticsExpanded) "إخفاء التفاصيل التقنية" else "عرض التفاصيل التقنية")
+             }
+             if (diagnosticsExpanded) {
+                 SelectionContainer {
+                     Text(
+                         questPreparationDiagnostics(report).joinToString("\n"),
+                         fontFamily = FontFamily.Monospace,
+                         fontSize = 12.sp,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                     )
+                 }
+             }
+             Button(onClick = onAction, enabled = actionEnabled) {
+                if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Default.Refresh, null)
+                Spacer(Modifier.width(8.dp))
+                Text(actionLabel)
             }
         }
     }
@@ -690,30 +846,48 @@ fun ModsWorkflowUi(
 
 @Composable private fun WorkflowRail(
     connected: Boolean,
-    app: Boolean,
-    zip: Boolean,
-    analyzed: Boolean,
-    reviewed: Boolean,
-    complete: Boolean
+    workflow: ModsOverallWorkflowState
 ) {
-    val steps = listOf(
-        "01 اللعبة" to app,
-        "02 الحزمة" to zip,
-        "03 التحليل" to analyzed,
-        "04 الخطة" to reviewed,
-        "05 الإجراء" to complete
-    )
+    val steps = ModsOverallStage.entries
     Row(Modifier.horizontalScroll(rememberScrollState()).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        steps.forEachIndexed { index, pair ->
-            val active = pair.second || (index == 0 && connected)
+        steps.forEachIndexed { index, stage ->
+            val isSkipped = stage in workflow.skipped
+            val isComplete = workflow.complete[stage] == true && !isSkipped
+            val active = isComplete || isSkipped || stage == workflow.currentStage ||
+                (index == 0 && connected)
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(112.dp)) {
-                Box(Modifier.size(28.dp).clip(RoundedCornerShape(9.dp)).background(if (pair.second) MaterialTheme.colorScheme.tertiary else if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-                    if (pair.second) Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onTertiary, modifier = Modifier.size(17.dp))
-                    else Text("${index + 1}", color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                Box(
+                    Modifier.size(28.dp).clip(RoundedCornerShape(9.dp)).background(
+                        when {
+                            isComplete -> MaterialTheme.colorScheme.tertiary
+                            isSkipped -> MaterialTheme.colorScheme.surfaceVariant
+                            active -> MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.surfaceVariant
+                        }
+                    ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isComplete) {
+                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onTertiary, modifier = Modifier.size(17.dp))
+                    } else if (isSkipped) {
+                        Text("—", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                    } else {
+                        Text(
+                            modsOverallStageNumber(stage),
+                            color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
-                Text(pair.first, style = MaterialTheme.typography.labelSmall, color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    modsOverallStageTitle(stage),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-            if (index < steps.lastIndex) HorizontalDivider(Modifier.width(34.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            if (index < steps.lastIndex) {
+                HorizontalDivider(Modifier.width(34.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            }
         }
     }
 }
@@ -937,7 +1111,7 @@ private fun InstallationSuccessCard() {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "ملف اللعبة: ${state.profileName ?: "غير معروف"} · المحمّل: ${state.loader}",
+                "ملف اللعبة: ${state.profileName ?: "غير معروف"} · دليل القراءة: ${state.loader}",
                 style = MaterialTheme.typography.bodySmall
             )
             state.existingDirectory?.let {

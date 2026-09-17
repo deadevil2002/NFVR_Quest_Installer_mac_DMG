@@ -173,6 +173,107 @@ class ModsWorkflowPureTest {
         assertTrue(modInstallUnavailableReason(loader, true, true)!!.isNotBlank())
     }
 
+    @Test
+    fun questPreparationPresentationUsesStableArabicCustomerCopy() {
+        QuestPreparationStage.entries.forEach { stage ->
+            val title = questPreparationStageTitle(stage)
+            assertTrue(title.any { it in '\u0600'..'\u06FF' })
+            assertFalse(title.contains(stage.name))
+            assertFalse(
+                questPreparationStageSummary(
+                    QuestPreparationStageResult(stage, QuestStageState.BLOCKED, "raw engine detail")
+                ).contains("raw engine detail")
+            )
+        }
+        val blocker = QuestPreparationBlocker(
+            code = "UNSUPPORTED_GAME_VERSION",
+            detail = "package=com.example.game version=9.9.9",
+            scope = "profile-registry"
+        )
+        assertEquals("إصدار اللعبة غير مدعوم للتحضير الموثوق.", questPreparationBlockerLabel(blocker))
+        assertFalse(questPreparationBlockerLabel(blocker).contains(blocker.code))
+    }
+
+    @Test
+    fun preparationDiagnosticsAreOptInAndRetainTechnicalEvidence() {
+        val report = QuestPreparationReport(
+            app = InstalledQuestApp("com.example.game", versionName = "1.0.0"),
+            stages = listOf(
+                QuestPreparationStageResult(
+                    QuestPreparationStage.CHECK_PROFILE,
+                    QuestStageState.BLOCKED,
+                    "profile=exact-v1"
+                )
+            ),
+            blockers = listOf(
+                QuestPreparationBlocker("UNSUPPORTED_GAME_VERSION", "versionCode=9", "profile-registry")
+            ),
+            backup = QuestBackupStatus(false, false, reason = "hash mismatch")
+        )
+        assertEquals("الجاهزية متوقفة بسبب متطلبات غير مكتملة.", questPreparationResultLabel(report))
+        assertTrue(questPreparationDiagnostics(report).any { it.contains("profile=exact-v1") })
+        assertTrue(questPreparationDiagnostics(report).any { it.contains("hash mismatch") })
+    }
+
+    @Test
+    fun overallWorkflowHasEightSemanticStagesAndPreparationCannotCompletePatch() {
+        val patch = testAnalysis(
+            ModInstallOutcome.APK_PATCH_REQUIRED,
+            ModPackageType.GENERIC_DATA
+        )
+        val state = modsOverallWorkflowState(
+            selectedApp = InstalledQuestApp("com.example.game", versionName = "1.0.0"),
+            selectedZipFilename = "mod.qmod",
+            analysis = patch,
+            semantics = modsWorkflowSemantics(patch, true, true, true),
+            preparation = QuestPreparationUiState(
+                report = QuestPreparationReport(
+                    app = InstalledQuestApp("com.example.game", versionName = "1.0.0"),
+                    assessment = QuestPreparationAssessment(true),
+                    backup = QuestBackupStatus(true, true),
+                    modStrategyReady = false
+                )
+            ),
+            installing = false
+        )
+        assertEquals(8, ModsOverallStage.entries.size)
+        assertEquals(
+            listOf("01", "02", "03", "04", "05", "06", "07", "08"),
+            ModsOverallStage.entries.map(::modsOverallStageNumber)
+        )
+        assertEquals(ModsOverallStage.PREPARATION, state.currentStage)
+        assertFalse(state.complete.getValue(ModsOverallStage.REVIEW))
+        assertFalse(state.complete.getValue(ModsOverallStage.INSTALL))
+        assertFalse(state.complete.getValue(ModsOverallStage.VERIFY))
+    }
+
+    @Test
+    fun directReadyWorkflowSkipsPreparationWithoutChangingCompletionSemantics() {
+        val direct = testAnalysis(ModInstallOutcome.DIRECT_INSTALL_READY, ModPackageType.QMOD)
+        val state = modsOverallWorkflowState(
+            selectedApp = InstalledQuestApp("com.example.game", versionName = "1.0.0"),
+            selectedZipFilename = "mod.qmod",
+            analysis = direct,
+            semantics = modsWorkflowSemantics(direct, true, true, true),
+            preparation = QuestPreparationUiState(),
+            installing = false
+        )
+        assertTrue(ModsOverallStage.PREPARATION in state.skipped)
+        assertTrue(state.complete.getValue(ModsOverallStage.REVIEW))
+        assertTrue(state.complete.getValue(ModsOverallStage.INSTALL))
+        assertTrue(state.complete.getValue(ModsOverallStage.VERIFY))
+    }
+
+    @Test
+    fun preparationActionRequiresConnectionAndAllBusyGuards() {
+        assertTrue(questPreparationActionEnabled(true, false, false, false, false))
+        assertFalse(questPreparationActionEnabled(false, false, false, false, false))
+        assertFalse(questPreparationActionEnabled(true, true, false, false, false))
+        assertFalse(questPreparationActionEnabled(true, false, true, false, false))
+        assertFalse(questPreparationActionEnabled(true, false, false, true, false))
+        assertFalse(questPreparationActionEnabled(true, false, false, false, true))
+    }
+
     private fun testAnalysis(
         outcome: ModInstallOutcome,
         packageType: ModPackageType = ModPackageType.UNKNOWN

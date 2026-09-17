@@ -1,6 +1,9 @@
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.text.Normalizer
 import java.security.MessageDigest
@@ -89,6 +92,12 @@ class ModPackageAnalyzer(
             val rootMod = archive.metadata["mod.json"]
             val rootPackage = archive.metadata["package.json"]
             val rootNfvr = archive.metadata["nfvr-mod.json"]
+            if (rootMod != null && archive.traversalEntries.isNotEmpty()) {
+                throw ModPackageException(
+                    "QMOD ZIP entries may not contain traversal components: " +
+                        archive.traversalEntries.joinToString(", ")
+                )
+            }
 
             when {
                 rootMod != null -> analyzeQmod(archive, rootMod, installedApp, loaderDetection)
@@ -147,10 +156,12 @@ class ModPackageAnalyzer(
         val hashes = linkedMapOf<String, String>()
         val prefixes = linkedMapOf<String, ByteArray>()
         val directories = linkedSetOf<String>()
+        val traversalEntries = mutableListOf<String>()
         val collisionKeys = mutableSetOf<String>()
         var declaredBytes = 0L
 
         ZipFile(zipFile).use { zip ->
+            rejectZip64OrUnsafeLinks(zipFile, zip)
             val iterator = zip.entries()
             var count = 0
             while (iterator.hasMoreElements()) {
@@ -159,6 +170,7 @@ class ModPackageAnalyzer(
                 if (count > MAX_ZIP_ENTRIES) {
                     throw ModPackageException("ZIP contains more than $MAX_ZIP_ENTRIES entries.")
                 }
+                if (hasTraversalComponent(entry.name)) traversalEntries += entry.name
                 val safeName = validateEntryName(entry.name)
                 // "./" is a valid directory marker but has no installable
                 // path of its own.  Keep inspecting the rest of the archive.
@@ -181,7 +193,13 @@ class ModPackageAnalyzer(
                         throw ModPackageException("ZIP declares more data than the safe archive limit.")
                     }
                 }
-                if (!entry.isDirectory && safeName in ROOT_METADATA_NAMES) {
+                if (safeName in ROOT_METADATA_NAMES && entry.name != safeName) {
+                    throw ModPackageException(
+                        "ZIP manifest '$safeName' must use its exact root entry name.",
+                        entry.name
+                    )
+                }
+                if (!entry.isDirectory && entry.name == safeName && safeName in ROOT_METADATA_NAMES) {
                     if (metadata.containsKey(safeName)) {
                         throw ModPackageException("ZIP contains duplicate metadata entry '$safeName'.")
                     }
@@ -227,7 +245,16 @@ class ModPackageAnalyzer(
             lastModifiedMillis = zipFile.lastModified(),
             sha256 = sha256File(zipFile)
         )
-        return ArchiveMetadata(entries, metadata, sizes, hashes, directories, prefixes, identity)
+        return ArchiveMetadata(
+            entries,
+            metadata,
+            sizes,
+            hashes,
+            directories,
+            prefixes,
+            identity,
+            traversalEntries
+        )
     }
 
     private fun digestPrefix(existing: ByteArray?, buffer: ByteArray, read: Int): ByteArray {
@@ -250,8 +277,129 @@ class ModPackageAnalyzer(
                 out.write(buffer, 0, read)
             }
         }
-        return out.toString(StandardCharsets.UTF_8.name())
+        val bytes = out.toByteArray()
+        if (bytes.size >= 3 &&
+            bytes[0] == 0xef.toByte() &&
+            bytes[1] == 0xbb.toByte() &&
+            bytes[2] == 0xbf.toByte()
+        ) {
+            throw ModPackageException("Metadata entry '$name' must be UTF-8 JSON without a BOM.")
+        }
+        return try {
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+        } catch (e: Exception) {
+            throw ModPackageException("Metadata entry '$name' is not valid UTF-8.")
+        }
     }
+
+    /**
+     * QMOD is defined as a regular PKWARE ZIP, not ZIP64, and archive entries
+     * must be ordinary files/directories rather than filesystem links.  The
+     * JDK ZIP API intentionally hides the central-directory attributes, so
+     * inspect those bounded headers before accepting the archive.
+     */
+    private fun rejectZip64OrUnsafeLinks(zipFile: File, zip: ZipFile) {
+        val iterator = zip.entries()
+        var count = 0
+        while (iterator.hasMoreElements()) {
+            val entry = iterator.nextElement()
+            count++
+            if (count > MAX_ZIP_ENTRIES) {
+                throw ModPackageException("ZIP contains more than $MAX_ZIP_ENTRIES entries.")
+            }
+            if (hasZip64Extra(entry.extra)) {
+                throw ModPackageException("ZIP64 archives are not supported.")
+            }
+        }
+        RandomAccessFile(zipFile, "r").use { file ->
+            val tailLength = minOf(file.length(), 65_557L).toInt()
+            val tail = ByteArray(tailLength)
+            file.seek(file.length() - tailLength)
+            file.readFully(tail)
+            val eocd = findEndOfCentralDirectory(tail)
+            if (eocd < 0) throw ModPackageException("ZIP end-of-central-directory record is missing.")
+            // A ZIP64 locator or record immediately preceding the EOCD is
+            // enough to reject the format; do not scan arbitrary payload bytes.
+            val hasZip64Locator = eocd >= 20 &&
+                readUnsignedInt(tail, eocd - 20) == 0x07064b50L
+            val hasZip64Record = eocd >= 76 &&
+                readUnsignedInt(tail, eocd - 76) == 0x06064b50L
+            if (hasZip64Locator || hasZip64Record) {
+                throw ModPackageException("ZIP64 archives are not supported.")
+            }
+            val totalEntries = readUnsignedShort(tail, eocd + 10)
+            val centralOffset = readUnsignedInt(tail, eocd + 16)
+            if (totalEntries == 0xffff || centralOffset == 0xffffffffL) {
+                throw ModPackageException("ZIP64 archives are not supported.")
+            }
+            if (centralOffset >= file.length()) {
+                throw ModPackageException("ZIP central directory is outside the archive.")
+            }
+            file.seek(centralOffset)
+            repeat(totalEntries) {
+                val header = ByteArray(46)
+                file.readFully(header)
+                if (readUnsignedInt(header, 0) != 0x02014b50L) {
+                    throw ModPackageException("ZIP central directory is malformed.")
+                }
+                val versionMadeBy = readUnsignedShort(header, 4)
+                val externalAttributes = readUnsignedInt(header, 38)
+                val nameLength = readUnsignedShort(header, 28)
+                val extraLength = readUnsignedShort(header, 30)
+                val commentLength = readUnsignedShort(header, 32)
+                if ((versionMadeBy ushr 8) == 3 &&
+                    (externalAttributes ushr 16 and 0xf000L) == 0xa000L
+                ) {
+                    throw ModPackageException("ZIP symbolic links are not supported.")
+                }
+                file.skipBytes(nameLength + extraLength + commentLength)
+            }
+        }
+    }
+
+    private fun hasZip64Extra(extra: ByteArray?): Boolean {
+        if (extra == null) return false
+        var offset = 0
+        while (offset + 4 <= extra.size) {
+            val id = (extra[offset].toInt() and 0xff) or
+                ((extra[offset + 1].toInt() and 0xff) shl 8)
+            val length = (extra[offset + 2].toInt() and 0xff) or
+                ((extra[offset + 3].toInt() and 0xff) shl 8)
+            if (offset + 4 + length > extra.size) return true
+            if (id == 0x0001) return true
+            offset += 4 + length
+        }
+        return offset != extra.size
+    }
+
+    private fun hasTraversalComponent(raw: String): Boolean =
+        raw.replace('\\', '/').split('/').any { it == "." || it == ".." }
+
+    private fun findEndOfCentralDirectory(bytes: ByteArray): Int {
+        for (index in bytes.size - 4 downTo 0) {
+            if (readUnsignedInt(bytes, index) == 0x06054b50L &&
+                index + 22 <= bytes.size &&
+                index + 22 + readUnsignedShort(bytes, index + 20) == bytes.size
+            ) {
+                return index
+            }
+        }
+        return -1
+    }
+
+    private fun readUnsignedShort(bytes: ByteArray, offset: Int): Int =
+        (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8)
+
+    private fun readUnsignedInt(bytes: ByteArray, offset: Int): Long =
+        (bytes[offset].toLong() and 0xffL) or
+            ((bytes[offset + 1].toLong() and 0xffL) shl 8) or
+            ((bytes[offset + 2].toLong() and 0xffL) shl 16) or
+            ((bytes[offset + 3].toLong() and 0xffL) shl 24)
 
     private fun analyzeQmod(
         archive: ArchiveMetadata,
@@ -262,9 +410,17 @@ class ModPackageAnalyzer(
         val target = json.optString("packageId", "").trim().ifBlank { null }
         val profile = target?.let(profileRegistry::findByPackageId)
         val preconditions = mutableListOf<ModInstallPrecondition>()
+        if (json.has("packageId") && json.opt("packageId") !is String) {
+            preconditions += blocked(
+                "INVALID_PACKAGE_ID",
+                "QMOD packageId must be a JSON string."
+            )
+        }
         validateQmodSchema(json, preconditions)
         if (target == null) {
             preconditions += blocked("TARGET_PACKAGE_MISSING", "QMOD does not declare a target packageId.")
+        } else if (!PACKAGE_ID.matches(target)) {
+            preconditions += blocked("INVALID_PACKAGE_ID", "QMOD packageId must be a valid Android package identifier.")
         } else if (installedApp == null) {
             preconditions += blocked("TARGET_APP_REQUIRED", "Select the installed Quest app before installing this QMOD.")
         } else if (installedApp.packageName != target) {
@@ -277,14 +433,16 @@ class ModPackageAnalyzer(
         }
         // Gorilla Tag has no current authoritative Quest loader/path contract.
         // Do not let its conservative classification become a guessed write:
-        // an explicit loader declaration and authenticated QuestPatcher tag
-        // are both required before loader-defined destinations are usable.
+        // An explicit loader declaration, or a canonical loader-root copy,
+        // must be paired with authenticated QuestPatcher evidence before a
+        // Gorilla destination is usable.
         val loaderValue = json.optString("modloader", "").trim()
         val isGorillaTag = target == GORILLA_TAG_PACKAGE_ID
-        if (isGorillaTag && loaderValue.isBlank()) {
+        val hasCanonicalGorillaCopy = isGorillaTag && hasCanonicalGorillaLoaderCopy(json)
+        if (isGorillaTag && loaderValue.isBlank() && !hasCanonicalGorillaCopy) {
             preconditions += blocked(
                 "MOD_LOADER_REQUIRED",
-                "Gorilla Tag Quest compatibility is not established; this QMOD must declare a loader and use authenticated QuestPatcher evidence."
+                "Gorilla Tag Quest compatibility is not established; this QMOD must declare a loader or use an authenticated QuestLoader destination with read-only loader evidence."
             )
         }
         val loader = ModLoaderKind.parse(loaderValue)
@@ -309,6 +467,9 @@ class ModPackageAnalyzer(
         val containsLoaderFiles = listOf("modFiles", "lateModFiles", "libraryFiles")
             .any { json.optJSONArray(it)?.length()?.let { length -> length > 0 } == true }
         val effectiveLoader = loader ?: if (containsLoaderFiles) ModLoaderKind.QUEST_LOADER else null
+        val gorillaCopyNeedsQuestLoader = isGorillaTag &&
+            effectiveLoader == null &&
+            hasCanonicalGorillaCopy
         if (profile == null && target != null && effectiveLoader == null) {
             // Explicit loader-relative fields derive their standardized root
             // from target+loader; unregistered packages remain limited to
@@ -321,6 +482,7 @@ class ModPackageAnalyzer(
         }
         val requiresLoader = when {
             effectiveLoader != null -> setOf(effectiveLoader)
+            gorillaCopyNeedsQuestLoader -> setOf(ModLoaderKind.QUEST_LOADER)
             else -> emptySet()
         }
         val loaderRequirement = loaderRequirement(
@@ -339,6 +501,14 @@ class ModPackageAnalyzer(
             )
         }
         checkQmodPackageVersion(json, installedApp, preconditions)
+        if (json.has("dependencies") &&
+            (json.opt("dependencies") == null || json.opt("dependencies") == JSONObject.NULL)
+        ) {
+            preconditions += blocked(
+                "INVALID_DEPENDENCY",
+                "QMOD dependencies must be a non-empty array or dependency object."
+            )
+        }
         val declaredDependencies = parseDependencies(
             json.opt("dependencies"),
             optional = false,
@@ -353,9 +523,9 @@ class ModPackageAnalyzer(
             )
         }
         if (dependencyOptionals.isNotEmpty()) {
-            preconditions += satisfied(
-                "OPTIONAL_DEPENDENCIES_UNRESOLVED",
-                "Optional QMOD dependencies were recorded for review; NFVR will not download them automatically."
+            preconditions += blocked(
+                "OPTIONAL_DEPENDENCIES_UNVERIFIED",
+                "Optional QMOD dependencies cannot be verified because NFVR has no installed-mod inventory or range resolver."
             )
         }
         val patchRequirement = if (hasPatchingRequirement(json)) {
@@ -369,6 +539,10 @@ class ModPackageAnalyzer(
             )
         } else null
         addStrictQmodSchemaPreconditions(json, preconditions)
+        // Native QMOD payloads are checked below against the declared loader,
+        // ARM64 ELF header, and canonical loader root.  Applying the generic
+        // deny rule here as well would reject the valid, explicitly mapped
+        // QuestLoader/Scotland2 library case.
         addDangerousPayloadPrecondition(archive, preconditions)
 
         val mappings = parseQmodMappings(
@@ -440,15 +614,17 @@ class ModPackageAnalyzer(
                             val allowed = setOf("name", "destination")
                             if (item.keys().asSequence().any { it !in allowed } ||
                                 !item.has("destination") ||
-                                !item.has("name")
+                                !item.has("name") ||
+                                item.opt("name") !is String ||
+                                item.opt("destination") !is String
                             ) {
                                 preconditions += blocked(
                                     "INVALID_FILE_COPIES",
-                                    "QMOD fileCopies requires canonical name and destination fields only."
+                                    "QMOD fileCopies requires string name and destination fields only."
                                 )
                                 continue
                             }
-                            val source = item.optString("name", "")
+                            val source = item.getString("name")
                             val destination = item.getString("destination")
                             if (target == GORILLA_TAG_PACKAGE_ID &&
                                 !isGorillaQuestLoaderDestination(destination)
@@ -478,7 +654,15 @@ class ModPackageAnalyzer(
 
         val listedFields = listOf("modFiles", "lateModFiles", "libraryFiles")
         for (field in listedFields) {
-            val list = json.optJSONArray(field) ?: continue
+            if (!json.has(field)) continue
+            val list = json.optJSONArray(field)
+            if (list == null) {
+                preconditions += blocked(
+                    "INVALID_QMOD_MAPPING",
+                    "QMOD $field must be an array of non-empty string source paths."
+                )
+                continue
+            }
             for (i in 0 until list.length()) {
                 val raw = list.opt(i)
                 if (raw !is String || raw.trim().isEmpty()) {
@@ -562,6 +746,50 @@ class ModPackageAnalyzer(
                 )
             }
         }
+        // Keep the legacy field-presence compatibility path, but never allow
+        // malformed identity values through it.  Modern QMOD schemas require
+        // all four values; every schema still treats id as a non-whitespace
+        // identifier and version as semantic when supplied.
+        val id = json.opt("id")
+        if (id != null && id != JSONObject.NULL &&
+            (id !is String || id.trim().isEmpty() || id.any { it.isWhitespace() })
+        ) {
+            preconditions += blocked(
+                "INVALID_QMOD_ID",
+                "QMOD id must be a non-empty identifier without whitespace."
+            )
+        }
+        listOf("name", "author").forEach { key ->
+            val value = json.opt(key)
+            if (value != null && value != JSONObject.NULL &&
+                (value !is String || value.trim().isEmpty())
+            ) {
+                preconditions += blocked(
+                    "INVALID_QMOD_FIELD",
+                    "QMOD $key must be a non-empty string."
+                )
+            }
+        }
+        if (json.has("version") && json.opt("version") !is String) {
+            preconditions += blocked("INVALID_QMOD_VERSION", "QMOD version must be a semantic-version string.")
+        }
+        if (json.has("modloader") && json.opt("modloader") !is String) {
+            preconditions += blocked("INVALID_QMOD_LOADER", "QMOD modloader must be a string.")
+        }
+        listOf("description", "coverImage", "porter").forEach { key ->
+            if (json.has(key) && json.opt(key) !is String) {
+                preconditions += blocked(
+                    "INVALID_QMOD_FIELD",
+                    "QMOD $key must be a string."
+                )
+            }
+        }
+        if (json.has("isLibrary") && json.opt("isLibrary") !is Boolean) {
+            preconditions += blocked(
+                "INVALID_QMOD_FIELD",
+                "QMOD isLibrary must be a boolean."
+            )
+        }
         val contentFields = listOf(
             "modFiles", "lateModFiles", "libraryFiles", "dependencies", "fileCopies"
         )
@@ -590,6 +818,8 @@ class ModPackageAnalyzer(
                     val item = raw.optJSONObject(i)
                     if (item == null ||
                         item.keys().asSequence().any { it !in setOf("extension", "destination") } ||
+                        item.opt("extension") !is String ||
+                        item.opt("destination") !is String ||
                         item.optString("extension").isBlank() ||
                         item.optString("destination").isBlank()
                     ) {
@@ -637,18 +867,19 @@ class ModPackageAnalyzer(
                             "QMOD dependency objects contain unsupported fields."
                         )
                     }
-                    val id = value.optString("id")
-                        .ifBlank { value.optString("modId") }
-                        .ifBlank { value.optString("packageId") }
+                    val idValue = value.opt("id")
+                    val versionValue = value.opt("version")
+                    val downloadValue = value.opt("downloadIfMissing")
+                    val id = (idValue as? String)
+                        ?.trim()
+                        .orEmpty()
                         .ifBlank { fallbackId.orEmpty() }
-                    val version = value.optString("version")
-                        .ifBlank { value.optString("versionRange") }
-                        .ifBlank { null }
-                    val sourceUrl = value.optString("downloadIfMissing")
-                        .ifBlank { value.optString("url") }
-                        .ifBlank { value.optString("downloadUrl") }
-                        .ifBlank { null }
-                    val canonicalArrayEntry = fallbackId == null
+                    val version = (versionValue as? String)
+                        ?.trim()
+                        ?.ifBlank { null }
+                    val sourceUrl = (downloadValue as? String)
+                        ?.trim()
+                        ?.ifBlank { null }
                     val requiredValue = if (value.has("required")) {
                         value.opt("required") as? Boolean
                     } else {
@@ -659,12 +890,17 @@ class ModPackageAnalyzer(
                             "INVALID_DEPENDENCY",
                             "QMOD dependency required must be a boolean."
                         )
-                    } else if (id.isBlank() ||
-                        (canonicalArrayEntry && version.isNullOrBlank())
+                    } else if ((value.has("id") && idValue !is String) ||
+                        (value.has("version") && versionValue !is String) ||
+                        (value.has("downloadIfMissing") && downloadValue !is String) ||
+                        id.isBlank() ||
+                        id.any { it.isWhitespace() } ||
+                        version.isNullOrBlank() ||
+                        !isSafeQmodVersionRange(version)
                     ) {
                         preconditions += blocked(
                             "INVALID_DEPENDENCY",
-                            "QMOD dependency entries must declare non-empty id and version."
+                            "QMOD dependency entries must declare string id and a valid version range."
                         )
                     } else {
                         val isOptional = optional || !requiredValue
@@ -678,15 +914,17 @@ class ModPackageAnalyzer(
                     }
                 }
                 is String -> {
-                    val id = value.trim().ifBlank { fallbackId.orEmpty() }
-                    if (id.isBlank() || fallbackId == null) {
+                    val id = fallbackId.orEmpty().trim()
+                    val version = value.trim()
+                    if (id.isBlank() || !isSafeQmodVersionRange(version)) {
                         preconditions += blocked(
                             "INVALID_DEPENDENCY",
-                            "QMOD dependency entries must be objects with id and version."
+                            "QMOD dependency map entries must use a non-empty ID and version range."
                         )
                     } else {
                         result += ModPackageDependency(
                             id = id,
+                            version = version,
                             optional = optional,
                             required = !optional
                         )
@@ -694,18 +932,46 @@ class ModPackageAnalyzer(
                 }
                 else -> preconditions += blocked(
                     "INVALID_DEPENDENCY",
-                    "QMOD dependencies must be objects, IDs, or an ID map."
+                    "QMOD dependency entries must be objects or ID-to-range map values."
                 )
             }
         }
 
         when (raw) {
             is JSONArray -> for (index in 0 until raw.length()) add(raw.opt(index))
-            is JSONObject -> for (key in raw.keys()) add(raw.opt(key), key)
-            is String -> add(raw)
+            is JSONObject -> {
+                if (raw.has("id") || raw.has("version") || raw.has("required") ||
+                    raw.has("downloadIfMissing")
+                ) {
+                    add(raw)
+                } else {
+                    for (key in raw.keys()) add(raw.opt(key), key)
+                }
+            }
+            is String -> preconditions += blocked(
+                "INVALID_DEPENDENCY",
+                "QMOD dependencies must be an array or dependency object, not a bare string."
+            )
             else -> preconditions += blocked(
                 "INVALID_DEPENDENCY",
-                "QMOD dependencies must be an array, object, or ID."
+                "QMOD dependencies must be an array or dependency object."
+            )
+        }
+        if ((raw is JSONArray && raw.length() == 0) ||
+            (raw is JSONObject && raw.length() == 0)
+        ) {
+            preconditions += blocked(
+                "INVALID_DEPENDENCY",
+                "QMOD dependencies must not be an empty array or object."
+            )
+        }
+        val duplicateIds = result.groupBy { it.id }.filterValues { values ->
+            values.size > 1
+        }.keys
+        if (duplicateIds.isNotEmpty()) {
+            preconditions += blocked(
+                "DUPLICATE_DEPENDENCY",
+                "QMOD dependency IDs must be unique: ${duplicateIds.joinToString()}."
             )
         }
         return result.distinctBy { it.id to it.version }
@@ -768,6 +1034,15 @@ class ModPackageAnalyzer(
         return AndroidPathValidator.isSafe(normalized) &&
             (normalized == mods || normalized.startsWith("$mods/") ||
                 normalized == libs || normalized.startsWith("$libs/"))
+    }
+
+    private fun hasCanonicalGorillaLoaderCopy(json: JSONObject): Boolean {
+        val copies = json.optJSONArray("fileCopies") ?: return false
+        return (0 until copies.length()).any { index ->
+            val item = copies.optJSONObject(index)
+            val destination = item?.opt("destination") as? String ?: return@any false
+            isGorillaQuestLoaderDestination(destination)
+        }
     }
 
     private fun androidLayoutPath(entry: String, root: String): String? {
@@ -1630,11 +1905,18 @@ class ModPackageAnalyzer(
         }
         val sourceCollision = collisionKey(sourcePath)
         val destinationCollision = collisionKey(fullDestination)
-        val collision = mappings.firstOrNull {
-            collisionKey(it.sourcePath) == sourceCollision ||
-                collisionKey(it.destinationPath) == destinationCollision
+        val sourceCollisionEntry = mappings.firstOrNull {
+            collisionKey(it.sourcePath) == sourceCollision
         }
-        if (collision != null) {
+        val destinationCollisionEntry = mappings.firstOrNull {
+            collisionKey(it.destinationPath) == destinationCollision
+        }
+        if (destinationCollisionEntry != null ||
+            (sourceCollisionEntry != null &&
+                (sourceCollisionEntry.sha256 != actualSha256 ||
+                    sourceCollisionEntry.sizeBytes != size))
+        ) {
+            val collision = destinationCollisionEntry ?: sourceCollisionEntry!!
             val same = collisionKey(collision.sourcePath) == sourceCollision &&
                 collisionKey(collision.destinationPath) == destinationCollision
             preconditions += blocked(
@@ -1860,12 +2142,19 @@ class ModPackageAnalyzer(
         preconditions: MutableList<ModInstallPrecondition>
     ) {
         if (!json.has("packageVersion")) return
+        if (json.opt("packageVersion") !is String) {
+            preconditions += blocked(
+                "INVALID_PACKAGE_VERSION",
+                "QMOD packageVersion must be a JSON string."
+            )
+            return
+        }
         val requested = json.optString("packageVersion", "").trim()
         if (requested.isBlank()) {
             preconditions += blocked("INVALID_PACKAGE_VERSION", "QMOD packageVersion must be a non-empty version.")
         } else if (app?.versionName == null) {
             preconditions += blocked("GAME_VERSION_REQUIRED", "QMOD declares packageVersion but the installed version is unavailable.")
-        } else if (compareVersions(app.versionName, requested) != 0) {
+        } else if (app.versionName.trim() != requested) {
             preconditions += blocked(
                 "GAME_VERSION_UNSUPPORTED",
                 "QMOD targets game version '$requested', but the installed version is '${app.versionName}'."
@@ -2255,6 +2544,22 @@ class ModPackageAnalyzer(
         return normalized
     }
 
+    /**
+     * QMOD dependency versions are ranges rather than arbitrary download
+     * directives.  Keep this intentionally conservative: accept the common
+     * SemVer operators/wildcards and reject URLs, control characters, and
+     * operator-only values without attempting to resolve a range locally.
+     */
+    private fun isSafeQmodVersionRange(value: String?): Boolean {
+        val range = value?.trim().orEmpty()
+        if (range.isEmpty() || range.length > 200) return false
+        if (range.any { it.isISOControl() || it == '/' || it == '\\' || it == ':' }) return false
+        if (range.contains("..")) return false
+        if (range.none { it.isDigit() || it == '*' || it == 'x' || it == 'X' }) return false
+        val allowed = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.*+<>=~^| -"
+        return range.all { it in allowed }
+    }
+
     private fun looksLikeGenericModPayload(path: String): Boolean {
         val lower = path.lowercase()
         return lower.endsWith(".so") ||
@@ -2284,7 +2589,8 @@ class ModPackageAnalyzer(
         val hashes: Map<String, String> = emptyMap(),
         val directories: Set<String> = emptySet(),
         val prefixes: Map<String, ByteArray> = emptyMap(),
-        val identity: ModArchiveIdentity? = null
+        val identity: ModArchiveIdentity? = null,
+        val traversalEntries: List<String> = emptyList()
     )
 
     private class ModPackageException(

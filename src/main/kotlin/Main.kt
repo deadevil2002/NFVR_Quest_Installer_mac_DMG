@@ -432,7 +432,7 @@ open class AdbClient(private val bundled: BundledAdb) {
         return runProcess(listOf(adb.absolutePath, "start-server"), workDir = dir)
     }
 
-    fun devices(): CmdResult {
+    open fun devices(): CmdResult {
         val (adb, dir) = adbBase()
         return runProcess(listOf(adb.absolutePath, "devices", "-l"), workDir = dir)
     }
@@ -652,6 +652,7 @@ fun main() {
     val bundledAdb = remember { BundledAdb(host) }
     val adb = remember { AdbClient(bundledAdb) }
     val modsManager = remember { ModsManager(adb) }
+    val questPreparationEngine = remember { QuestPreparationEngine(adb) }
     val modAnalysisController = remember {
         QuestModAnalysisController { request ->
             modsManager.analyzeModPackage(request.serial, request.archive, request.app)
@@ -714,6 +715,7 @@ fun main() {
     var modPlanId by remember { mutableStateOf<String?>(null) }
     var destinationConfirmedPlanId by remember { mutableStateOf<String?>(null) }
     var modSupport by remember { mutableStateOf<ModSupportUiState?>(null) }
+    var questPreparation by remember { mutableStateOf<QuestPreparationUiState?>(null) }
     var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
@@ -889,6 +891,7 @@ fun main() {
             appScanProgress = null
             selectedApp = null
             modSupport = null
+            questPreparation = null
             if (lostDuringInstall) {
                 modInstallDeviceLost = true
                 statusText = "الحالة: فقد الاتصال — انتظار إنهاء النقل الحالي"
@@ -911,10 +914,11 @@ fun main() {
         // Scanner progress callbacks are marshalled to Dispatchers.Main.immediate
         // before this helper is called; never clear Compose focus from ADB IO.
         focusClearRegistry.clearBeforeUiMutation()
-        if (selectedApp != null &&
-            (next == null || !sameInstalledAppSnapshot(selectedApp, next))
+        if (selectedApp == null && next != null ||
+            selectedApp != null && (next == null || !sameInstalledAppSnapshot(selectedApp, next))
         ) {
             invalidateModOperation(clearFocus = false)
+            if (selectedApp != null) questPreparation = null
         }
         selectedApp = next
     }
@@ -2042,6 +2046,10 @@ fun main() {
     }
 
     suspend fun discoverModSupport(app: InstalledQuestApp, serial: String) {
+        val requestGeneration = modOperationGeneration
+        if (connectedDeviceSerial != serial ||
+            !sameInstalledAppSnapshot(selectedApp, app)
+        ) return
         val profile = GameModProfileRegistry.findByPackageId(app.packageName)
         modSupport = ModSupportUiState(
             serial = serial,
@@ -2060,19 +2068,173 @@ fun main() {
                 adb.shell(serial, "test", "-d", path).exit == 0
             }
         }
-        if (connectedDeviceSerial != serial || selectedApp?.packageName != app.packageName) return
+        if (requestGeneration != modOperationGeneration ||
+            connectedDeviceSerial != serial ||
+            !sameInstalledAppSnapshot(selectedApp, app)
+        ) return
         modSupport = ModSupportUiState(
             serial = serial,
             packageId = app.packageName,
             profileName = profile?.displayName,
             existingDirectory = result,
-            loader = if (result != null) "تم العثور على مسار محتمل" else "غير مكتشف",
-            status = if (result != null) {
-                "تم فحص الحالة — وُجد مجلد مودات قائم"
+            loader = if (result != null) {
+                "مسار بيانات موجود — ليس دليل محمّل"
             } else {
-                "تم فحص الحالة — لا يوجد مسار مودات مباشر"
+                "لم يثبت وجود محمّل"
+            },
+            status = if (result != null) {
+                "تم فحص مسار بيانات قائم قراءة فقط؛ لا يثبت جاهزية المحمّل"
+            } else {
+                "تم الفحص قراءة فقط — لا يوجد دليل محمّل موثوق"
             }
         )
+    }
+
+    suspend fun runQuestPreparationAction() {
+        val app = selectedApp
+        val serial = connectedDeviceSerial
+        if (app == null || serial.isNullOrBlank()) {
+            questPreparation = QuestPreparationUiState(
+                status = "اختر لعبة مثبتة واتصل بجهاز Quest قبل فحص الجاهزية."
+            )
+            return
+        }
+        val requestGeneration = modOperationGeneration
+        if (!modOperationMutex.tryLock()) {
+            questPreparation = QuestPreparationUiState(
+                status = "هناك عملية تحليل أو تثبيت أخرى قيد التنفيذ؛ أعد المحاولة بعد انتهائها."
+            )
+            return
+        }
+        val current = questPreparation
+        questPreparation = current?.copy(busy = true, status = "جارٍ فحص حالة APK والنسخ المحلية…")
+            ?: QuestPreparationUiState(busy = true, status = "جارٍ فحص حالة APK والنسخ المحلية…")
+        try {
+            val report = withContext(Dispatchers.IO) {
+                val inventory = questPreparationEngine.inspectInstalledApks(serial, app)
+                val backup = if (current?.report != null && !current.report.backup.integrityVerified) {
+                    questPreparationEngine.createApkBackup(serial, app, inventory)
+                } else {
+                    questPreparationEngine.latestBackup(serial, app, inventory)
+                }
+                val localInventory = if (
+                    backup.integrityVerified && backup.metadata != null && backup.directory != null
+                ) {
+                    val savedByRemote = backup.metadata.originalArtifacts.associateBy { it.remotePath }
+                    inventory.copy(
+                        artifacts = inventory.artifacts.map { artifact ->
+                            val saved = savedByRemote[artifact.remotePath]
+                            artifact.copy(
+                                sha256 = saved?.sha256,
+                                localPath = saved?.let { File(backup.directory, it.localPath).absolutePath }
+                            )
+                        }
+                    )
+                } else inventory
+                val profile = QuestPreparationProfileRegistry.find(app)
+                val inspections = localInventory.artifacts.mapNotNull { artifact ->
+                    artifact.localPath?.let {
+                        questPreparationEngine.inspectLocalApk(
+                            File(it),
+                            artifact,
+                            profile?.requiredResourceHashes?.keys.orEmpty()
+                        )
+                    }
+                }
+                val assessment = questPreparationEngine.assess(app, localInventory, inspections)
+                val modStrategyReady = false
+                val capture = app.versionName != null || app.versionCode != null
+                val inventoryOk = inventory.complete
+                val inspectionOk = inspections.size == inventory.artifacts.size &&
+                    inspections.all { it.valid }
+                val stages = listOf(
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.SELECT_GAME,
+                        QuestStageState.COMPLETE,
+                        "Selected ${app.packageName}"
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.CAPTURE_IDENTITY,
+                        if (capture) QuestStageState.COMPLETE else QuestStageState.BLOCKED,
+                        "package=${app.packageName}, version=${app.versionName ?: "unknown"}, code=${app.versionCode ?: "unknown"}"
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.INVENTORY_APKS,
+                        if (inventoryOk) QuestStageState.COMPLETE else QuestStageState.BLOCKED,
+                        "${inventory.artifacts.size} APK(s), base=${inventory.base != null}, readOnly=${inventory.readOnly}"
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.INSPECT_APK,
+                        if (inspectionOk) QuestStageState.COMPLETE else QuestStageState.BLOCKED,
+                        if (inspectionOk) "ZIP/ABI/IL2CPP inspection completed" else
+                            "Local APK backup copies and integrity verification are required before inspection."
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.CHECK_PROFILE,
+                        if (assessment.blockers.isEmpty() && assessment.profileId != null) {
+                            QuestStageState.COMPLETE
+                        } else QuestStageState.BLOCKED,
+                        assessment.evidenceScope
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.CREATE_BACKUP,
+                        if (backup.available) QuestStageState.COMPLETE else QuestStageState.BLOCKED,
+                        backup.reason ?: "Local backup captured."
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.VERIFY_BACKUP,
+                        if (backup.integrityVerified) QuestStageState.COMPLETE else QuestStageState.BLOCKED,
+                        backup.reason ?: "All backup SHA-256 values match."
+                    ),
+                    QuestPreparationStageResult(
+                        QuestPreparationStage.READY_FOR_MOD_INSTALL,
+                        if (assessment.readyForModInstall && backup.integrityVerified && modStrategyReady) QuestStageState.COMPLETE
+                        else QuestStageState.BLOCKED,
+                        if (assessment.readyForModInstall && backup.integrityVerified && modStrategyReady) {
+                            "Preparation evidence is complete."
+                        } else {
+                            "No patch, signing, reinstall, or rollback capability is enabled."
+                        }
+                    )
+                )
+                QuestPreparationReport(
+                    app = app,
+                    inventory = localInventory,
+                    zipInspections = inspections,
+                    assessment = assessment,
+                    backup = backup,
+                    stages = stages,
+                    blockers = assessment.blockers,
+                    modStrategyReady = modStrategyReady
+                )
+            }
+            if (requestGeneration != modOperationGeneration ||
+                connectedDeviceSerial != serial ||
+                !sameInstalledAppSnapshot(selectedApp, app)
+            ) {
+                return
+            }
+            questPreparation = QuestPreparationUiState(
+                report = report,
+                status = if (report.readyForModInstall) {
+                    "اكتملت أدلة الجاهزية للنسخة المحددة."
+                } else {
+                    "تم الفحص بأمان؛ راجع أسباب الحظر الدقيقة أدناه."
+                }
+            )
+        } catch (error: Throwable) {
+            if (requestGeneration == modOperationGeneration &&
+                connectedDeviceSerial == serial &&
+                sameInstalledAppSnapshot(selectedApp, app)
+            ) {
+                questPreparation = QuestPreparationUiState(
+                    report = current?.report,
+                    status = "تعذر إكمال فحص الجاهزية: ${error.message ?: "سبب غير معروف"}"
+                )
+            }
+        } finally {
+            modOperationMutex.unlock()
+        }
     }
 
     val dropRouter = remember {
@@ -3024,6 +3186,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             invalidateModOperation()
                                             selectedApp = app
                                              modSupport = null
+                                              questPreparation = QuestPreparationUiState()
                                              val serial = connectedDeviceSerial
                                              if (serial != null) {
                                                  uiScope.launch {
@@ -3044,6 +3207,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                              invalidateModOperation()
                                              selectedApp = null
                                               modSupport = null
+                                               questPreparation = null
                                          }
                                      },
                                      onClearSelectedApp = {
@@ -3058,6 +3222,7 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                              modZipFile = null
                                               modZipSha256 = null
                                               modSupport = null
+                                               questPreparation = null
                                          }
                                      },
                                     selectedZipFilename = modZipFile?.name,
@@ -3101,6 +3266,14 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     analysis = modAnalysis,
                                      analysisStatus = modAnalysisStatus,
                                      modSupport = modSupport,
+                                     questPreparation = questPreparation,
+                                     onQuestPreparationAction = {
+                                         if (!isInstallingMod) {
+                                             uiScope.launch { runQuestPreparationAction() }
+                                         } else {
+                                             appendModLog("لا يمكن فحص أو نسخ APK أثناء تثبيت مود.")
+                                         }
+                                     },
                                      onCopyDiagnostics = {
                                          val details = buildString {
                                              appendLine("package=${selectedApp?.packageName.orEmpty()}")
