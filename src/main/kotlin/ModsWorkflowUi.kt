@@ -292,6 +292,11 @@ fun ModsWorkflowUi(
     onInstall: () -> Unit,
      questPreparation: QuestPreparationUiState? = null,
      onQuestPreparationAction: () -> Unit = {},
+     questProbe: QuestPreparationProbeUiState = QuestPreparationProbeUiState(),
+     onQuestProbeScanAll: () -> Unit = {},
+     onQuestProbeScan: (String) -> Unit = {},
+     onQuestProbeCancel: () -> Unit = {},
+     onQuestProbeExport: () -> Unit = {},
     // Kept for source compatibility with the host screen.  It is intentionally
     // not invoked; built-in content is informational in this UI.
     onOpenExternalUrl: (String) -> Unit = {},
@@ -385,6 +390,17 @@ fun ModsWorkflowUi(
                             MaterialTheme.colorScheme.primary
                         )
                     }
+                }
+                item {
+                    QuestPreparationProbeSection(
+                        state = questProbe,
+                        connected = connected,
+                        enabled = !installing && !analyzing && !pickerOpen,
+                        onScanAll = onQuestProbeScanAll,
+                        onScan = onQuestProbeScan,
+                        onCancel = onQuestProbeCancel,
+                        onExport = onQuestProbeExport
+                    )
                 }
                 item { StepTitle("01", "اختر اللعبة من النظارة", "قائمة الألعاب المثبتة من Quest — بدون إدخال مسارات يدوية") }
                 if (selectedApp == null || appPickerRequested) {
@@ -765,6 +781,103 @@ private fun QuestPreparationCard(
                 Spacer(Modifier.width(8.dp))
                 Text(actionLabel)
             }
+        }
+    }
+}
+
+@Composable
+private fun QuestPreparationProbeSection(
+    state: QuestPreparationProbeUiState,
+    connected: Boolean,
+    enabled: Boolean,
+    onScanAll: () -> Unit,
+    onScan: (String) -> Unit,
+    onCancel: () -> Unit,
+    onExport: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("فحص جاهزية الألعاب للمودات", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "فحص قراءة فقط للألعاب الأربعة المستهدفة؛ لا يشمل تطبيقات أخرى ولا يغيّر ملفات النظارة.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (state.busy || state.completed.isNotEmpty()) {
+                Text("${state.completed.size} / ${state.totalGames} ألعاب", style = MaterialTheme.typography.labelMedium)
+                LinearProgressIndicator(
+                    progress = { questProbeProgress(state) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            Text(questProbeStatus(state), style = MaterialTheme.typography.bodySmall)
+            if (state.report != null) state.report.discoveries.forEach { discovery ->
+                val completed = state.completed.firstOrNull { it.displayName == discovery.game }
+                val status = when {
+                    completed?.warnings?.isNotEmpty() == true -> "NOT_FOUND"
+                    completed != null -> "FOUND"
+                    else -> questProbeStateLabel(discovery.state)
+                }
+                val tone = when (status) {
+                    "FOUND" -> MaterialTheme.colorScheme.tertiary
+                    "AMBIGUOUS" -> warningColor()
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                    Column(Modifier.weight(1f)) {
+                        Text(discovery.game, style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            when {
+                                discovery.candidates.isEmpty() -> status
+                                else -> "$status · " + discovery.candidates.joinToString { it.packageId }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = tone
+                        )
+                        if (completed?.warnings?.isNotEmpty() == true) {
+                            Text("تحذير: تعذر إكمال بعض الأدلة.", style = MaterialTheme.typography.bodySmall, color = warningColor())
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { onScan(discovery.game) },
+                        enabled = connected && enabled && !state.busy
+                    ) { Text("فحص") }
+                }
+            } else questProbeTargetNames().forEach { game ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(game, Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
+                    OutlinedButton(onClick = { onScan(game) }, enabled = connected && enabled && !state.busy) {
+                        Text("فحص")
+                    }
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onScanAll, enabled = connected && enabled && !state.busy) {
+                    if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Default.Search, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("فحص الكل")
+                }
+                if (state.busy) OutlinedButton(onClick = onCancel) { Text("إلغاء") }
+                OutlinedButton(
+                    onClick = onExport,
+                    enabled = !state.busy && state.report != null && !state.stale
+                ) { Text("تصدير التقرير") }
+            }
+            if (state.exportedJson != null && state.exportedText != null) {
+                StatusNote(
+                    "تم التصدير:\nJSON: ${state.exportedJson}\nTXT: ${state.exportedText}",
+                    Icons.Default.CheckCircle,
+                    MaterialTheme.colorScheme.tertiary
+                )
+            }
+            if (state.stale) {
+                StatusNote("تم تجاهل نتيجة مرتبطة بجهاز سابق.", Icons.Default.Warning, warningColor())
+            }
+            state.error?.let { StatusNote(it, Icons.Default.Warning, warningColor()) }
         }
     }
 }

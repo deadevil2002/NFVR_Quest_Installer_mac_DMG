@@ -38,6 +38,7 @@ import java.awt.Desktop
 import java.net.URI
 import javax.swing.SwingUtilities
 import java.nio.file.Files
+import java.nio.file.Path
 import java.text.DecimalFormat
 import java.time.Instant
 import javax.swing.JOptionPane
@@ -512,6 +513,112 @@ open fun pushWithProgress(
 
     return CmdResult(0, "OK", "")
 }
+
+class AdbRestrictedQuestTransport(private val adb: AdbClient) : RestrictedQuestTransport {
+    private data class CommandResult(val exit: Int, val out: String, val err: String)
+    private val packagePattern = Regex("""^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$""")
+    private val remoteFilePattern = Regex("""^/(?:data/app|system|product|vendor)/[A-Za-z0-9_./+@=-]+\.apk$""")
+    private val remoteDirectoryPattern = Regex("""^/sdcard/(?:Android/(?:obb|data)|ModData)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$""")
+    private val serialPattern = Regex("""^[A-Za-z0-9._:-]+$""")
+    private fun bounded(value: String, limit: Int = 200_000): String = value.take(limit)
+    private fun checkedSerial(serial: String): String = serial.trim().also {
+        require(serialPattern.matches(it)) { "invalid device serial" }
+    }
+    private fun checkedPackage(packageId: String): String = packageId.trim().also {
+        require(packagePattern.matches(it)) { "invalid package id" }
+    }
+    private fun checkedFile(path: String): String = path.trim().also {
+        require(remoteFilePattern.matches(it) && it.split('/').none { part -> part == "." || part == ".." }) {
+            "unsupported remote APK path"
+        }
+    }
+    private fun checkedDirectory(path: String): String = path.trim().also {
+        require(remoteDirectoryPattern.matches(it) && it.split('/').none { part -> part == "." || part == ".." }) {
+            "unsupported remote directory"
+        }
+    }
+    private fun command(serial: String, vararg args: String): CommandResult {
+        val result = adb.shell(checkedSerial(serial), *args)
+        return CommandResult(result.exit, bounded(result.out), bounded(result.err))
+    }
+    private fun out(serial: String, vararg args: String): String =
+        command(serial, *args).out
+
+    override fun devices(): String {
+        val rows = bounded(adb.devices().out).lineSequence()
+        .filter { line ->
+            val fields = line.trim().split(Regex("\\s+"))
+            fields.size >= 2 && serialPattern.matches(fields[0]) && fields[1] == "device"
+        }
+        .joinToString("\n")
+        return if (rows.isBlank()) "" else "List of devices attached\n$rows\n"
+    }
+
+    override fun getprop(serial: String, name: String): String {
+        require(name in setOf(
+            "ro.product.model", "ro.build.version.release", "ro.product.cpu.abi",
+            "ro.product.cpu.abilist", "ro.product.cpu.arch"
+        ))
+        return out(serial, "getprop", name)
+    }
+
+    override fun packageList(serial: String): String = out(serial, "pm", "list", "packages", "-f")
+
+    override fun packageInfo(serial: String, packageId: String): String =
+        out(serial, "dumpsys", "package", checkedPackage(packageId))
+
+    override fun packagePaths(serial: String, packageId: String): List<String> =
+        out(serial, "pm", "path", checkedPackage(packageId)).lineSequence()
+            .mapNotNull { Regex("""package:(\S+)""").find(it)?.groupValues?.get(1) }
+            .filter { remoteFilePattern.matches(it) }.toList()
+
+    override fun stat(serial: String, path: String): Long? =
+        out(serial, "stat", "-c", "%s", checkedFile(path)).trim().toLongOrNull()
+
+    override fun list(serial: String, path: String): List<RemoteEntry> =
+        listResult(serial, path).entries
+
+    override fun listResult(serial: String, path: String): RestrictedListResult {
+        val root = checkedDirectory(path)
+        val exists = command(serial, "test", "-d", root)
+        if (exists.exit != 0) {
+            return RestrictedListResult(
+                success = true,
+                diagnostic = exists.err.take(500).ifBlank { null },
+                exists = false
+            )
+        }
+        val result = command(serial, "ls", "-l", root)
+        if (result.exit != 0) {
+            return RestrictedListResult(
+                success = false,
+                diagnostic = result.err.take(500),
+                exists = true
+            )
+        }
+        val entries = result.out.lineSequence().mapNotNull { line ->
+            val fields = line.trim().split(Regex("\\s+"))
+            if (fields.size < 7 || !Regex("""^[bcdlps-][rwxXsStT-]{9}$""").matches(fields[0])) return@mapNotNull null
+            val name = fields.last()
+            if (!Regex("""^[A-Za-z0-9_.@+=,-]+$""").matches(name) || name == "." || name == "..") return@mapNotNull null
+            val sizeIndex = (3..5).firstOrNull { i ->
+                i + 2 < fields.size && fields[i].toLongOrNull() != null &&
+                    (fields[i + 1].matches(Regex("""\d{4}-\d\d-\d\d""")) ||
+                        fields[i + 1].matches(Regex("""[A-Za-z]{3}""")))
+            } ?: return@mapNotNull null
+            RemoteEntry(
+                "${root.trimEnd('/')}/$name",
+                fields[sizeIndex].toLongOrNull(),
+                fields.subList(sizeIndex + 1, fields.size - 1).joinToString(" "),
+                fields[0].first() == 'd'
+            )
+        }.take(512).toList()
+        return RestrictedListResult(true, entries, exists = true)
+    }
+
+    override fun pull(serial: String, remotePath: String, local: File): Boolean =
+        adb.pullReadOnly(checkedSerial(serial), checkedFile(remotePath), local).exit == 0
+}
     open fun shell(serial: String, vararg args: String): CmdResult {
         val (adb, dir) = adbBase()
         return runProcess(listOf(adb.absolutePath, "-s", serial, "shell", *args), workDir = dir)
@@ -716,6 +823,9 @@ fun main() {
     var destinationConfirmedPlanId by remember { mutableStateOf<String?>(null) }
     var modSupport by remember { mutableStateOf<ModSupportUiState?>(null) }
     var questPreparation by remember { mutableStateOf<QuestPreparationUiState?>(null) }
+    var questProbe by remember { mutableStateOf(QuestPreparationProbeUiState()) }
+    var questProbeJob by remember { mutableStateOf<Job?>(null) }
+    var questProbeCancel by remember { mutableStateOf(false) }
     var analyzingMod by remember { mutableStateOf(false) }
     var isInstallingMod by remember { mutableStateOf(false) }
     var modExecutionProgress by remember { mutableStateOf<ModsManager.ModExecutionProgress?>(null) }
@@ -2237,6 +2347,95 @@ fun main() {
         }
     }
 
+    fun runQuestProbe(target: String? = null) {
+        val serial = connectedDeviceSerial
+        if (serial.isNullOrBlank() || questProbeJob != null) return
+        val generation = modOperationGeneration
+        questProbeCancel = false
+        val prior = questProbe.completed
+        questProbe = questProbe.copy(
+            busy = true, cancelled = false, stale = false, error = null,
+            currentGame = target ?: "الألعاب المستهدفة", exportedJson = null, exportedText = null
+        )
+        val job = uiScope.launch {
+            try {
+                val report = withContext(Dispatchers.IO) {
+                    QuestPreparationProbe(AdbClient.AdbRestrictedQuestTransport(adb)).probe(
+                        targetGame = target,
+                        onGame = { game ->
+                            uiScope.launch(Dispatchers.Main.immediate) {
+                                if (generation == modOperationGeneration && connectedDeviceSerial == serial) {
+                                    questProbe = questProbe.copy(
+                                        completed = (questProbe.completed + game).distinctBy { it.packageId },
+                                        currentGame = game.displayName
+                                    )
+                                }
+                            }
+                        },
+                        cancelled = { questProbeCancel || !isActive }
+                    )
+                }
+                if (generation != modOperationGeneration || connectedDeviceSerial != serial) {
+                    questProbe = questProbe.copy(
+                        report = report,
+                        completed = report.games,
+                        busy = false,
+                        stale = true,
+                        cancelled = report.cancelled,
+                        currentGame = null
+                    )
+                } else {
+                    questProbe = questProbe.copy(
+                        report = report,
+                        completed = (prior + report.games).distinctBy { it.packageId },
+                        busy = false,
+                        cancelled = report.cancelled,
+                        stale = report.stale,
+                        currentGame = null
+                    )
+                }
+            } catch (e: CancellationException) {
+                questProbe = questProbe.copy(busy = false, cancelled = true, currentGame = null)
+            } catch (e: Throwable) {
+                questProbe = questProbe.copy(
+                    busy = false, error = "تعذر إكمال فحص الجاهزية: ${e.message ?: "خطأ غير معروف"}",
+                    currentGame = null
+                )
+            } finally {
+                questProbeJob = null
+            }
+        }
+        questProbeJob = job
+    }
+
+    fun exportQuestProbe() {
+        val report = questProbe.report ?: return
+        uiScope.launch {
+            val result = WindowsIsolatedPicker.chooseFolder(
+                lastModArchiveDirectory,
+                ownerHwnd = null
+            )
+            if (result is DesktopChooserResult.Selected) {
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        QuestPreparationReportExporter.export(
+                            report,
+                            result.file.toPath(),
+                        )
+                    }
+                }.onSuccess { files ->
+                    questProbe = questProbe.copy(
+                        exportedJson = files.json.toString(),
+                        exportedText = files.text.toString(),
+                        error = null
+                    )
+                }.onFailure {
+                    questProbe = questProbe.copy(error = "تعذر تصدير التقرير: ${it.message ?: "خطأ غير معروف"}")
+                }
+            }
+        }
+    }
+
     val dropRouter = remember {
         DesktopDropRouter(
             onDrop = { target, files ->
@@ -3267,6 +3466,17 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                      analysisStatus = modAnalysisStatus,
                                      modSupport = modSupport,
                                      questPreparation = questPreparation,
+                                     questProbe = questProbe,
+                                     onQuestProbeScanAll = {
+                                         if (!isInstallingMod) runQuestProbe()
+                                     },
+                                     onQuestProbeScan = { target ->
+                                         if (!isInstallingMod) runQuestProbe(target)
+                                     },
+                                     onQuestProbeCancel = {
+                                         questProbeCancel = true
+                                     },
+                                     onQuestProbeExport = ::exportQuestProbe,
                                      onQuestPreparationAction = {
                                          if (!isInstallingMod) {
                                              uiScope.launch { runQuestPreparationAction() }
