@@ -115,8 +115,78 @@ enum class ModInstallOutcome {
     UNSAFE_ARCHIVE
 }
 
+/**
+ * The workflow is selected from the analyzed archive, not from the selected
+ * game's name.  This prevents data-only content and built-in game content
+ * from being routed through APK preparation merely because the game supports
+ * code mods too.
+ */
+enum class ModWorkflowRoute {
+    CONTENT_MOD,
+    LOADER_CODE_MOD,
+    VIRTUAL_STUMP,
+    APK_PATCH_REQUIRED,
+    UNSUPPORTED
+}
+
+data class ModWorkflowRouting(
+    val route: ModWorkflowRoute,
+    val preparationRequired: Boolean,
+    val installAvailable: Boolean,
+    val requiredLoader: String? = null,
+    val reason: String? = null
+)
+
+fun routeModWorkflow(analysis: ModPackageAnalysis): ModWorkflowRouting {
+    val plan = analysis.installPlan
+    return when {
+        analysis.packageType == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ||
+            analysis.outcome == ModInstallOutcome.BUILT_IN_GAME_CONTENT ->
+            ModWorkflowRouting(
+                ModWorkflowRoute.VIRTUAL_STUMP,
+                preparationRequired = false,
+                installAvailable = false,
+                reason = "محتوى تديره اللعبة؛ لا يوجد عقد استيراد محلي موثق."
+            )
+        analysis.outcome == ModInstallOutcome.APK_PATCH_REQUIRED ->
+            ModWorkflowRouting(
+                ModWorkflowRoute.APK_PATCH_REQUIRED,
+                preparationRequired = true,
+                installAvailable = false,
+                reason = "تحتاج الحزمة إلى تجهيز APK قبل التثبيت."
+            )
+        analysis.outcome == ModInstallOutcome.REQUIRES_MOD_LOADER ->
+            ModWorkflowRouting(
+                ModWorkflowRoute.LOADER_CODE_MOD,
+                preparationRequired = true,
+                installAvailable = false,
+                requiredLoader = plan.loaderRequirement
+                    ?.requested
+                    ?.joinToString(" أو ") { it.displayName }
+                    ?.takeIf(String::isNotBlank),
+                reason = "تحتاج الحزمة إلى محمّل مودات متوافق."
+            )
+        analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+            plan.installable ->
+            ModWorkflowRouting(
+                ModWorkflowRoute.CONTENT_MOD,
+                preparationRequired = false,
+                installAvailable = true
+            )
+        else ->
+            ModWorkflowRouting(
+                ModWorkflowRoute.UNSUPPORTED,
+                preparationRequired = false,
+                installAvailable = false,
+                reason = customerAnalysisMessage(analysis)
+            )
+    }
+}
+
 fun customerPreconditionMessage(code: String): String = when {
     code == "APK_PATCH_REQUIRED" -> "تحتاج هذه الحزمة إلى تصحيح آمن لتطبيق اللعبة قبل التثبيت."
+    code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" ->
+        "تدعم بيانات الإصدار الحالية هذه الحزمة ضمن عائلة اللعبة نفسها، لكن مقارنة GameVersion في وقت التشغيل غير موثقة علنًا؛ التثبيت متاح لأن جميع فحوص المحتوى والوجهة والأمان نجحت."
     code.contains("LOADER", ignoreCase = true) -> "يجب تجهيز محمّل المودات المطلوب ثم إعادة التحليل."
     code.contains("TARGET_APP_REQUIRED", ignoreCase = true) -> "اختر لعبة مثبتة على النظارة أولًا."
     code.contains("APK_SHA256_REQUIRED", ignoreCase = true) ->
@@ -134,9 +204,13 @@ fun customerPreconditionMessage(code: String): String = when {
 
 fun customerAnalysisMessage(analysis: ModPackageAnalysis): String = when {
     analysis.installPlan.preconditions.any {
-        !it.satisfied && it.code == "NOMAD_GAME_VERSION_UNVERIFIED"
+        it.code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING"
     } ->
-        "إصدار Nomad لهذا المود غير متحقق: بيانات GameVersion لا تثبت توافقه مع إصدار اللعبة المحدد."
+        customerPreconditionMessage("NOMAD_GAME_VERSION_COMPATIBILITY_WARNING")
+    analysis.installPlan.preconditions.any {
+        !it.satisfied && it.code == "NOMAD_GAME_VERSION_INCOMPATIBLE"
+    } ->
+        "إصدار Nomad لهذا المود ينتمي إلى عائلة توافق مختلفة عن إصدار اللعبة المحدد."
     analysis.installPlan.preconditions.any {
         !it.satisfied && it.code == "BUILT_IN_IMPORTER_UNVERIFIED"
     } ->

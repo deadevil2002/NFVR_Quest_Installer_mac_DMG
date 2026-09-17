@@ -82,4 +82,43 @@ class QuestPreparationProbePresentationTest {
         val newDevice = mergeQuestProbeReports(old, retry.copy(device = device.copy(serial = "new")), "Gorilla Tag", sameDevice = false)
         assertEquals(listOf("com.AnotherAxiom.GorillaTag"), newDevice.games.map { it.packageId })
     }
+
+    @Test
+    fun `content readiness survives signature warning`() {
+        val game = QuestProbeGame(
+            "BONELAB",
+            "com.StressLevelZero.BONELAB",
+            probeState = QuestProbeState.PARTIAL,
+            preparationState = ProbePreparationState.CONTENT_MOD_READY,
+            androidData = QuestProbeData(
+                exists = true,
+                accessible = true,
+                paths = listOf(
+                    "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods"
+                )
+            ),
+            apkInspectionFailureCode = "APK_SIGNATURE_SCAN_FAILED",
+            warnings = listOf("APK_SIGNATURE_SCAN_FAILED")
+        )
+        assertEquals("مودات المحتوى جاهزة للتثبيت", questProbeGameReadinessLabel(game))
+        assertTrue(questProbeFailureLabel(game.apkInspectionFailureCode)!!.contains("لا يؤثر"))
+    }
+
+    @Test
+    fun `Scotland2 readiness survives signature warning`() {
+        val game = QuestProbeGame(
+            "Beat Saber",
+            "com.beatgames.beatsaber",
+            probeState = QuestProbeState.PARTIAL,
+            preparationState = ProbePreparationState.LOADER_READY,
+            loader = ProbeLoader.SCOTLAND2,
+            apkInspectionFailureCode = "APK_SIGNATURE_SCAN_FAILED",
+            warnings = listOf("APK_SIGNATURE_SCAN_FAILED")
+        )
+        assertEquals(
+            "اللعبة مجهزة بمحمّل Scotland2",
+            questProbeGameReadinessLabel(game)
+        )
+        assertTrue(questProbeFailureLabel(game.apkInspectionFailureCode)!!.contains("لا يؤثر"))
+    }
 }

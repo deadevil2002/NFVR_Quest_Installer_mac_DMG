@@ -16,6 +16,74 @@ class ModsWorkflowPureTest {
     }
 
     @Test
+    fun archiveTypeRoutesPreparationOnlyToCodeAndPatchWorkflows() {
+        val content = testAnalysis(
+            ModInstallOutcome.DIRECT_INSTALL_READY,
+            ModPackageType.BONELAB_NATIVE_CONTENT
+        )
+        val virtual = testAnalysis(
+            ModInstallOutcome.BUILT_IN_GAME_CONTENT,
+            ModPackageType.GORILLA_TAG_VIRTUAL_STUMP
+        )
+        val loader = testAnalysis(
+            ModInstallOutcome.REQUIRES_MOD_LOADER,
+            ModPackageType.QMOD
+        )
+        val patch = testAnalysis(
+            ModInstallOutcome.APK_PATCH_REQUIRED,
+            ModPackageType.GENERIC_DATA
+        )
+
+        assertEquals(ModWorkflowRoute.CONTENT_MOD, routeModWorkflow(content).route)
+        assertFalse(routeModWorkflow(content).preparationRequired)
+        assertFalse(modsPreparationPanelVisible(content))
+        assertEquals(ModWorkflowRoute.VIRTUAL_STUMP, routeModWorkflow(virtual).route)
+        assertFalse(routeModWorkflow(virtual).preparationRequired)
+        assertFalse(modsPreparationPanelVisible(virtual))
+        assertEquals(ModWorkflowRoute.LOADER_CODE_MOD, routeModWorkflow(loader).route)
+        assertTrue(routeModWorkflow(loader).preparationRequired)
+        assertEquals(ModWorkflowRoute.APK_PATCH_REQUIRED, routeModWorkflow(patch).route)
+        assertTrue(routeModWorkflow(patch).preparationRequired)
+    }
+
+    @Test
+    fun loaderPreparationPresentationExcludesAllApkElements() {
+        val loader = testAnalysis(
+            ModInstallOutcome.REQUIRES_MOD_LOADER,
+            ModPackageType.QMOD
+        )
+        val presentation = modsPreparationPresentation(loader)!!
+        assertTrue(presentation.loaderOnly)
+        assertFalse(presentation.apkEvidenceVisible)
+        assertFalse(presentation.backupVisible)
+        assertFalse(presentation.remediationActionVisible)
+        assertTrue(presentation.title.contains("محمّل"))
+        assertFalse(presentation.title.contains("APK"))
+    }
+
+    @Test
+    fun patchPreparationPresentationIsExplicitlyRequired() {
+        val patch = testAnalysis(
+            ModInstallOutcome.APK_PATCH_REQUIRED,
+            ModPackageType.GENERIC_DATA
+        )
+        val presentation = modsPreparationPresentation(patch)!!
+        assertFalse(presentation.loaderOnly)
+        assertTrue(presentation.apkEvidenceVisible)
+        assertTrue(presentation.backupVisible)
+        assertTrue(presentation.remediationActionVisible)
+        assertTrue(presentation.title.contains("مطلوب"))
+    }
+
+    @Test
+    fun signatureScanFailureIsAContentWarningNotAPreparationBlocker() {
+        assertTrue(
+            questProbeFailureLabel("APK_SIGNATURE_SCAN_FAILED")!!
+                .contains("لا يؤثر ذلك على تثبيت مودات المحتوى")
+        )
+    }
+
+    @Test
     fun warningCodesAreShownOnce() {
         val warnings = listOf(
             ModInstallPrecondition("TARGET", "first"),

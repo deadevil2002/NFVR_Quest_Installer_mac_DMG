@@ -126,6 +126,8 @@ internal fun questProbeFailureLabel(code: String?): String? = when {
         "تعذر قراءة حجم APK من النظارة؛ بقيت اللعبة مكتشفة لكن أدلة APK غير مكتملة."
     code.contains("PATH", ignoreCase = true) ->
         "تعذر تحديد مسار APK بدقة؛ بقيت نتيجة اكتشاف اللعبة منفصلة عن فشل الدليل."
+    code == "APK_SIGNATURE_SCAN_FAILED" ->
+        "تعذر إكمال فحص توقيع APK؛ لا يؤثر ذلك على تثبيت مودات المحتوى."
     else ->
         "تعذر إكمال بعض أدلة APK؛ لا تُعد اللعبة غير مثبتة بسبب هذا الفشل."
 }
@@ -136,20 +138,27 @@ internal fun questProbeFailureLabel(code: String?): String? = when {
  * of the raw probe enums.
  */
 internal fun questProbeGameReadinessLabel(game: QuestProbeGame): String {
-    if (game.probeState == QuestProbeState.PARTIAL ||
-        game.probeState == QuestProbeState.FAILED
-    ) return "الفحص غير مكتمل"
     val contentDirectory = (game.androidData.paths + game.modData.paths)
         .any { it.endsWith("/files/Mods") || it.endsWith("/files/mods") }
     return when {
+        game.preparationState == ProbePreparationState.LOADER_READY ->
+            if (game.loader == ProbeLoader.SCOTLAND2) {
+                "اللعبة مجهزة بمحمّل Scotland2"
+            } else {
+                "اللعبة مجهزة بمحمّل مودات"
+            }
+        game.preparationState == ProbePreparationState.CONTENT_MOD_READY && contentDirectory ->
+            "مودات المحتوى جاهزة للتثبيت"
+        game.preparationState == ProbePreparationState.CODE_MOD_READY ->
+            "اللعبة مجهزة لمودات الكود"
+        game.probeState == QuestProbeState.PARTIAL ||
+            game.probeState == QuestProbeState.FAILED ->
+            "الفحص غير مكتمل"
         contentDirectory && game.loader !in setOf(ProbeLoader.UNKNOWN, ProbeLoader.NONE) ->
             "مودات المحتوى جاهزة؛ دليل المحمّل متاح أيضًا"
         contentDirectory -> "مودات المحتوى جاهزة للتثبيت"
         game.codeModLoaderState?.let { it != "NONE" && it != "UNKNOWN" } == true ->
             "مود يحتاج محمل"
-        game.preparationState == ProbePreparationState.LOADER_READY ||
-            game.preparationState == ProbePreparationState.CODE_MOD_READY ->
-            "اللعبة مجهزة"
         game.preparationState == ProbePreparationState.STOCK_UNPREPARED ->
             "اللعبة غير مجهزة"
         else -> questProbePreparationLabel(game.preparationState)

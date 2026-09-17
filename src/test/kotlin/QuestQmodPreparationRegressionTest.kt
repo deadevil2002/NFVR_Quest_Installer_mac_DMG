@@ -33,6 +33,9 @@ class QuestQmodPreparationRegressionTest {
         assertEquals(ModInstallOutcome.REQUIRES_MOD_LOADER, analysis.outcome)
         assertFalse(analysis.installable)
         assertTrue(analysis.plan.preconditions.any { it.code == "MOD_LOADER_UNKNOWN" })
+        assertEquals(ModWorkflowRoute.LOADER_CODE_MOD, routeModWorkflow(analysis).route)
+        assertTrue(modsPreparationRequired(analysis))
+        assertTrue(modsPreparationIsLoaderPanel(analysis))
         archive.delete()
     }
 

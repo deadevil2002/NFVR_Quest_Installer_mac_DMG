@@ -159,7 +159,47 @@ internal fun modsOverallStageNumber(stage: ModsOverallStage): String =
     (stage.ordinal + 1).toString().padStart(2, '0')
 
 internal fun modsPreparationRequired(analysis: ModPackageAnalysis?): Boolean =
-    analysis?.outcome == ModInstallOutcome.APK_PATCH_REQUIRED
+    analysis?.let { routeModWorkflow(it).preparationRequired } == true
+
+internal fun modsPreparationPanelVisible(analysis: ModPackageAnalysis?): Boolean =
+    modsPreparationRequired(analysis)
+
+internal fun modsPreparationIsLoaderPanel(analysis: ModPackageAnalysis?): Boolean =
+    analysis?.let { routeModWorkflow(it).route == ModWorkflowRoute.LOADER_CODE_MOD } == true
+
+internal data class ModsPreparationPresentation(
+    val loaderOnly: Boolean,
+    val apkEvidenceVisible: Boolean,
+    val backupVisible: Boolean,
+    val remediationActionVisible: Boolean,
+    val title: String,
+    val subtitle: String
+)
+
+internal fun modsPreparationPresentation(
+    analysis: ModPackageAnalysis?
+): ModsPreparationPresentation? {
+    val route = analysis?.let { routeModWorkflow(it).route } ?: return null
+    return when (route) {
+        ModWorkflowRoute.LOADER_CODE_MOD -> ModsPreparationPresentation(
+            loaderOnly = true,
+            apkEvidenceVisible = false,
+            backupVisible = false,
+            remediationActionVisible = false,
+            title = "تجهيز محمّل المودات",
+            subtitle = "تحقق من هوية المحمّل وأدلته قبل نقل مود الكود"
+        )
+        ModWorkflowRoute.APK_PATCH_REQUIRED -> ModsPreparationPresentation(
+            loaderOnly = false,
+            apkEvidenceVisible = true,
+            backupVisible = true,
+            remediationActionVisible = true,
+            title = "تجهيز APK مطلوب",
+            subtitle = "جمع أدلة APK المطلوبة؛ لا يغيّر اللعبة"
+        )
+        else -> null
+    }
+}
 
 internal fun modsReadinessComplete(analysis: ModPackageAnalysis?): Boolean =
     analysis?.let {

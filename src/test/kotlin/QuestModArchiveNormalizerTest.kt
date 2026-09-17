@@ -73,21 +73,21 @@ class QuestModArchiveNormalizerTest {
     @Test
     fun frameworkPackManagedAssemblyIsNomadContentNotAssumedExternalLoader() {
         val archive = zipOf(
-            "Framework Pack/manifest.json" to "{}",
+            "Framework Pack/manifest.json" to
+                """{"GameVersion":"1.0.0.0","GameName":"Blade & Sorcery: Nomad"}""",
             "Framework Pack/Framework Pack.dll" to "sanitized-managed-assembly",
             "Framework Pack/Framework Pack.pdb" to "sanitized-symbols"
         )
 
         val analysis = analyzeAfterRename(archive, nomad, verifiedDiscovery(nomad))
         assertEquals(ModPackageType.KNOWN_GAME_PROFILE, analysis.packageType)
-        assertFalse(analysis.installable)
-        assertEquals(ModInstallOutcome.UNSUPPORTED, analysis.outcome)
+        assertTrue(analysis.installable, analysis.message)
+        assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, analysis.outcome)
         assertTrue(
             analysis.installPlan.preconditions.any {
-                it.code == "NOMAD_GAME_VERSION_UNVERIFIED" && !it.satisfied
+                it.code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" && it.satisfied
             }
         )
-        assertTrue(customerAnalysisMessage(analysis).contains("GameVersion"))
         assertEquals(
             "/sdcard/Android/data/com.Warpfrog.BladeAndSorcery/files/Mods",
             analysis.installPlan.destinationRoot
@@ -291,11 +291,27 @@ class QuestModArchiveNormalizerTest {
                 val manifest = standalone.archiveTree?.metadata?.entries
                     ?.firstOrNull { it.key.endsWith("/manifest.json") }?.value
                 assertEquals("1.0.0.0", manifest?.optString("GameVersion"))
-                assertTrue(
-                    standalone.installPlan.preconditions.any {
-                        it.message.contains("1.0.0.0") && it.message.contains("1.0.7")
-                    }
+                assertTrue(standalone.installPlan.preconditions.any {
+                    it.code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" && it.satisfied
+                })
+                assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, eligible.outcome)
+                assertEquals(3, eligible.installPlan.totalFiles)
+                assertEquals(77162L, eligible.installPlan.totalBytes)
+                assertTrue(customerAnalysisMessage(eligible).contains("غير موثقة"))
+                assertEquals(
+                    "/sdcard/Android/data/com.Warpfrog.BladeAndSorcery/files/Mods",
+                    eligible.installPlan.destinationRoot
                 )
+                assertFalse(routeModWorkflow(eligible).preparationRequired)
+            }
+            if (name.startsWith("normalpapablplane")) {
+                assertEquals(ModPackageType.BONELAB_NATIVE_CONTENT, eligible.packageType)
+                assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, eligible.outcome)
+                assertEquals(8, eligible.installPlan.totalFiles)
+                assertEquals(426316821L, eligible.installPlan.totalBytes)
+                assertTrue(eligible.installPlan.patchRequirement == null)
+                assertTrue(eligible.installPlan.loaderRequirement == null)
+                assertFalse(routeModWorkflow(eligible).preparationRequired)
             }
         }
     }

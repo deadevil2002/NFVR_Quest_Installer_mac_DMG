@@ -632,19 +632,38 @@ fun ModsWorkflowUi(
                         AnalysisResultCard(analysis)
                     }
                 }
-                item { StepTitle("05", "التحضير عند الحاجة", "جمع أدلة APK ونسخة محلية للقراءة فقط؛ لا يغيّر اللعبة") }
-                if (selectedApp != null && questPreparation != null) {
+                if (modsPreparationPanelVisible(analysis)) {
+                    item {
+                        StepTitle(
+                            "05",
+                            if (modsPreparationIsLoaderPanel(analysis)) "تجهيز محمّل المودات"
+                            else "تجهيز APK مطلوب",
+                            if (modsPreparationIsLoaderPanel(analysis)) {
+                                "تحقق من هوية المحمّل وأدلته قبل نقل مود الكود"
+                            } else {
+                                "جمع أدلة APK المطلوبة؛ لا يغيّر اللعبة"
+                            }
+                        )
+                    }
+                }
+                if (selectedApp != null &&
+                    questPreparation != null &&
+                    modsPreparationPanelVisible(analysis)
+                ) {
                     item {
                         QuestPreparationCard(
                             selectedApp = selectedApp,
                             state = questPreparation,
+                            loaderRequired = modsPreparationIsLoaderPanel(analysis),
+                            loaderRequirement = analysis?.installPlan?.loaderRequirement,
+                            loaderPreconditions = analysis?.installPlan?.preconditions.orEmpty(),
                             actionEnabled = questPreparationActionEnabled(
                                 connected = connected,
                                 installing = installing,
                                 analyzing = analyzing,
                                 pickerOpen = pickerOpen,
                                 busy = questPreparation.busy
-                            ),
+                            ) && !modsPreparationIsLoaderPanel(analysis),
                             onAction = onQuestPreparationAction
                         )
                     }
@@ -737,18 +756,68 @@ fun ModsWorkflowUi(
 }
 
 @Composable
+private fun LoaderPreparationCard(
+    selectedApp: InstalledQuestApp,
+    requirement: ModLoaderRequirement?,
+    preconditions: List<ModInstallPrecondition>
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("متطلبات محمّل المودات", style = MaterialTheme.typography.titleMedium)
+            Text(
+                questPreparationSelectedPackageLabel(selectedApp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
+            LoaderRequirementDetails(
+                requirement,
+                preconditions.filter(::isLoaderPrecondition)
+            )
+            preconditions.filterNot { it.satisfied }.filter(::isLoaderPrecondition)
+                .forEach {
+                    StatusNote(
+                        customerPreconditionMessage(it.code),
+                        Icons.Default.Warning,
+                        warningColor()
+                    )
+                }
+            StatusNote(
+                "لا توجد في NFVR أداة تنفيذية معتمدة لتجهيز هذا المحمّل؛ لم يتم نقل أي ملف.",
+                Icons.Default.Info,
+                warningColor()
+            )
+        }
+    }
+}
+
+@Composable
 private fun QuestPreparationCard(
     selectedApp: InstalledQuestApp,
     state: QuestPreparationUiState,
+    loaderRequired: Boolean = false,
+    loaderRequirement: ModLoaderRequirement? = null,
+    loaderPreconditions: List<ModInstallPrecondition> = emptyList(),
     actionEnabled: Boolean,
     onAction: () -> Unit
 ) {
+    if (loaderRequired) {
+        LoaderPreparationCard(
+            selectedApp = selectedApp,
+            requirement = loaderRequirement,
+            preconditions = loaderPreconditions
+        )
+        return
+    }
     val report = state.report
     val rows = questPreparationStageRows(report)
     val blocked = report?.blockers.orEmpty()
     val backup = report?.backup
     var diagnosticsExpanded by remember { mutableStateOf(false) }
     val actionLabel = when {
+        loaderRequired -> null
         state.busy -> "جارٍ الفحص…"
         report == null -> "فحص جاهزية APK — قراءة فقط"
         backup?.integrityVerified != true -> "إنشاء نسخة APK محلية والتحقق منها"
@@ -759,7 +828,10 @@ private fun QuestPreparationCard(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("تحضير اختياري للعبة", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "تجهيز APK مطلوب للعبة",
+                style = MaterialTheme.typography.titleMedium
+            )
             Text(
                 questPreparationSelectedPackageLabel(report?.app ?: selectedApp),
                 style = MaterialTheme.typography.labelLarge,
@@ -824,7 +896,7 @@ private fun QuestPreparationCard(
                     }
                 }
             }
-            backup?.let {
+            if (!loaderRequired) backup?.let {
                 StatusNote(
                      questPreparationBackupLabel(it),
                     Icons.Default.Info,
@@ -857,12 +929,12 @@ private fun QuestPreparationCard(
                      )
                  }
              }
-             Button(onClick = onAction, enabled = actionEnabled) {
+             actionLabel?.let { label -> Button(onClick = onAction, enabled = actionEnabled) {
                 if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Default.Refresh, null)
                 Spacer(Modifier.width(8.dp))
-                Text(actionLabel)
-            }
+                Text(label)
+            } }
         }
     }
 }

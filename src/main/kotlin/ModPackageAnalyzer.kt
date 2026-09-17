@@ -1398,26 +1398,49 @@ class ModPackageAnalyzer(
             addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
         }
         if (managedAssemblyPayload) {
-            // Research confirms that this AnyCPU managed DLL is an Android
-            // supported Nomad mod loaded by the game's built-in scripting
-            // system.  The remaining safety gate is game-version evidence,
-            // not a guessed external loader or a PC-only classification.
-            val selectedVersion = installedApp?.versionName
-            if (declaredVersion == null || selectedVersion == null ||
-                declaredVersion != selectedVersion
-            ) {
-                val manifestVersion = declaredVersion ?: "missing"
-                val gameVersion = selectedVersion ?: "missing"
-                preconditions += blocked(
-                    "NOMAD_GAME_VERSION_UNVERIFIED",
-                    "Nomad manifest GameVersion '$manifestVersion' is not verified with selected game version '$gameVersion'; NFVR will not install this managed content yet."
+            // The current Nomad runtime's GameVersion comparison is not
+            // publicly specified. Do not turn an opaque 1.0.0.0 manifest
+            // value into a false exact-match failure against app version 1.0.7.
+            val compatibility = NomadCompatibilityEvaluator.evaluate(
+                declaredVersion,
+                installedApp?.versionName
+            )
+            when (compatibility.state) {
+                NomadCompatibilityState.INCOMPATIBLE -> preconditions += blocked(
+                    "NOMAD_GAME_VERSION_INCOMPATIBLE",
+                    "Nomad manifest GameVersion '${declaredVersion ?: "missing"}' belongs to a different compatibility family than installed version '${installedApp?.versionName ?: "missing"}'."
+                )
+                NomadCompatibilityState.WARNING -> preconditions += satisfied(
+                    "NOMAD_GAME_VERSION_REVIEW_WARNING",
+                    compatibility.reason
+                )
+                NomadCompatibilityState.EXACT -> preconditions += satisfied(
+                    "NOMAD_GAME_VERSION_EXACT",
+                    compatibility.reason
+                )
+                NomadCompatibilityState.COMPATIBLE_FAMILY -> preconditions += satisfied(
+                    "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING",
+                    "Release evidence places this Nomad mod in the installed major/minor family, " +
+                        "but the current runtime's GameVersion semantics are not publicly specified."
                 )
             }
-        } else if (declaredVersion != null && installedApp?.versionName != declaredVersion) {
-            preconditions += blocked(
-                "GAME_VERSION_UNSUPPORTED",
-                "Nomad content targets game version '$declaredVersion', but the installed version is '${installedApp?.versionName}'."
+        } else if (declaredVersion != null) {
+            val compatibility = NomadCompatibilityEvaluator.evaluate(
+                declaredVersion,
+                installedApp?.versionName
             )
+            when (compatibility.state) {
+                NomadCompatibilityState.INCOMPATIBLE -> preconditions += blocked(
+                    "GAME_VERSION_UNSUPPORTED",
+                    "Nomad content targets incompatible game-version family '${declaredVersion}'."
+                )
+                NomadCompatibilityState.COMPATIBLE_FAMILY -> preconditions += satisfied(
+                    "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING",
+                    "Release evidence places this Nomad mod in the installed major/minor family, " +
+                        "but the current runtime's GameVersion semantics are not publicly specified."
+                )
+                else -> Unit
+            }
         }
         val mappings = mutableListOf<ModFileMapping>()
         val files = archive.entries.filterNot { it in archive.directories }

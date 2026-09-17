@@ -156,10 +156,11 @@ class ModContentProfilesTest {
             "NomadMod/mod.assetbundle" to "bundle"
         )
         val staleResult = analyzer.analyze(stale, nomad)
-        assertFalse(staleResult.installable)
+        assertTrue(staleResult.installable)
         assertTrue(staleResult.plan.preconditions.any {
-            it.code == "GAME_VERSION_UNSUPPORTED"
+            it.code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" && it.satisfied
         })
+        assertTrue(customerAnalysisMessage(staleResult).contains("غير موثقة"))
         stale.delete()
 
         val mismatch = zipOf(
@@ -174,6 +175,22 @@ class ModContentProfilesTest {
             it.code == "TARGET_PACKAGE_MISMATCH"
         })
         mismatch.delete()
+    }
+
+    @Test
+    fun nomadDifferentMajorMinorFamilyRemainsBlocked() {
+        val archive = zipOf(
+            "NomadMod/manifest.json" to
+                """{"name":"Nomad Mod","packageId":"com.Warpfrog.BladeAndSorcery","gameVersion":"2.0.0.0"}""",
+            "NomadMod/module.json" to """{"name":"Nomad Mod","id":"nomad"}""",
+            "NomadMod/mod.assetbundle" to "bundle"
+        )
+        val result = analyzer.analyze(archive, nomad)
+        assertFalse(result.installable)
+        assertTrue(result.plan.preconditions.any {
+            it.code == "GAME_VERSION_UNSUPPORTED" && !it.satisfied
+        })
+        archive.delete()
     }
 
     @Test
