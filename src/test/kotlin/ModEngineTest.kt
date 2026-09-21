@@ -517,7 +517,7 @@ class ModEngineTest {
     fun adbLoaderDetectorFailsClosedWithoutAuthenticatedArtifactReader() {
         val app = InstalledQuestApp("com.example.game", "1")
         val adb = LoaderEvidenceAdb()
-        val detection = AdbModLoaderDetector(adb, null).detect("SERIAL", app)
+        val detection = AdbModLoaderDetector(adb, null, null).detect("SERIAL", app)
 
         assertTrue(detection.evidence.values.all { it.status == ModLoaderStatus.UNKNOWN })
         assertTrue(adb.commands.isEmpty())

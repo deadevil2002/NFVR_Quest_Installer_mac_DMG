@@ -340,27 +340,136 @@ class AdbAuthenticatedModLoaderArtifactVerifier(
 }
 
 /**
+ * Filesystem-based Scotland2 detection.  Reads the read-only ModData
+ * directory structure created by Scotland2's loader at
+ * `/sdcard/ModData/<packageId>/Modloader/`.  The presence of the
+ * `libs/libsl2.so` file is the strongest filesystem evidence because
+ * Scotland2 places its bootstrap library there.  The Modloader directory
+ * tree (early_mods, mods, libs) is corroborating evidence.
+ *
+ * This verifier intentionally does not read or modify any APK, nor does
+ * it push or create any files.  The evidence is fully read-only.
+ */
+class AdbFilesystemLoaderVerifier(
+    private val adbClient: AdbClient
+) : ModLoaderArtifactVerifier {
+    override fun verify(serial: String, app: InstalledQuestApp): ModLoaderDetection? =
+        runCatching { verifyInternal(serial, app) }.getOrNull()
+
+    private fun verifyInternal(serial: String, app: InstalledQuestApp): ModLoaderDetection? {
+        val packageId = app.packageName
+
+        // Scotland2 ModData root: /sdcard/ModData/<packageId>/Modloader/
+        val modloaderRoot = "/sdcard/ModData/$packageId/Modloader"
+        val modloaderExists = adbClient.shell(serial, "test", "-d", modloaderRoot).exit == 0
+
+        // Check for the Scotland2 bootstrap library
+        val libsl2Path = "$modloaderRoot/libs/libsl2.so"
+        val libsl2Exists = adbClient.shell(serial, "test", "-f", libsl2Path).exit == 0
+
+        // Check for the Scotland2 loader directory structure
+        val earlyModsExists = adbClient.shell(serial, "test", "-d", "$modloaderRoot/early_mods").exit == 0
+        val modsExists = adbClient.shell(serial, "test", "-d", "$modloaderRoot/mods").exit == 0
+        val libsExists = adbClient.shell(serial, "test", "-d", "$modloaderRoot/libs").exit == 0
+
+        val hasScotland2Evidence = libsl2Exists || (modloaderExists && (earlyModsExists || modsExists || libsExists))
+        if (!hasScotland2Evidence) return null
+
+        val evidenceList = mutableListOf<String>()
+        if (libsl2Exists) evidenceList += "filesystem: $libsl2Path exists"
+        if (modloaderExists) evidenceList += "filesystem: $modloaderRoot exists"
+        if (earlyModsExists) evidenceList += "filesystem: $modloaderRoot/early_mods exists"
+        if (modsExists) evidenceList += "filesystem: $modloaderRoot/mods exists"
+        if (libsExists) evidenceList += "filesystem: $modloaderRoot/libs exists"
+
+        return ModLoaderDetection(
+            packageId = packageId,
+            evidence = ModLoaderKind.entries.associateWith { kind ->
+                when (kind) {
+                    ModLoaderKind.SCOTLAND2 -> ModLoaderEvidence(
+                        loader = kind,
+                        status = ModLoaderStatus.DETECTED,
+                        evidence = evidenceList
+                    )
+                    else -> ModLoaderEvidence(
+                        loader = kind,
+                        status = ModLoaderStatus.UNKNOWN,
+                        evidence = listOf("filesystem scan does not assess ${kind.displayName}")
+                    )
+                }
+            },
+            checkedReadOnly = true
+        )
+    }
+}
+
+/**
  * The detector never infers a loader from free-form `dumpsys`, `pm`, or
  * directory text. Names in those outputs are not authenticated loader
  * evidence: they can be package labels, mod names, or arbitrary files. The
- * default verifier is [AdbAuthenticatedModLoaderArtifactVerifier]; callers
- * may pass null only for an intentionally fail-closed integration.
+ * default verifier chain is: APK tag verifier → filesystem evidence
+ * verifier.  Callers may pass null only for an intentionally fail-closed
+ * integration.
  */
 class AdbModLoaderDetector(
     private val adbClient: AdbClient,
     private val artifactVerifier: ModLoaderArtifactVerifier? =
-        AdbAuthenticatedModLoaderArtifactVerifier(adbClient)
+        AdbAuthenticatedModLoaderArtifactVerifier(adbClient),
+    private val filesystemVerifier: ModLoaderArtifactVerifier? =
+        AdbFilesystemLoaderVerifier(adbClient)
 ) : ModLoaderDetector {
     override fun detect(serial: String, app: InstalledQuestApp): ModLoaderDetection {
+        // Primary: authenticated APK tag (most authoritative)
         val verified = runCatching {
             artifactVerifier?.verify(serial, app)
         }.getOrNull()
         if (verified != null &&
             verified.packageId == app.packageName &&
-            verified.checkedReadOnly
+            verified.checkedReadOnly &&
+            verified.detected.isNotEmpty()
         ) {
             return verified
         }
+
+        // Secondary: read-only filesystem evidence (corroborating)
+        val filesystemEvidence = runCatching {
+            filesystemVerifier?.verify(serial, app)
+        }.getOrNull()
+        if (filesystemEvidence != null &&
+            filesystemEvidence.packageId == app.packageName &&
+            filesystemEvidence.checkedReadOnly &&
+            filesystemEvidence.detected.isNotEmpty()
+        ) {
+            return filesystemEvidence
+        }
+
+        // Merge both results if one has positive evidence
+        if (verified != null && filesystemEvidence != null &&
+            verified.packageId == app.packageName &&
+            filesystemEvidence.packageId == app.packageName
+        ) {
+            val mergedEvidence = ModLoaderKind.entries.associateWith { kind ->
+                val apkResult = verified.evidence[kind]
+                val fsResult = filesystemEvidence.evidence[kind]
+                when {
+                    apkResult?.status == ModLoaderStatus.DETECTED -> apkResult
+                    fsResult?.status == ModLoaderStatus.DETECTED -> fsResult
+                    apkResult?.status == ModLoaderStatus.NOT_DETECTED -> apkResult
+                    fsResult != null -> fsResult
+                    else -> apkResult ?: ModLoaderEvidence(
+                        loader = kind,
+                        status = ModLoaderStatus.UNKNOWN,
+                        evidence = listOf("no evidence available")
+                    )
+                }
+            }
+            return ModLoaderDetection(
+                packageId = app.packageName,
+                evidence = mergedEvidence,
+                checkedReadOnly = true
+            )
+        }
+
         // Do not call shell here: unverified command output must never become
         // loader evidence. The production verifier performs all artifact I/O.
         return ModLoaderDetection(

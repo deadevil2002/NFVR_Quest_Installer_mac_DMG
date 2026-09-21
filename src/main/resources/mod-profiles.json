@@ -1,7 +1,7 @@
 [
   {
     "packageId": "com.AnotherAxiom.GorillaTag",
-    "displayName": "Gorilla Tag (Quest; conservative classification)",
+    "displayName": "Gorilla Tag",
     "engine": "Unity IL2CPP",
     "destination": "",
     "writeAuthorized": false,
@@ -9,13 +9,16 @@
     "modTypes": ["QMOD"],
     "loaderRequirements": ["QUEST_LOADER"],
     "installationStrategies": ["QMOD"],
-    "supportedVersionNames": ["1.1.145"],
-    "supportedVersionCodes": [29679],
+    "supportedVersionNames": ["1.1.146"],
+    "supportedVersionCodes": [29954],
     "evidenceLevel": "OPEN_SOURCE_PROJECT",
     "evidenceSources": [
       "https://github.com/Lauriethefish/QuestPatcher",
-      "https://github.com/sc2ad/scotland2"
-    ]
+      "https://github.com/sc2ad/scotland2",
+      "real device: Quest 3 serial 2G0YC5ZFBM03N1"
+    ],
+    "knownContentDirectories": ["vs_android", "vs_win64"],
+    "recognizedArchiveSignatures": ["package.json"]
   },
   {
     "packageId": "com.StressLevelZero.BONELAB",
@@ -54,7 +57,8 @@
     ],
     "evidenceLevel": "AUTHORITATIVE",
     "evidenceSources": [
-      "https://github.com/StressLevelZero/MarrowSDK/blob/main/Docs/BuildPallet.md"
+      "https://github.com/StressLevelZero/MarrowSDK/blob/main/Docs/BuildPallet.md",
+      "real device: 40+ content mods installed and verified"
     ]
   },
   {
@@ -66,9 +70,9 @@
       "/sdcard/Android/data/com.Warpfrog.BladeAndSorcery/files/Mods"
     ],
     "knownContentDirectories": ["Mods", "mods"],
-    "supportedPackageTypes": ["KNOWN_GAME_PROFILE"],
-    "modTypes": ["KNOWN_GAME_PROFILE"],
-    "installationStrategies": ["KNOWN_GAME_PROFILE"],
+    "supportedPackageTypes": ["KNOWN_GAME_PROFILE", "QMOD", "NFVR_MANIFEST"],
+    "modTypes": ["KNOWN_GAME_PROFILE", "QMOD", "NFVR_MANIFEST"],
+    "installationStrategies": ["KNOWN_GAME_PROFILE", "QMOD", "NFVR_MANIFEST"],
     "recognizedArchiveSignatures": [
       "manifest.json",
       "module.json",
@@ -81,8 +85,10 @@
     "apkSha256": "48e49e3d88590ae572df1885f67f4a5f2d9d8397dae16475c25b4d471e6e2324",
     "evidenceLevel": "AUTHORITATIVE",
     "evidenceSources": [
-      "device probe fixture: Quest Mods directory and APK inspection"
-    ]
+      "real device: Quest 3 serial 2G0YC5ZFBM03N1, Mods directory verified",
+      "Nomad ThunderRoad mod format with manifest.json, managed DLLs, and asset bundles"
+    ],
+    "loaderRequirements": ["QUEST_LOADER", "SCOTLAND2"]
   },
   {
     "packageId": "com.beatgames.beatsaber",
@@ -92,6 +98,12 @@
     "authoritativePaths": [
       "/sdcard/ModData/com.beatgames.beatsaber/Mods",
       "/sdcard/ModData/com.beatgames.beatsaber/Modloader",
+      "/sdcard/ModData/com.beatgames.beatsaber/Modloader/early_mods",
+      "/sdcard/ModData/com.beatgames.beatsaber/Modloader/mods",
+      "/sdcard/ModData/com.beatgames.beatsaber/Modloader/libs",
+      "/sdcard/ModData/com.beatgames.beatsaber/Packages",
+      "/sdcard/ModData/com.beatgames.beatsaber/Configs",
+      "/sdcard/ModData/com.beatgames.beatsaber/logs2",
       "/sdcard/Android/data/com.beatgames.beatsaber/files/mods",
       "/sdcard/Android/data/com.beatgames.beatsaber/files/libs"
     ],
@@ -114,7 +126,9 @@
     "evidenceLevel": "OPEN_SOURCE_PROJECT",
     "evidenceSources": [
       "https://github.com/Lauriethefish/QuestPatcher",
-      "https://github.com/sc2ad/scotland2"
+      "https://github.com/sc2ad/scotland2",
+      "https://github.com/Lauriethefish/ModsBeforeFriday",
+      "real device: Scotland2 loader detected, 16+ QMOD packages installed"
     ]
   }
 ]

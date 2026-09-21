@@ -371,6 +371,13 @@ class ModsManager(
         add("/sdcard/Android/data/${installedApp.packageName}/files/Plugins", "known package Plugins path")
         add("/sdcard/Android/data/${installedApp.packageName}/files/plugins", "known package plugins path")
         add("/sdcard/ModData/${installedApp.packageName}", "known ModData package path")
+        add("/sdcard/ModData/${installedApp.packageName}/Mods", "Scotland2 Mods path")
+        add("/sdcard/ModData/${installedApp.packageName}/Modloader", "Scotland2 Modloader root")
+        add("/sdcard/ModData/${installedApp.packageName}/Modloader/early_mods", "Scotland2 early_mods path")
+        add("/sdcard/ModData/${installedApp.packageName}/Modloader/mods", "Scotland2 mods path")
+        add("/sdcard/ModData/${installedApp.packageName}/Modloader/libs", "Scotland2 libs path")
+        add("/sdcard/ModData/${installedApp.packageName}/Packages", "Scotland2 QMOD packages path")
+        add("/sdcard/ModData/${installedApp.packageName}/Configs", "Scotland2 configs path")
         val candidates = paths.map { (path, source) ->
             ModDirectoryCandidate(
                 packageId = installedApp.packageName,
