@@ -80,12 +80,13 @@
       ".assetbundle",
       ".bundle"
     ],
-    "supportedVersionNames": ["1.0.7"],
-    "supportedVersionCodes": [682],
+    "supportedVersionNames": ["1.0.7", "1.3.1"],
+    "supportedVersionCodes": [682, 260730005],
     "apkSha256": "48e49e3d88590ae572df1885f67f4a5f2d9d8397dae16475c25b4d471e6e2324",
     "evidenceLevel": "AUTHORITATIVE",
     "evidenceSources": [
       "real device: Quest 3 serial 2G0YC5ZFBM03N1, Mods directory verified",
+      "real device re-probe: Nomad 1.3.1/260730005 installed",
       "Nomad ThunderRoad mod format with manifest.json, managed DLLs, and asset bundles"
     ],
     "loaderRequirements": ["QUEST_LOADER", "SCOTLAND2"]
@@ -121,14 +122,15 @@
     ],
     "loaderRequirements": ["QUEST_LOADER", "SCOTLAND2"],
     "recognizedArchiveSignatures": ["mod.json", "qmod.json"],
-    "supportedVersionNames": ["1.42.2_13885"],
-    "supportedVersionCodes": [2182],
+    "supportedVersionNames": ["1.42.2_13885", "1.40.8_7379"],
+    "supportedVersionCodes": [2182, 1716],
     "evidenceLevel": "OPEN_SOURCE_PROJECT",
     "evidenceSources": [
       "https://github.com/Lauriethefish/QuestPatcher",
       "https://github.com/sc2ad/scotland2",
       "https://github.com/Lauriethefish/ModsBeforeFriday",
-      "real device: Scotland2 loader detected, 16+ QMOD packages installed"
+      "real device: Scotland2 loader detected, 16+ QMOD packages installed",
+      "real device re-probe: Beat Saber 1.40.8_7379, Modloader/libsl2.so + libs/lib*.so verified"
     ]
   }
 ]

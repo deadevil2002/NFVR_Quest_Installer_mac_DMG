@@ -63,6 +63,11 @@ class QuestPreparationReportExporterTest {
             Files.createSymbolicLink(link, outside)
         } catch (_: UnsupportedOperationException) {
             return
+        } catch (_: java.nio.file.FileSystemException) {
+            // Windows without symlink privilege (SeCreateSymbolicLinkPrivilege)
+            // cannot create the fixture link; the exporter itself is not at
+            // fault, so skip instead of failing the suite.
+            return
         }
         assertFailsWith<IllegalArgumentException> {
             QuestPreparationReportExporter.export(report("com.StressLevelZero.BONELAB"), dir)

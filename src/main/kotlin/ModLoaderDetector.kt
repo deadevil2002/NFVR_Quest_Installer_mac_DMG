@@ -360,12 +360,21 @@ class AdbFilesystemLoaderVerifier(
         val packageId = app.packageName
 
         // Scotland2 ModData root: /sdcard/ModData/<packageId>/Modloader/
+        // Real-device evidence (Quest 3, Beat Saber): the bootstrap library
+        // lives directly at Modloader/libsl2.so, with dependency libraries
+        // under Modloader/libs/lib*.so.  Both layouts are accepted.
         val modloaderRoot = "/sdcard/ModData/$packageId/Modloader"
         val modloaderExists = adbClient.shell(serial, "test", "-d", modloaderRoot).exit == 0
 
-        // Check for the Scotland2 bootstrap library
-        val libsl2Path = "$modloaderRoot/libs/libsl2.so"
-        val libsl2Exists = adbClient.shell(serial, "test", "-f", libsl2Path).exit == 0
+        // Check for the Scotland2 bootstrap library (both known layouts)
+        val libsl2Paths = listOf(
+            "$modloaderRoot/libsl2.so",
+            "$modloaderRoot/libs/libsl2.so"
+        )
+        val foundLibsl2Path = libsl2Paths.firstOrNull { path ->
+            adbClient.shell(serial, "test", "-f", path).exit == 0
+        }
+        val libsl2Exists = foundLibsl2Path != null
 
         // Check for the Scotland2 loader directory structure
         val earlyModsExists = adbClient.shell(serial, "test", "-d", "$modloaderRoot/early_mods").exit == 0
@@ -376,7 +385,7 @@ class AdbFilesystemLoaderVerifier(
         if (!hasScotland2Evidence) return null
 
         val evidenceList = mutableListOf<String>()
-        if (libsl2Exists) evidenceList += "filesystem: $libsl2Path exists"
+        if (foundLibsl2Path != null) evidenceList += "filesystem: $foundLibsl2Path exists"
         if (modloaderExists) evidenceList += "filesystem: $modloaderRoot exists"
         if (earlyModsExists) evidenceList += "filesystem: $modloaderRoot/early_mods exists"
         if (modsExists) evidenceList += "filesystem: $modloaderRoot/mods exists"
