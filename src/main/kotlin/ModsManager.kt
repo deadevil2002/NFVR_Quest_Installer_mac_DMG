@@ -401,8 +401,22 @@ class ModsManager(
                 "package=${installedApp.packageName}",
                 "candidateCount=${candidates.size}"
             ),
-            beatSaberInventory = collectBeatSaberInventory(serial, installedApp)
+            beatSaberInventory = collectBeatSaberInventory(serial, installedApp),
+            pavlovRunAsFunctional = probePavlovRunAs(serial, installedApp)
         )
+    }
+
+    /**
+     * Pavlov only, strictly read-only: reports whether `run-as` functions
+     * for the installed package (debuggable build).  Never a write probe
+     * and never an install gate; shell writes were proven denied on
+     * device even where run-as reads work.
+     */
+    private fun probePavlovRunAs(serial: String, installedApp: InstalledQuestApp): Boolean? {
+        if (installedApp.packageName != ModPackageAnalyzer.PAVLOV_PACKAGE_ID) return null
+        return runCatching {
+            adbClient.shell(serial, "run-as", installedApp.packageName, "ls").exit == 0
+        }.getOrDefault(false)
     }
 
     /**
@@ -714,6 +728,9 @@ class ModsManager(
         val tempRoot = Files.createTempDirectory("NFVR_ModPlan_").toFile()
         var copiedBytes = 0L
         var copiedFiles = 0
+        var remoteStagingDir: String? = null
+        val tempRootBase = executionPlan.destinationRoot?.trimEnd('/')
+            ?.takeIf { it.isNotBlank() && AndroidPathValidator.isSafe(it) }
         try {
             onProgress(ModExecutionProgress(ModInstallPhase.EXTRACTING, null, "استخراج الملفات المطلوبة بأمان"))
             if (!archiveIdentityMatches(zipFile, reviewedIdentity)) {
@@ -828,7 +845,43 @@ class ModsManager(
                 }
             }
 
-            for (mapping in executionPlan.mappings) {
+            // Entries the host cannot materialize (Windows-illegal names)
+            // stage through an NFVR-owned remote temp dir under the
+            // approved root, then move to their exact final names.  Plans
+            // without such entries transfer exactly like before.
+            val tempIndices = executionPlan.mappings.mapIndexedNotNull { index, mapping ->
+                index.takeIf {
+                    requiresSafeTempName(mapping.destinationPath.substringAfterLast('/'))
+                }
+            }.toSet()
+            if (tempIndices.isNotEmpty()) {
+                if (tempRootBase == null) {
+                    return ModInstallResult(false, "لم يتم إثبات جذر محتوى معتمد قبل النقل.")
+                }
+                val tmp = remoteTempDir(tempRootBase, operationBinding.analysisPlanId)
+                if (tmp == null || !isNfvrTempDir(tmp, tempRootBase)) {
+                    return ModInstallResult(
+                        false,
+                        customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                    )
+                }
+                runCatching {
+                    adbClient.shell(serial, "rm", "-rf", shellQuoteRemotePath(tmp))
+                }
+                val mkTemp = createModPath(serial, tmp, approvedBase = tempRootBase)
+                if (mkTemp.exit != 0) {
+                    DiagnosticLogger.info(
+                        "ADB mkdir failed for remote temp dir: exit=${mkTemp.exit}, stderr=${mkTemp.err}"
+                    )
+                    return ModInstallResult(
+                        false,
+                        customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
+                    )
+                }
+                remoteStagingDir = tmp
+            }
+
+            for ((index, mapping) in executionPlan.mappings.withIndex()) {
                 val destination = mapping.destinationPath
                 if (!isApprovedDestination(destination, profile, executionPlan)) {
                     return ModInstallResult(false, "تم رفض وجهة غير معتمدة: $destination")
@@ -843,6 +896,7 @@ class ModsManager(
                     DiagnosticLogger.info(
                         "ADB mkdir failed for mod destination: exit=${mkdir.exit}, stderr=${mkdir.err}, stdout=${mkdir.out}"
                     )
+                    cleanupRemoteTempDir(serial, remoteStagingDir, tempRootBase)
                     return ModInstallResult(
                         false,
                         customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION)
@@ -850,17 +904,28 @@ class ModsManager(
                 }
 
                 val source = extracted.getValue(mapping.sourcePath)
+                // Staged entries push to the NFVR-owned temp dir, then move
+                // to the exact final name.  Everything else pushes direct.
+                val staging = remoteStagingDir
+                val useStaging = index in tempIndices && staging != null
+                val pushTarget = if (useStaging) {
+                    "$staging/part-%04d".format(index)
+                } else {
+                    destination
+                }
+                val displayName = destination.substringAfterLast('/')
                 onProgress(
                     ModExecutionProgress(
                         ModInstallPhase.TRANSFERRING,
                         executionPlan.progress(copiedBytes, copiedFiles).fraction.coerceAtMost(0.94),
-                        transferProgressMessage(source, copiedFiles, executionPlan)
+                        transferProgressMessage(source, copiedFiles, executionPlan, displayName = displayName)
                     )
                 )
-                val pushed = adbClient.pushModFileWithProgress(
+                val pushed = pushModFileWithRetry(
                     serial,
                     source,
-                    destination,
+                    pushTarget,
+                    maxAttempts = 2,
                     onProgress = { current, _ ->
                         val fraction = executionPlan.progress(copiedBytes + current, copiedFiles)
                             .fraction.coerceAtMost(0.94)
@@ -872,7 +937,8 @@ class ModsManager(
                                     source,
                                     copiedFiles,
                                     executionPlan,
-                                    currentBytes = current
+                                    currentBytes = current,
+                                    displayName = displayName
                                 )
                             )
                         )
@@ -882,14 +948,34 @@ class ModsManager(
                     DiagnosticLogger.info(
                         "ADB push failed for ${mapping.sourcePath}: exit=${pushed.exit}, stderr=${pushed.err}, stdout=${pushed.out}"
                     )
+                    cleanupRemoteTempDir(serial, remoteStagingDir, tempRootBase)
                     return ModInstallResult(
                         false,
                         customerModExecutionFailureMessage(ModExecutionFailureKind.TRANSFER)
                     )
                 }
+                if (useStaging) {
+                    val moved = adbClient.shell(
+                        serial,
+                        "mv",
+                        shellQuoteRemotePath(pushTarget),
+                        shellQuoteRemotePath(destination)
+                    )
+                    if (moved.exit != 0) {
+                        DiagnosticLogger.info(
+                            "ADB mv failed for ${mapping.sourcePath}: exit=${moved.exit}, stderr=${moved.err}, stdout=${moved.out}"
+                        )
+                        cleanupRemoteTempDir(serial, remoteStagingDir, tempRootBase)
+                        return ModInstallResult(
+                            false,
+                            customerModExecutionFailureMessage(ModExecutionFailureKind.TRANSFER)
+                        )
+                    }
+                }
                 copiedBytes += mapping.sizeBytes
                 copiedFiles++
             }
+            cleanupRemoteTempDir(serial, remoteStagingDir, tempRootBase)
 
             onProgress(
                 ModExecutionProgress(
@@ -962,6 +1048,7 @@ class ModsManager(
             }
             return ModInstallResult(true, successMessage)
         } catch (e: Exception) {
+            cleanupRemoteTempDir(serial, remoteStagingDir, tempRootBase)
             ModInstallHistory.record(executionPlan, false, e.message ?: "error")
             DiagnosticLogger.error("فشل تنفيذ خطة تثبيت المود", e)
             return ModInstallResult(
@@ -1024,11 +1111,19 @@ class ModsManager(
         val root = tempRoot.canonicalFile.toPath()
         val files = linkedMapOf<String, File>()
         ZipFile(zipFile).use { zip ->
-            for (mapping in plan.mappings) {
+            for ((index, mapping) in plan.mappings.withIndex()) {
                 val entry = findNormalizedEntry(zip, mapping.sourcePath)
                     ?: error("الملف ${mapping.sourcePath} غير موجود داخل الحزمة.")
                 require(!entry.isDirectory) { "لا يمكن تثبيت مجلد كملف: ${mapping.sourcePath}" }
-                val outputPath = root.resolve(mapping.sourcePath).normalize()
+                // Entries Windows cannot materialize (for example ASCII
+                // quotes) stream into a generated safe temp name; the
+                // archive path stays the mapping key and the remote final
+                // name stays exact.
+                val outputPath = if (requiresSafeTempName(mapping.sourcePath.substringAfterLast('/'))) {
+                    root.resolve(safeLocalTempName(index, mapping.sha256)).normalize()
+                } else {
+                    root.resolve(mapping.sourcePath).normalize()
+                }
                 require(outputPath.startsWith(root)) { "تم رفض مسار استخراج غير آمن." }
                 val output = outputPath.toFile()
                 output.parentFile?.mkdirs()
@@ -1125,15 +1220,16 @@ class ModsManager(
         source: File,
         copiedFiles: Int,
         plan: ModInstallPlan,
-        currentBytes: Long? = null
+        currentBytes: Long? = null,
+        displayName: String? = null
     ): String {
         val current = currentBytes?.coerceAtLeast(0L)
         val byteText = if (current == null) {
-            "${source.length()} بايت"
+            "${source.length()} ????"
         } else {
-            "$current/${source.length()} بايت"
+            "$current/${source.length()} ????"
         }
-        return "نقل ${source.name} — ملف ${copiedFiles + 1}/${plan.totalFiles}، $byteText"
+        return "??? ${displayName ?: source.name} - ??? ${copiedFiles + 1}/${plan.totalFiles}? $byteText"
     }
 
     private fun executionProfile(plan: ModInstallPlan): GameModProfile? {
@@ -1193,6 +1289,57 @@ class ModsManager(
             }
         }
         return null
+    }
+
+    /**
+     * Best-effort removal of the NFVR-owned remote staging dir.  Refuses
+     * anything outside the approved root or outside our namespace, so a
+     * confused caller can never delete user content.
+     */
+    private fun cleanupRemoteTempDir(serial: String, tmpDir: String?, root: String?) {
+        if (tmpDir.isNullOrBlank() || root.isNullOrBlank()) return
+        if (!isNfvrTempDir(tmpDir, root)) {
+            DiagnosticLogger.info("Refusing to clean non-NFVR temp dir: $tmpDir")
+            return
+        }
+        runCatching { adbClient.shell(serial, "rm", "-rf", shellQuoteRemotePath(tmpDir)) }
+        DiagnosticLogger.info("Cleaned remote temp dir: $tmpDir")
+    }
+
+    /**
+     * Bounded per-file push retry for transient ADB transport flakes.
+     * Same bytes to the same already-collision-checked destination; a
+     * partially pushed file is overwritten by the retry and the existing
+     * byte-size verification still guards the result, so fail-closed
+     * semantics are unchanged.  Exactly one retry keeps long installs
+     * robust without masking persistent failures.
+     */
+    private fun pushModFileWithRetry(
+        serial: String,
+        source: File,
+        pushTarget: String,
+        maxAttempts: Int,
+        onProgress: (copiedBytes: Long, totalBytes: Long) -> Unit
+    ): CmdResult {
+        var last: CmdResult = CmdResult(1, "", "push did not run")
+        repeat(maxAttempts.coerceAtLeast(1)) { attempt ->
+            if (attempt > 0) {
+                DiagnosticLogger.info(
+                    "Retrying ADB push of ${source.name} (attempt ${attempt + 1})"
+                )
+                runCatching { adbClient.killServer() }
+                runCatching { adbClient.startServer() }
+            }
+            last = adbClient.pushModFileWithProgress(
+                serial, source, pushTarget, onProgress = onProgress
+            )
+            if (last.exit == 0) return last
+            DiagnosticLogger.info(
+                "ADB push attempt ${attempt + 1} failed for ${source.name}: " +
+                    "exit=${last.exit}, stderr=${last.err.take(300)}"
+            )
+        }
+        return last
     }
 
     private suspend fun verifyRemoteFile(serial: String, mapping: ModFileMapping): String? {
@@ -1304,7 +1451,23 @@ class ModsManager(
                      * operation, mkdir fails instead of recreating it.
                      */
                     val created = adbClient.shell(serial, "mkdir", shellQuoteRemotePath(current))
-                    if (created.exit != 0) return created
+                    if (created.exit != 0) {
+                        // A negative `test -d` followed by EEXIST is a
+                        // stale FUSE negative cache or a concurrent
+                        // creator (proven on real hardware: the recheck
+                        // can stay stale for its TTL, so retry with
+                        // backoff).  Only an actual directory continues.
+                        var rechecked = false
+                        for (attempt in 0 until 3) {
+                            if (attempt > 0) Thread.sleep(500)
+                            if (adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(current)).exit == 0) {
+                                rechecked = true
+                                break
+                            }
+                        }
+                        if (!rechecked) return created
+                        DiagnosticLogger.info("mkdir raced an existing dir, continuing: $current")
+                    }
                 }
             }
         }
@@ -1398,4 +1561,45 @@ internal fun parseQuestDfAvailableBytes(dfOutput: String): Long? {
     val availableKb = parts[3].toLongOrNull() ?: return null
     if (availableKb < 0L) return null
     return availableKb * 1024L
+}
+
+private val WINDOWS_ILLEGAL_BASENAME_CHARS = setOf('\\', '/', ':', '*', '?', '"', '<', '>', '|')
+
+/**
+ * True when a remote basename cannot be materialized as a host temp file
+ * on Windows (Win32 illegal set, controls, trailing space/dot).  Such
+ * entries are extracted under a generated safe name and renamed remotely
+ * to their exact final name; the archive and manifests are never altered.
+ */
+internal fun requiresSafeTempName(basename: String): Boolean {
+    if (basename.isEmpty()) return true
+    if (basename.any { it in WINDOWS_ILLEGAL_BASENAME_CHARS || it.code < 32 }) return true
+    return basename.endsWith(' ') || basename.endsWith('.')
+}
+
+/** Deterministic, collision-resistant host temp name (never user data). */
+internal fun safeLocalTempName(index: Int, sourceSha256: String?): String {
+    val tag = sourceSha256?.filter { it.isLetterOrDigit() }?.take(16)?.ifBlank { null } ?: "nohash"
+    return "%04d-%s.nfvrpart".format(index, tag)
+}
+
+/**
+ * NFVR-owned remote staging dir inside the approved mod root, unique per
+ * operation.  Null when no safe dir can be derived.
+ */
+internal fun remoteTempDir(root: String, planId: String): String? {
+    val clean = root.trim().trimEnd('/')
+    if (clean.isBlank() || !AndroidPathValidator.isSafe(clean)) return null
+    val suffix = planId.filter { it.isLetterOrDigit() }.take(12).ifBlank { return null }
+    return "$clean/.nfvr-tmp-$suffix"
+}
+
+/** True only for NFVR staging dirs strictly inside the approved root. */
+internal fun isNfvrTempDir(path: String, root: String): Boolean {
+    val cleanRoot = root.trim().trimEnd('/')
+    if (cleanRoot.isBlank()) return false
+    val name = path.trim().trimEnd('/').substringAfterLast('/')
+    return path.trim().trimEnd('/').startsWith("$cleanRoot/") &&
+        name.startsWith(".nfvr-tmp-") &&
+        name.length > ".nfvr-tmp-".length
 }

@@ -11,13 +11,15 @@ object AndroidPathValidator {
     private val unsafeCharacters = Regex("""[;|`><\r\n\u0000]""")
     // Unity/Marrow bundle names commonly contain parentheses (for example
     // bl_plane(night).bundle), apostrophes (mango'sm16...bundle), dollar
-    // signs, ampersands (s&wshieldplus...bundle), and plus signs
-    // (reticle++...bundle). They are ordinary path characters, not shell
-    // syntax: the Mods transport single-quotes every remote path (`'\\''`
-    // idiom for quotes). Retain the existing control/separator checks
-    // while accepting them in verified destination paths.  Non-ASCII
-    // quotes stay rejected: Windows cannot extract such names at all.
-    private val allowedCharacters = Regex("""^[A-Za-z0-9._/ ()$'&+-]+$""")
+    // signs, ampersands (s&wshieldplus...bundle), plus signs
+    // (reticle++...bundle), ASCII quotes, and Unicode smart quotes
+    // (sr2m"veresk".bundle). They are ordinary path characters, not shell
+    // syntax: the Mods transport single-quotes every remote path (`'\''`
+    // idiom for quotes), and Windows materializes every one of these
+    // except ASCII quotes (which stage through temp names instead).
+    // Retain the existing control/separator checks while accepting them
+    // in verified destination paths.
+    private val allowedCharacters = Regex("^[A-Za-z0-9._/ ()$'&+\"\\u201c\\u201d-]+$")
 
     fun isSafe(path: String): Boolean {
         val value = path.trim()

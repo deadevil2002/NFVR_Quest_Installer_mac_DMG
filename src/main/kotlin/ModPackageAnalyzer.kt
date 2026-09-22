@@ -141,7 +141,7 @@ class ModPackageAnalyzer(
                 isBonelabPayload(archive, installedApp) ->
                     analyzeBonelabPayload(archive, installedApp, loaderDetection, directoryDiscovery)
                 isPavlovPayload(zipFile, archive) ->
-                    analyzePavlovPayload(zipFile, archive, installedApp)
+                    analyzePavlovPayload(zipFile, archive, installedApp, directoryDiscovery)
                 isKnownGameProfilePayload(archive, installedApp) ->
                     analyzeKnownGameProfile(archive, installedApp, loaderDetection)
                 directoryDiscovery != null && directoryDiscovery.existingCandidates.isNotEmpty() ->
@@ -2312,10 +2312,25 @@ class ModPackageAnalyzer(
     private fun analyzePavlovPayload(
         zipFile: File,
         archive: ArchiveMetadata,
-        installedApp: InstalledQuestApp?
+        installedApp: InstalledQuestApp?,
+        directoryDiscovery: ModDirectoryDiscovery? = null
     ): ModPackageAnalysis {
         val preconditions = mutableListOf<ModInstallPrecondition>()
         checkTarget(PAVLOV_PACKAGE_ID, installedApp, "Pavlov", preconditions)
+        // run-as readability is diagnostic only.  Shell writes were proven
+        // denied on device, and taint bytes are server-derived, so no
+        // combination reaches an install plan.
+        when (directoryDiscovery?.pavlovRunAsFunctional) {
+            true -> preconditions += satisfied(
+                "PAVLOV_RUN_AS_FUNCTIONAL",
+                "run-as reads work for Pavlov, but shell writes were proven denied and taint is server-derived."
+            )
+            false -> preconditions += satisfied(
+                "PAVLOV_RUN_AS_UNAVAILABLE",
+                "run-as is unavailable for Pavlov on this device."
+            )
+            null -> Unit
+        }
         preconditions += satisfied(
             "PAVLOV_MOD_IO_MANAGED",
             "Pavlov UGC content is mounted by the game's own mod.io runtime."

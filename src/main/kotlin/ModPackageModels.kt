@@ -438,7 +438,14 @@ data class ModDirectoryDiscovery(
      * dependency declarations.  Null when unavailable or inapplicable;
      * analysis without inventory keeps the conservative dependency gate.
      */
-    val beatSaberInventory: BeatSaberModInventory? = null
+    val beatSaberInventory: BeatSaberModInventory? = null,
+    /**
+     * Pavlov only: whether `run-as <package>` legitimately functions for
+     * reads on this device (debuggable build).  Diagnostic evidence only:
+     * Pavlov authorizes no install plan either way, and shell writes were
+     * proven denied even where run-as reads work.
+     */
+    val pavlovRunAsFunctional: Boolean? = null
 ) {
     val existingCandidates: List<ModDirectoryCandidate>
         get() = candidates.filter { it.exists }

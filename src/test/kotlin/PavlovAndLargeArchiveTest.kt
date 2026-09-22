@@ -227,6 +227,46 @@ class PavlovAndLargeArchiveTest {
     }
 
     @Test
+    fun pavlovRunAsCapabilityRecordedWithoutUnblocking() = runBlocking {
+        val archive = pavlovFixture()
+        try {
+            val functional = ModsManager(
+                RunAsAdb(runAsWorks = true),
+                StaticModLoaderDetector(ModLoaderDetection(pavlov.packageName, emptyMap())),
+                NoOpApkModLoaderPatcher
+            )
+            val discovery = functional.discoverModDirectories("SERIAL", pavlov)
+            assertEquals(true, discovery.pavlovRunAsFunctional)
+            val blocked = ModPackageAnalyzer().analyze(
+                archive, pavlov, null, discovery
+            )
+            // Capability recorded, install still impossible: taint bytes
+            // are server-derived and shell writes were proven denied.
+            assertFalse(blocked.installable)
+            assertTrue(blocked.installPlan.mappings.isEmpty())
+            assertTrue(
+                blocked.installPlan.preconditions.any {
+                    it.satisfied && it.code == "PAVLOV_RUN_AS_FUNCTIONAL"
+                }
+            )
+            val broken = ModsManager(
+                RunAsAdb(runAsWorks = false),
+                StaticModLoaderDetector(ModLoaderDetection(pavlov.packageName, emptyMap())),
+                NoOpApkModLoaderPatcher
+            )
+            val discoveryDown = broken.discoverModDirectories("SERIAL", pavlov)
+            assertEquals(false, discoveryDown.pavlovRunAsFunctional)
+            val stillBlocked = ModPackageAnalyzer().analyze(
+                archive, pavlov, null, discoveryDown
+            )
+            assertFalse(stillBlocked.installable)
+            assertTrue(stillBlocked.installPlan.mappings.isEmpty())
+        } finally {
+            archive.delete()
+        }
+    }
+
+    @Test
     fun traversalRejected() {
         val archive = zipOf(
             "metadata.json" to """{"EngineVersion":"5.1.1","ModType":1}""",
@@ -359,6 +399,32 @@ class PavlovAndLargeArchiveTest {
             zip.closeEntry()
         }
         return file
+    }
+
+    private class RunAsAdb(
+        private val runAsWorks: Boolean
+    ) : AdbClient(BundledAdb(HostOs.LINUX)) {
+        override fun shell(serial: String, vararg args: String): CmdResult {
+            val command = args.toList()
+            return when {
+                command == listOf("pm", "list", "packages", "-3", "-f") ->
+                    CmdResult(0, "package:/data/app/com.vankrupt.pavlov/base.apk=com.vankrupt.pavlov\n", "")
+                command == listOf("dumpsys", "package", "com.vankrupt.pavlov") ->
+                    CmdResult(0, "versionName=1.0.29 versionCode=2397\n", "")
+                command.firstOrNull() == "run-as" ->
+                    if (runAsWorks) CmdResult(0, "cache\ncode_cache\n", "")
+                    else CmdResult(1, "", "run-as: package not debuggable")
+                else -> CmdResult(1, "", "absent")
+            }
+        }
+
+        override fun pushModFileWithProgress(
+            serial: String,
+            from: File,
+            toDevicePath: String,
+            onProgress: (copiedBytes: Long, totalBytes: Long) -> Unit,
+            cancelled: () -> Boolean
+        ): CmdResult = CmdResult(1, "", "unused")
     }
 
     private class TinyDfAdb(

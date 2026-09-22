@@ -1,6 +1,7 @@
 import java.io.File
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -53,7 +54,7 @@ class ModsTransportAndInventoryTest {
         assertTrue(
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/reticle++-1.bundle")
         )
-        assertFalse(
+        assertTrue(
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/sr2m“veresk”.bundle")
         )
         assertFalse(AndroidPathValidator.isSafe("/sdcard/a;b"))
@@ -270,6 +271,275 @@ class ModsTransportAndInventoryTest {
                     it.registration.contains("universal", ignoreCase = true)
             }
         )
+    }
+
+    // ---- safe temp transport ----
+
+    @Test
+    fun windowsIllegalNamesNeedTempStaging() {
+        assertTrue(requiresSafeTempName("we\"ird.bundle"))
+        assertTrue(requiresSafeTempName("a*b"))
+        assertTrue(requiresSafeTempName("a?b"))
+        assertTrue(requiresSafeTempName("a<b"))
+        assertTrue(requiresSafeTempName("trailing."))
+        assertTrue(requiresSafeTempName("trailing "))
+        assertTrue(requiresSafeTempName(""))
+        // Smart quotes, $, ', &, +, spaces: legal on Windows, direct.
+        assertFalse(requiresSafeTempName("sr2m“veresk”.bundle"))
+        assertFalse(requiresSafeTempName("\$black_color.bundle"))
+        assertFalse(requiresSafeTempName("mango'sm16.bundle"))
+        assertFalse(requiresSafeTempName("normal.bundle"))
+    }
+
+    @Test
+    fun tempNamesAreSafeAndDeterministic() {
+        val first = safeLocalTempName(3, "abc123")
+        val second = safeLocalTempName(3, "abc123")
+        assertEquals(first, second)
+        assertTrue(first.endsWith(".nfvrpart"))
+        assertFalse(requiresSafeTempName(first))
+        assertTrue(safeLocalTempName(4, "abc123") != first)
+    }
+
+    @Test
+    fun remoteTempDirStaysInsideApprovedRoot() {
+        val root = "/sdcard/Android/data/x/files/Mods"
+        val tmp = remoteTempDir(root, "planid123456")
+        assertTrue(tmp != null && tmp.startsWith("$root/.nfvr-tmp-"))
+        assertTrue(isNfvrTempDir(tmp!!, root))
+        assertEquals(null, remoteTempDir("", "planid123456"))
+        assertEquals(null, remoteTempDir(root, ""))
+        assertEquals(null, remoteTempDir("/etc", "planid123456"))
+        assertFalse(isNfvrTempDir(root, root))
+        assertFalse(isNfvrTempDir("/sdcard/other/.nfvr-tmp-x", root))
+        assertFalse(isNfvrTempDir("$root/.nfvr-tmp-", root))
+        assertFalse(isNfvrTempDir("$root/other", root))
+    }
+
+    @Test
+    fun quoteFileStagesThroughTempAndKeepsExactFinalName() = runBlocking {
+        val archive = quoteFixture()
+        try {
+            val adb = TempTransportAdb(bonelabApp())
+            val manager = managerFor(adb, bonelabApp())
+            val analysis = manager.analyzeModPackage(archive, bonelabApp())
+            assertTrue(analysis.installable, analysis.message + " :: " + analysis.installPlan.preconditions.toString())
+            val plan = analysis.installPlan.bindToDevice("SERIAL")
+            assertTrue(plan.installable, plan.preconditions.toString())
+            val result = manager.executeInstallPlan("SERIAL", archive, plan)
+            assertTrue(result.success, result.message)
+            // The trailing-dot file (Windows-unmaterializable) pushed to
+            // temp, then moved to the exact final; others pushed direct.
+            val dotFinal = plan.mappings.first { it.destinationPath.endsWith("trailingdot.") }.destinationPath
+            val pushes = adb.pushTargets.filter { it.endsWith(".nfvrpart") || it.contains(".nfvr-tmp-") }
+            assertTrue(pushes.isNotEmpty(), adb.pushTargets.toString())
+            assertTrue(adb.pushTargets.none { it.endsWith("trailingdot.") }, adb.pushTargets.toString())
+            assertEquals(1, adb.moves.count { it.second == dotFinal }, adb.moves.toString())
+            assertTrue(adb.cleaned, "remote temp dir must be cleaned after success")
+            // Final verification saw the exact difficult names.
+            assertTrue(adb.verifiedFiles.any { it.endsWith("trailingdot.") }, adb.verifiedFiles.toString())
+            assertTrue(adb.verifiedFiles.any { it.contains("“veresk”") }, adb.verifiedFiles.toString())
+        } finally {
+            archive.delete()
+        }
+    }
+
+    @Test
+    fun failedStagedTransferCleansTempAndWritesNoFinal() = runBlocking {
+        val archive = quoteFixture()
+        try {
+            val adb = TempTransportAdb(bonelabApp(), failPush = true)
+            val manager = managerFor(adb, bonelabApp())
+            val plan = manager.analyzeModPackage(archive, bonelabApp()).installPlan
+                .bindToDevice("SERIAL")
+            val result = manager.executeInstallPlan("SERIAL", archive, plan)
+            assertFalse(result.success)
+            assertTrue(adb.cleaned, "remote temp dir must be cleaned after failure")
+            assertTrue(adb.moves.isEmpty())
+        } finally {
+            archive.delete()
+        }
+    }
+
+    @Test
+    fun mkdirEexistRaceContinuesWhenDirExists() = runBlocking {
+        val adb = object : AdbClient(BundledAdb(HostOs.LINUX)) {
+            val tests = linkedMapOf<String, Int>()
+            override fun shell(serial: String, vararg args: String): CmdResult {
+                val command = args.toList()
+                if (command.firstOrNull() == "test" && command.getOrNull(1) == "-d") {
+                    val path = shellUnquoteRemotePath(command.getOrNull(2).orEmpty())
+                    tests[path] = (tests[path] ?: 0) + 1
+                    // First probe misses (stale cache), recheck hits.
+                    return CmdResult(if ((tests[path] ?: 0) > 1) 0 else 1, "", "")
+                }
+                if (command.firstOrNull() == "mkdir") {
+                    return CmdResult(1, "", "mkdir: File exists")
+                }
+                return CmdResult(0, "", "")
+            }
+        }
+        val manager = ModsManager(
+            adb,
+            StaticModLoaderDetector(ModLoaderDetection(bonelabApp().packageName, emptyMap())),
+            NoOpApkModLoaderPatcher
+        )
+        val base = "/sdcard/Android/data/${bonelabApp().packageName}/files/Mods"
+        val result = manager.createModPath("SERIAL", "$base/M", approvedBase = base)
+        assertEquals(0, result.exit)
+    }
+
+    @Test
+    fun mkdirStaleCacheRecheckEventuallyContinues() = runBlocking {
+        var probes = 0
+        val adb = object : AdbClient(BundledAdb(HostOs.LINUX)) {
+            override fun shell(serial: String, vararg args: String): CmdResult {
+                val command = args.toList()
+                if (command.firstOrNull() == "test" && command.getOrNull(1) == "-d") {
+                    probes++
+                    // Stale negative cache for the first two probes.
+                    return CmdResult(if (probes > 2) 0 else 1, "", "")
+                }
+                if (command.firstOrNull() == "mkdir") {
+                    return CmdResult(1, "", "mkdir: File exists")
+                }
+                return CmdResult(0, "", "")
+            }
+        }
+        val manager = ModsManager(
+            adb,
+            StaticModLoaderDetector(ModLoaderDetection(bonelabApp().packageName, emptyMap())),
+            NoOpApkModLoaderPatcher
+        )
+        val base = "/sdcard/Android/data/${bonelabApp().packageName}/files/Mods"
+        val result = manager.createModPath("SERIAL", "$base/M", approvedBase = base)
+        assertEquals(0, result.exit)
+        assertTrue(probes >= 3)
+    }
+
+    private fun bonelabApp() = InstalledQuestApp(
+        ModPackageAnalyzer.BONELAB_PACKAGE_ID, "1.2974.57485", 2974L
+    )
+
+    private fun managerFor(adb: TempTransportAdb, app: InstalledQuestApp) = ModsManager(
+        adb,
+        StaticModLoaderDetector(ModLoaderDetection(app.packageName, emptyMap())),
+        NoOpApkModLoaderPatcher
+    )
+
+    private fun quoteFixture(): File {
+        // NOTE: ASCII quotes can never reach analysis on Windows because
+        // Win32 path parsing rejects them during archive inspection (a
+        // platform limit, not policy).  Trailing dots exercise the same
+        // temp-staging path end to end on this host; smart quotes flow
+        // direct like any legal name.
+        val file = File.createTempFile("nfvr-quote-", ".zip")
+        ZipOutputStream(file.outputStream().buffered()).use { zip ->
+            zip.putNextEntry(ZipEntry("M/pallet.json"))
+            zip.write(
+                """{"name":"Q","packageId":"com.StressLevelZero.BONELAB","gameVersion":"1.2974.57485","version":"1.0.0"}"""
+                    .toByteArray(Charsets.UTF_8)
+            )
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("M/trailingdot."))
+            zip.write("dot-bytes".toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("M/sr2m“veresk”.bundle"))
+            zip.write("smart-bytes".toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("M/normal.bundle"))
+            zip.write("normal-bytes".toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+        }
+        return file
+    }
+
+    @Test
+    fun transientPushFlakeRecoversOnRetry() = runBlocking {
+        val archive = quoteFixture()
+        try {
+            val adb = TempTransportAdb(bonelabApp(), failFirstPush = true)
+            val manager = managerFor(adb, bonelabApp())
+            val plan = manager.analyzeModPackage(archive, bonelabApp()).installPlan
+                .bindToDevice("SERIAL")
+            val result = manager.executeInstallPlan("SERIAL", archive, plan)
+            assertTrue(result.success, result.message)
+            assertTrue(adb.pushCalls >= plan.mappings.size + 1, "expected a retried push")
+            assertTrue(adb.cleaned)
+        } finally {
+            archive.delete()
+        }
+    }
+
+    private class TempTransportAdb(
+        private val app: InstalledQuestApp,
+        private val failPush: Boolean = false,
+        private val failFirstPush: Boolean = false
+    ) : AdbClient(BundledAdb(HostOs.LINUX)) {
+        val pushTargets = mutableListOf<String>()
+        var pushCalls = 0
+        val moves = mutableListOf<Pair<String, String>>()
+        val verifiedFiles = linkedSetOf<String>()
+        var cleaned = false
+        private val files = linkedMapOf<String, Long>()
+        private val modRoot = "/sdcard/Android/data/${app.packageName}/files/Mods"
+
+        private fun unq(raw: String) = shellUnquoteRemotePath(raw)
+
+        override fun shell(serial: String, vararg args: String): CmdResult {
+            val command = args.toList()
+            return when {
+                command == listOf("pm", "list", "packages", "-3", "-f") ->
+                    CmdResult(0, "package:/data/app/${app.packageName}/base.apk=${app.packageName}\n", "")
+                command == listOf("dumpsys", "package", app.packageName) ->
+                    CmdResult(0, "versionName=${app.versionName} versionCode=${app.versionCode}\n", "")
+                command.firstOrNull() == "df" ->
+                    CmdResult(0, "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/fuse 99999999 1000 99998999 1% /storage/emulated\n", "")
+                command.firstOrNull() == "test" && command.getOrNull(1) == "!" ->
+                    CmdResult(0, "", "")
+                command.firstOrNull() == "test" -> CmdResult(0, "", "")
+                command.firstOrNull() == "stat" -> {
+                    val path = unq(command.lastOrNull().orEmpty())
+                    val size = files[path] ?: return CmdResult(1, "", "missing")
+                    verifiedFiles += path
+                    CmdResult(0, "$size\n", "")
+                }
+                command.firstOrNull() == "mkdir" -> CmdResult(0, "", "")
+                command.firstOrNull() == "mv" -> {
+                    val src = unq(command.getOrNull(1).orEmpty())
+                    val dst = unq(command.getOrNull(2).orEmpty())
+                    val size = files.remove(src) ?: return CmdResult(1, "", "no such temp file")
+                    files[dst] = size
+                    moves += src to dst
+                    CmdResult(0, "", "")
+                }
+                command.firstOrNull() == "rm" -> {
+                    val target = unq(command.lastOrNull().orEmpty())
+                    if (!target.contains(".nfvr-tmp-")) return CmdResult(1, "", "refusing")
+                    files.keys.filter { it.startsWith(target.trimEnd('/') + "/") || it == target.trimEnd('/') }
+                        .forEach { files.remove(it) }
+                    cleaned = true
+                    CmdResult(0, "", "")
+                }
+                else -> CmdResult(0, "", "")
+            }
+        }
+
+        override fun pushModFileWithProgress(
+            serial: String,
+            from: File,
+            toDevicePath: String,
+            onProgress: (copiedBytes: Long, totalBytes: Long) -> Unit,
+            cancelled: () -> Boolean
+        ): CmdResult {
+            if (failPush) return CmdResult(1, "", "injected push failure")
+            pushCalls++
+            if (failFirstPush && pushCalls == 1) return CmdResult(1, "", "injected flake")
+            pushTargets += toDevicePath
+            files[toDevicePath] = from.length()
+            onProgress(from.length(), from.length())
+            return CmdResult(0, "", "")
+        }
     }
 
     private fun qmodWithDeps(): File {
