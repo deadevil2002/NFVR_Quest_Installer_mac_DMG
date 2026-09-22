@@ -1551,6 +1551,10 @@ fun main() {
     val installMutex = remember { Mutex() }
     val modOperationMutex = remember { Mutex() }
     var modOperationGeneration by remember { mutableStateOf(0L) }
+    // Identity of the analysis currently holding modOperationMutex, if any.
+    // Lets a duplicate trigger for the SAME selection stay silent instead
+    // of emitting a false conflicting-operation error.
+    var activeModAnalysisKey by remember { mutableStateOf<String?>(null) }
     var activityEvents by remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
 
     // ===== LICENSE UI STATE =====
@@ -1937,11 +1941,21 @@ fun main() {
         }
         modAnalysisStatus = "جارٍ تحليل الحزمة…"
         appendModLog("جارٍ تحليل الحزمة…")
+        val analysisIdentityKey = modAnalysisIdentityKey(
+            connectedDeviceSerial, selectedApp, modZipFile, modZipSha256
+        )
         if (!modOperationMutex.tryLock()) {
+            // The file picker and the automatic analysis trigger race on
+            // every selection.  A duplicate of the running analysis stays
+            // completely silent; only a genuinely different operation fails.
+            if (shouldSkipDuplicateModAnalysis(activeModAnalysisKey, analysisIdentityKey)) {
+                return
+            }
             finishAnalysisFailure("تعذر التحليل: توجد عملية مود أخرى قيد التنفيذ.")
             analyzingMod = false
             return
         }
+        activeModAnalysisKey = analysisIdentityKey
         try {
             val file = modZipFile
             val app = selectedApp
@@ -2056,6 +2070,7 @@ fun main() {
         } finally {
             analyzingMod = false
             modExecutionProgress = null
+            activeModAnalysisKey = null
             modOperationMutex.unlock()
         }
     }
@@ -2746,10 +2761,7 @@ fun main() {
             }
             if (installResult.success) {
                 modInstallSucceeded = true
-                appendModLog(installResult.message)
-                appendModLog("==============================================")
-                appendModLog("تم تثبيت المود والتحقق من الملفات بنجاح")
-                appendModLog("==============================================")
+                modInstallSuccessLogLines(installResult.message).forEach(::appendModLog)
             } else {
                 modInstallSucceeded = false
                 appendModLog("فشل التثبيت: ${installResult.message}")

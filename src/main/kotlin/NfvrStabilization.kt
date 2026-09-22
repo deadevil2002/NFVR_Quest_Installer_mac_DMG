@@ -314,6 +314,55 @@ suspend fun orchestrateZipChooserResult(
 }
 
 /**
+ * Identity of one automatic analysis request: selected device/game plus
+ * the archive snapshot.  Mirrors [sameModFileSnapshot]-style identity
+ * (canonical path, size, timestamp) without hashing, so it stays cheap
+ * enough to compute before acquiring the operation mutex.  Null when the
+ * selection is incomplete and no analysis can run.
+ */
+internal fun modAnalysisIdentityKey(
+    serial: String?,
+    app: InstalledQuestApp?,
+    file: File?,
+    archiveSha256: String?
+): String? {
+    if (app == null || file == null) return null
+    val canonical = runCatching { file.canonicalFile }.getOrNull() ?: return null
+    if (!canonical.isFile) return null
+    return listOf(
+        serial.orEmpty(),
+        app.packageName,
+        app.versionName.orEmpty(),
+        app.versionCode?.toString().orEmpty(),
+        canonical.absolutePath,
+        canonical.length().toString(),
+        canonical.lastModified().toString(),
+        archiveSha256.orEmpty()
+    ).joinToString("")
+}
+
+/**
+ * Single-flight decision for overlapping analysis triggers (file-picker
+ * callback plus automatic analysis racing on one selection).  When the
+ * mutex is already held BY THE SAME analysis identity, the duplicate
+ * must stay silent: no second invocation, no error, no log entry.  A
+ * genuinely different identity keeps the conflicting-operation error.
+ */
+internal fun shouldSkipDuplicateModAnalysis(activeKey: String?, incomingKey: String?): Boolean =
+    incomingKey != null && incomingKey == activeKey
+
+/**
+ * The single authoritative customer-facing log block for a verified
+ * install.  Exactly one result line between separators; verification,
+ * criteria, and timing are decided upstream by the install flow.
+ */
+internal fun modInstallSuccessLogLines(message: String): List<String> = listOf(
+    "==============================================",
+    message,
+    "=============================================="
+)
+
+/**
  * OS file locking is per-user/session by virtue of living under user.home.
  * The channel remains open for the lifetime of the returned guard.
  */
