@@ -1,17 +1,23 @@
 object AndroidPathValidator {
     private val allowedPrefixes = listOf("/sdcard/", "/storage/emulated/0/")
-    // `$` is accepted because the Mods transport single-quotes every remote
-    // path (`shellQuoteRemotePath`), which neutralizes device-shell
-    // expansion.  Legitimate Unity asset names start with `$` (for example
-    // $black_color-....bundle).  `; & | ` < >` stay rejected as defense in
+    // `$`, `'`, and `&` are accepted because the Mods transport
+    // single-quotes every remote path (`shellQuoteRemotePath`), which
+    // neutralizes device-shell expansion (`'\''` idiom for quotes).
+    // Legitimate Unity asset names use them (for example
+    // $black_color-....bundle, mango'sm16....bundle,
+    // s&wshieldplus-....bundle).  `; | ` < >` stay rejected as defense in
     // depth, and CR/LF stay rejected because `ls`-based inventory parsing
     // splits on newlines.
-    private val unsafeCharacters = Regex("""[;&|`><\r\n\u0000]""")
+    private val unsafeCharacters = Regex("""[;|`><\r\n\u0000]""")
     // Unity/Marrow bundle names commonly contain parentheses (for example
-    // bl_plane(night).bundle). They are ordinary path characters, not shell
-    // syntax; retain the existing control/separator checks while accepting
-    // them in verified destination paths.
-    private val allowedCharacters = Regex("""^[A-Za-z0-9._/ ()$-]+$""")
+    // bl_plane(night).bundle), apostrophes (mango'sm16...bundle), dollar
+    // signs, ampersands (s&wshieldplus...bundle), and plus signs
+    // (reticle++...bundle). They are ordinary path characters, not shell
+    // syntax: the Mods transport single-quotes every remote path (`'\\''`
+    // idiom for quotes). Retain the existing control/separator checks
+    // while accepting them in verified destination paths.  Non-ASCII
+    // quotes stay rejected: Windows cannot extract such names at all.
+    private val allowedCharacters = Regex("""^[A-Za-z0-9._/ ()$'&+-]+$""")
 
     fun isSafe(path: String): Boolean {
         val value = path.trim()
