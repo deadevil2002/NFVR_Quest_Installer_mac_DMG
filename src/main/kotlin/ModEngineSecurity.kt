@@ -55,6 +55,25 @@ fun isSafeModRelativePath(value: String): Boolean =
     }.getOrDefault(false)
 
 /**
+ * Quotes one remote path for `adb shell` transport.  adb joins shell args
+ * with spaces and the device re-parses them, so an unquoted path is shell
+ * code: `$vars` expand, spaces split, `;|&`` etc. execute.  Single-quoting
+ * makes every path arrive as one literal word (embedded quotes use the
+ * POSIX `'\''` idiom).  Only remote PATHS are quoted; flags, package IDs,
+ * and other safe-charset tokens stay bare.
+ */
+fun shellQuoteRemotePath(path: String): String =
+    "'" + path.replace("'", "'\\''") + "'"
+
+/** Inverse of [shellQuoteRemotePath] for fakes and diagnostics. */
+fun shellUnquoteRemotePath(quoted: String): String {
+    if (quoted.length >= 2 && quoted.startsWith("'") && quoted.endsWith("'")) {
+        return quoted.substring(1, quoted.length - 1).replace("'\\''", "'")
+    }
+    return quoted
+}
+
+/**
  * The only package-bound Quest roots accepted by analysis and execution.
  * Keeping this policy shared prevents a plan from being approved by one
  * phase and rejected/expanded by another.

@@ -354,13 +354,13 @@ class ModsManagerExecutionRegressionTest {
                 command.firstOrNull() == "test" && command.getOrNull(1) == "-d" -> {
                     rootVerified = true
                     CmdResult(
-                        if (existingDirectories.contains(command.getOrNull(2).orEmpty())) 0 else 1,
+                        if (existingDirectories.contains(shellUnquoteRemotePath(command.getOrNull(2).orEmpty()))) 0 else 1,
                         "",
                         ""
                     )
                 }
                 command.firstOrNull() == "test" && command.getOrNull(1) == "-f" -> {
-                    val path = command.getOrNull(2).orEmpty()
+                    val path = shellUnquoteRemotePath(command.getOrNull(2).orEmpty())
                     if (missingFile && path == expectedSizes.keys.firstOrNull()) {
                         CmdResult(1, "", "missing fixture file")
                     } else {
@@ -369,7 +369,7 @@ class ModsManagerExecutionRegressionTest {
                     }
                 }
                 command.firstOrNull() == "stat" -> {
-                    val path = command.lastOrNull().orEmpty()
+                    val path = shellUnquoteRemotePath(command.lastOrNull().orEmpty())
                     val expected = expectedSizes[path] ?: return CmdResult(1, "", "unknown fixture path")
                     val actual = if (wrongSize && path == expectedSizes.keys.firstOrNull()) {
                         expected + 1L
@@ -379,7 +379,7 @@ class ModsManagerExecutionRegressionTest {
                     CmdResult(0, "$actual\n", "")
                 }
                 command.firstOrNull() == "mkdir" -> {
-                    val path = command.getOrNull(1).orEmpty()
+                    val path = shellUnquoteRemotePath(command.getOrNull(1).orEmpty())
                     val parent = path.substringBeforeLast('/', "")
                     if (existingDirectories.contains(parent)) {
                         existingDirectories += path

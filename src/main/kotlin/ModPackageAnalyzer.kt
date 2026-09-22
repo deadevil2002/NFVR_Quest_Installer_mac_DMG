@@ -53,7 +53,7 @@ class ModPackageAnalyzer(
         private val SHA256 = Regex("[0-9a-fA-F]{64}")
         private val QMOD_METADATA_KEYS = setOf(
             "_QPVersion", "name", "id", "author", "version", "description", "coverImage",
-            "porter", "isLibrary"
+            "porter", "isLibrary", "\$schema"
         )
         private val QMOD_IMPLEMENTED_KEYS = setOf(
             "packageId", "packageVersion", "modloader", "modFiles", "lateModFiles",
@@ -122,7 +122,13 @@ class ModPackageAnalyzer(
             }
 
             when {
-                rootMod != null -> analyzeQmod(archive, rootMod, installedApp, loaderDetection)
+                rootMod != null -> analyzeQmod(
+                    archive,
+                    rootMod,
+                    installedApp,
+                    loaderDetection,
+                    directoryDiscovery?.beatSaberInventory
+                )
                 rootPackage != null && isVirtualStump(rootPackage) ->
                     analyzeVirtualStump(archive, rootPackage, installedApp)
                 rootNfvr != null -> analyzeNfvr(archive, rootNfvr, installedApp, loaderDetection)
@@ -466,7 +472,8 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         json: JSONObject,
         installedApp: InstalledQuestApp?,
-        loaderDetection: ModLoaderDetection?
+        loaderDetection: ModLoaderDetection?,
+        inventory: BeatSaberModInventory? = null
     ): ModPackageAnalysis {
         val target = json.optString("packageId", "").trim().ifBlank { null }
         val profile = target?.let(profileRegistry::findByPackageId)
@@ -575,18 +582,54 @@ class ModPackageAnalyzer(
             optional = false,
             preconditions = preconditions
         )
-        val dependencies = declaredDependencies.filterNot { it.optional }
-        val dependencyOptionals = declaredDependencies.filter { it.optional }
-        if (dependencies.isNotEmpty()) {
+        // On-device inventory (Beat Saber) resolves declarations to
+        // SATISFIED/MISSING/VERSION_MISMATCH without downloading anything.
+        // Without inventory every declaration stays UNKNOWN and blocks,
+        // exactly like before.
+        val requiredReports = resolveQmodDependencyStatuses(
+            declaredDependencies.filterNot { it.optional },
+            inventory
+        )
+        val optionalReports = resolveQmodDependencyStatuses(
+            declaredDependencies.filter { it.optional },
+            inventory
+        )
+        val dependencies = requiredReports.map { report ->
+            report.dependency.copy(status = report.status, foundVersion = report.foundVersion)
+        }
+        val dependencyOptionals = optionalReports.map { report ->
+            report.dependency.copy(status = report.status, foundVersion = report.foundVersion)
+        }
+        val missingRequired = requiredReports.filter { it.status != QmodDependencyStatus.SATISFIED }
+        if (missingRequired.isNotEmpty()) {
+            val names = missingRequired.joinToString { report ->
+                report.dependency.id +
+                    (report.dependency.version?.let { " ($it)" } ?: "") +
+                    " [${customerDependencyStatusMessage(report.status)}]"
+            }
             preconditions += blocked(
                 "DEPENDENCIES_REQUIREMENT",
-                "This QMOD declares dependencies; NFVR will not download or install dependencies automatically."
+                "This QMOD declares dependencies that are not verified on the device ($names); " +
+                    "NFVR will not download or install dependencies automatically."
+            )
+        } else if (requiredReports.isNotEmpty()) {
+            preconditions += satisfied(
+                "DEPENDENCIES_SATISFIED",
+                "All ${requiredReports.size} required dependencies verified on the device: " +
+                    requiredReports.joinToString { it.dependency.id }
             )
         }
-        if (dependencyOptionals.isNotEmpty()) {
+        val unverifiedOptionals = optionalReports.filter { it.status != QmodDependencyStatus.SATISFIED }
+        if (unverifiedOptionals.isNotEmpty()) {
             preconditions += blocked(
                 "OPTIONAL_DEPENDENCIES_UNVERIFIED",
-                "Optional QMOD dependencies cannot be verified because NFVR has no installed-mod inventory or range resolver."
+                "Optional QMOD dependencies cannot be verified because no installed-mod inventory confirms them."
+            )
+        } else if (optionalReports.isNotEmpty()) {
+            preconditions += satisfied(
+                "OPTIONAL_DEPENDENCIES_SATISFIED",
+                "Optional dependencies verified on the device: " +
+                    optionalReports.joinToString { it.dependency.id }
             )
         }
         val patchRequirement = if (hasPatchingRequirement(json)) {
@@ -837,7 +880,10 @@ class ModPackageAnalyzer(
         if (json.has("modloader") && json.opt("modloader") !is String) {
             preconditions += blocked("INVALID_QMOD_LOADER", "QMOD modloader must be a string.")
         }
-        listOf("description", "coverImage", "porter").forEach { key ->
+        // `$schema` is a standard informational JSON-Schema declaration
+        // shipped by real QuestPatcher QMODs (for example SongCore).  NFVR
+        // never fetches it; it must simply be a string when present.
+        listOf("description", "coverImage", "porter", "\$schema").forEach { key ->
             if (json.has(key) && json.opt(key) !is String) {
                 preconditions += blocked(
                     "INVALID_QMOD_FIELD",

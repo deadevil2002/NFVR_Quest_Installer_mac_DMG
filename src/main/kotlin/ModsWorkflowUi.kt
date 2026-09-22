@@ -1668,7 +1668,8 @@ private fun InstallationSuccessCard() {
                     StatusNote(
                         "اعتمادية مطلوبة: ${dependency.id}" +
                             (dependency.version?.let { " — الإصدار $it" } ?: "") +
-                            " — يلزم التحقق قبل النقل.",
+                            " — ${customerDependencyStatusMessage(dependency.status)}" +
+                            (dependency.foundVersion?.let { " ($it)" } ?: ""),
                         Icons.Default.Warning,
                         warningColor()
                     )
@@ -1676,7 +1677,8 @@ private fun InstallationSuccessCard() {
                 analysis.installPlan.optionalDependencies.forEach { dependency ->
                     StatusNote(
                         "اعتمادية اختيارية: ${dependency.id}" +
-                            (dependency.version?.let { " — الإصدار $it" } ?: ""),
+                            (dependency.version?.let { " — الإصدار $it" } ?: "") +
+                            " — ${customerDependencyStatusMessage(dependency.status)}",
                         Icons.Default.Info,
                         MaterialTheme.colorScheme.onSurfaceVariant
                     )

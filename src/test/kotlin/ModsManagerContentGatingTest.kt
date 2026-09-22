@@ -180,12 +180,12 @@ class ModsManagerContentGatingTest {
                         ""
                     )
                 command.firstOrNull() == "stat" -> {
-                    val path = command.lastOrNull().orEmpty()
+                    val path = shellUnquoteRemotePath(command.lastOrNull().orEmpty())
                     CmdResult(0, "${expectedSizes[path] ?: 0L}\n", "")
                 }
                 command.firstOrNull() == "test" &&
                     command.getOrNull(1) == "-d" -> {
-                    val path = command.getOrNull(2).orEmpty()
+                    val path = shellUnquoteRemotePath(command.getOrNull(2).orEmpty())
                     if (disappearImmediatelyBeforeChildMkdir &&
                         path.startsWith("$modRoot/") &&
                         baseExists
@@ -202,7 +202,7 @@ class ModsManagerContentGatingTest {
                     )
                 }
                 command.firstOrNull() == "mkdir" -> {
-                    val path = command.getOrNull(1).orEmpty()
+                    val path = shellUnquoteRemotePath(command.getOrNull(1).orEmpty())
                     val parent = path.substringBeforeLast('/', "")
                     mkdirs++
                     if (baseExists && existingDirectories.contains(parent)) {

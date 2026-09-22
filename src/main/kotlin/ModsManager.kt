@@ -383,7 +383,7 @@ class ModsManager(
                 packageId = installedApp.packageName,
                 path = path,
                 exists = runCatching {
-                    adbClient.shell(serial, "test", "-d", path).exit == 0
+                    adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(path)).exit == 0
                 }.getOrDefault(false),
                 source = source,
                 evidenceLevel = profile?.evidenceLevel ?: ModEvidenceLevel.OPEN_SOURCE_PROJECT
@@ -400,8 +400,48 @@ class ModsManager(
                 "readOnly=true",
                 "package=${installedApp.packageName}",
                 "candidateCount=${candidates.size}"
-            )
+            ),
+            beatSaberInventory = collectBeatSaberInventory(serial, installedApp)
         )
+    }
+
+    /**
+     * Beat Saber only.  Lists Scotland2 package/library names read-only
+     * (`ls`); any failure yields an empty inventory, never a block.
+     */
+    private fun collectBeatSaberInventory(
+        serial: String,
+        installedApp: InstalledQuestApp
+    ): BeatSaberModInventory? {
+        if (installedApp.packageName != "com.beatgames.beatsaber") return null
+        return runCatching {
+            fun lsNames(path: String): List<String> {
+                val result = adbClient.shell(serial, "ls", shellQuoteRemotePath(path))
+                if (result.exit != 0) return emptyList()
+                return result.out.lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() && !it.contains('/') && !it.startsWith(".") }
+                    .toList()
+            }
+            val base = "/sdcard/ModData/${installedApp.packageName}"
+            val packagesRoot = "$base/Packages"
+            val packages = lsNames(packagesRoot).flatMap { version ->
+                lsNames("$packagesRoot/$version").map { dir ->
+                    parseScotland2PackageDir(dir, "Packages/$version/$dir")
+                }
+            }
+            val libs = lsNames("$base/Modloader/libs").filter { it.endsWith(".so", ignoreCase = true) }
+            val mods = (lsNames("$base/Modloader/mods") + lsNames("$base/Modloader/early_mods"))
+                .filter { it.endsWith(".so", ignoreCase = true) || it.endsWith(".dll", ignoreCase = true) }
+            BeatSaberModInventory(
+                serial = serial,
+                packageId = installedApp.packageName,
+                gameVersion = installedApp.versionName,
+                packages = packages,
+                loaderLibs = libs,
+                mods = mods
+            )
+        }.getOrNull()
     }
 
     suspend fun scanInstalledQuestApps(
@@ -730,7 +770,7 @@ class ModsManager(
                  * merged or replaced.
                  */
                 for (modRoot in destinationModRoots(executionPlan)) {
-                    val rootAvailable = adbClient.shell(serial, "test", "!", "-e", modRoot)
+                    val rootAvailable = adbClient.shell(serial, "test", "!", "-e", shellQuoteRemotePath(modRoot))
                     if (rootAvailable.exit == 1) {
                         DiagnosticLogger.info("Mod install destination root already exists: $modRoot")
                         return ModInstallResult(
@@ -753,7 +793,7 @@ class ModsManager(
                 }
                 // Ask for the safe (non-collision) result so legacy ADB
                 // fakes and restricted shells can treat exit=0 as "absent".
-                val collision = adbClient.shell(serial, "test", "!", "-e", destination)
+                val collision = adbClient.shell(serial, "test", "!", "-e", shellQuoteRemotePath(destination))
                 when {
                     collision.exit == 1 -> {
                         DiagnosticLogger.info("Mod install collision: $destination")
@@ -779,7 +819,7 @@ class ModsManager(
                 if (base.isNullOrBlank() || !AndroidPathValidator.isSafe(base)) {
                     return ModInstallResult(false, "لم يتم إثبات جذر محتوى معتمد قبل النقل.")
                 }
-                val baseExists = adbClient.shell(serial, "test", "-d", base)
+                val baseExists = adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(base))
                 if (baseExists.exit != 0) {
                     return ModInstallResult(
                         false,
@@ -863,7 +903,7 @@ class ModsManager(
                 if (root.isNullOrBlank() || !AndroidPathValidator.isSafe(root)) {
                     add("فشل التحقق من جذر وجهة المود.")
                 } else {
-                    val rootResult = adbClient.shell(serial, "test", "-d", root)
+                    val rootResult = adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(root))
                     if (rootResult.exit != 0) {
                         add("فشل التحقق: مجلد الوجهة غير موجود في $root")
                     }
@@ -970,7 +1010,7 @@ class ModsManager(
 
     private fun questFreeBytes(serial: String, destinationRoot: String?): Long? {
         val target = destinationRoot?.takeIf { AndroidPathValidator.isSafe(it) } ?: "/sdcard"
-        val df = runCatching { adbClient.shell(serial, "df", target) }.getOrNull()
+        val df = runCatching { adbClient.shell(serial, "df", shellQuoteRemotePath(target)) }.getOrNull()
             ?: return null
         if (df.exit != 0) return null
         return parseQuestDfAvailableBytes(df.out)
@@ -1156,9 +1196,9 @@ class ModsManager(
     }
 
     private suspend fun verifyRemoteFile(serial: String, mapping: ModFileMapping): String? {
-        val exists = adbClient.shell(serial, "test", "-f", mapping.destinationPath)
+        val exists = adbClient.shell(serial, "test", "-f", shellQuoteRemotePath(mapping.destinationPath))
         if (exists.exit != 0) return "فشل التحقق: الملف غير موجود في ${mapping.destinationPath}"
-        val size = adbClient.shell(serial, "stat", "-c", "%s", mapping.destinationPath)
+        val size = adbClient.shell(serial, "stat", "-c", "%s", shellQuoteRemotePath(mapping.destinationPath))
         if (size.exit != 0) {
             return "فشل قراءة حجم ${mapping.destinationPath}: ${size.err.take(300)}"
         }
@@ -1252,7 +1292,7 @@ class ModsManager(
         val relative = path.removePrefix("$base/").trim('/')
         for (segment in relative.split('/').filter(String::isNotBlank)) {
             current = "$current/$segment"
-            val existing = adbClient.shell(serial, "test", "-d", current)
+            val existing = adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(current))
             when {
                 existing.exit == 0 -> continue
                 existing.exit != 1 ->
@@ -1263,7 +1303,7 @@ class ModsManager(
                      * disappears between the immediate base check and this
                      * operation, mkdir fails instead of recreating it.
                      */
-                    val created = adbClient.shell(serial, "mkdir", current)
+                    val created = adbClient.shell(serial, "mkdir", shellQuoteRemotePath(current))
                     if (created.exit != 0) return created
                 }
             }

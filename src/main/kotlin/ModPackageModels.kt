@@ -394,7 +394,13 @@ data class ModPackageDependency(
     val downloadRequired: Boolean = true,
     val optional: Boolean = false,
     val sourceUrl: String? = null,
-    val required: Boolean = !optional
+    val required: Boolean = !optional,
+    /**
+     * On-device resolution against the installed inventory (Beat Saber).
+     * UNKNOWN unless the analyzer verified it; never downloaded.
+     */
+    val status: QmodDependencyStatus = QmodDependencyStatus.UNKNOWN,
+    val foundVersion: String? = null
 )
 
 /**
@@ -425,7 +431,14 @@ data class ModDirectoryDiscovery(
     val candidates: List<ModDirectoryCandidate> = emptyList(),
     val loaderDetection: ModLoaderDetection? = null,
     val profile: GameModProfile? = null,
-    val diagnostics: List<String> = emptyList()
+    val diagnostics: List<String> = emptyList(),
+    /**
+     * Beat Saber only: read-only installed-mod inventory (`ls` of the
+     * Scotland2 Packages/Modloader trees) used to resolve QMOD
+     * dependency declarations.  Null when unavailable or inapplicable;
+     * analysis without inventory keeps the conservative dependency gate.
+     */
+    val beatSaberInventory: BeatSaberModInventory? = null
 ) {
     val existingCandidates: List<ModDirectoryCandidate>
         get() = candidates.filter { it.exists }
