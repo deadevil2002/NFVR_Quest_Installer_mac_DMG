@@ -23,11 +23,28 @@ class ModPackageAnalyzer(
         const val BLADE_AND_SORCERY_PACKAGE_ID = "com.Warpfrog.BladeAndSorcery"
         const val NOMAD_PACKAGE_ID = BLADE_AND_SORCERY_PACKAGE_ID
         const val GORILLA_TAG_PACKAGE_ID = "com.AnotherAxiom.GorillaTag"
+        const val PAVLOV_PACKAGE_ID = "com.vankrupt.pavlov"
         const val MAX_ZIP_ENTRIES = 5_000
         const val MAX_ENTRY_NAME_BYTES = 1_000
         const val MAX_METADATA_BYTES = 1L * 1024L * 1024L
-        const val MAX_ENTRY_BYTES = 512L * 1024L * 1024L
-        const val MAX_TOTAL_DECLARED_BYTES = 2L * 1024L * 1024L * 1024L
+        /**
+         * Maximum size of one standard-ZIP entry (0xFFFFFFFF bytes).
+         * java.util.zip cannot address anything larger without ZIP64, which
+         * NFVR rejects outright; inspection, extraction, transfer, and
+         * verification all stream with Long sizes, so no smaller arbitrary
+         * per-entry cap is technically justified.  Real Quest game assets
+         * (for example Pavlov mod.io .pak files near 600MB) are legitimate.
+         */
+        const val MAX_ENTRY_BYTES = 0xFFFFFFFFL
+        /**
+         * Archive-bomb guard based on evidence instead of an arbitrary total.
+         * Rejects only when expanded output is BOTH large (above
+         * [EXPANSION_FLOOR_BYTES]) and disproportionate to the compressed
+         * input (above [MAX_EXPANSION_RATIO]).  Legitimate pre-compressed
+         * game content has a ratio near 1 and is never affected.
+         */
+        const val EXPANSION_FLOOR_BYTES = 512L * 1024L * 1024L
+        const val MAX_EXPANSION_RATIO = 64.0
         private val ROOT_METADATA_NAMES = setOf("mod.json", "nfvr-mod.json", "qmod.json", "package.json")
         private val ROOT_MANIFEST_NAMES = ROOT_METADATA_NAMES
         private val CONTENT_METADATA_BASENAMES = setOf(
@@ -117,6 +134,8 @@ class ModPackageAnalyzer(
                     analyzeNomadPayload(archive, installedApp, loaderDetection, directoryDiscovery)
                 isBonelabPayload(archive, installedApp) ->
                     analyzeBonelabPayload(archive, installedApp, loaderDetection, directoryDiscovery)
+                isPavlovPayload(zipFile, archive) ->
+                    analyzePavlovPayload(zipFile, archive, installedApp)
                 isKnownGameProfilePayload(archive, installedApp) ->
                     analyzeKnownGameProfile(archive, installedApp, loaderDetection)
                 directoryDiscovery != null && directoryDiscovery.existingCandidates.isNotEmpty() ->
@@ -170,7 +189,7 @@ class ModPackageAnalyzer(
         val directories = linkedSetOf<String>()
         val traversalEntries = mutableListOf<String>()
         val collisionKeys = mutableSetOf<String>()
-        var declaredBytes = 0L
+        var compressedBytes = 0L
 
         ZipFile(zipFile).use { zip ->
             rejectZip64OrUnsafeLinks(zipFile, zip)
@@ -199,11 +218,12 @@ class ModPackageAnalyzer(
                 if (entry.size > MAX_ENTRY_BYTES) {
                     throw ModPackageException("ZIP entry '$safeName' exceeds the safe size limit.")
                 }
-                if (entry.size >= 0L) {
-                    declaredBytes += entry.size
-                    if (declaredBytes > MAX_TOTAL_DECLARED_BYTES) {
-                        throw ModPackageException("ZIP declares more data than the safe archive limit.")
-                    }
+                // Compressed sizes feed the expansion-ratio bomb guard in
+                // the streaming pass below.  Unknown sizes (-1) contribute
+                // nothing; the guard is skipped when no compressed total
+                // is known rather than guessing.
+                if (!entry.isDirectory && entry.compressedSize > 0L) {
+                    compressedBytes += entry.compressedSize
                 }
                 if (safeName in ROOT_METADATA_NAMES && entry.name != safeName) {
                     throw ModPackageException(
@@ -252,8 +272,14 @@ class ModPackageAnalyzer(
                         if (read < 0) break
                         bytes += read
                         actualBytes += read
-                        if (bytes > MAX_ENTRY_BYTES || actualBytes > MAX_TOTAL_DECLARED_BYTES) {
-                            throw ModPackageException("ZIP expands beyond the safe inspection limit.")
+                        if (bytes > MAX_ENTRY_BYTES) {
+                            throw ModPackageException("ZIP entry '$safeName' expands beyond the safe size limit.")
+                        }
+                        if (expansionAbuse(actualBytes, compressedBytes)) {
+                            throw ModPackageException(
+                                "ZIP expansion ratio exceeds the safe archive-bomb limit " +
+                                    "(${actualBytes} bytes from ${compressedBytes} compressed bytes)."
+                            )
                         }
                         digest.update(buffer, 0, read)
                         if ((prefixes[safeName]?.size ?: 0) < 4_096) {
@@ -1946,13 +1972,21 @@ class ModPackageAnalyzer(
         // Directory existence is not a Gorilla Tag compatibility contract.
         // Its classification-only profile must not become writable merely
         // because discovery found a guessed Mods/plugins/ModData candidate.
-        if (target == GORILLA_TAG_PACKAGE_ID) {
-            val preconditions = listOf(
-                blocked(
-                    "GORILLA_TAG_DESTINATION_UNAUTHORIZED",
-                    "Gorilla Tag Quest has no authoritative generic directory contract; only an exact QMOD with authenticated QuestLoader evidence may use a canonical loader destination."
-                )
-            )
+        // Pavlov is classification-only too: it exposes no sdcard mod
+        // folder, so a discovered directory must never authorize it either.
+        if (target == GORILLA_TAG_PACKAGE_ID || target == PAVLOV_PACKAGE_ID) {
+            val gameName = if (target == PAVLOV_PACKAGE_ID) "Pavlov" else "Gorilla Tag"
+            val code = if (target == PAVLOV_PACKAGE_ID) {
+                "PAVLOV_DESTINATION_UNAUTHORIZED"
+            } else {
+                "GORILLA_TAG_DESTINATION_UNAUTHORIZED"
+            }
+            val detail = if (target == PAVLOV_PACKAGE_ID) {
+                "Pavlov Quest exposes no authoritative mod directory; UGC is mounted by the game's own mod.io runtime."
+            } else {
+                "Gorilla Tag Quest has no authoritative generic directory contract; only an exact QMOD with authenticated QuestLoader evidence may use a canonical loader destination."
+            }
+            val preconditions = listOf(blocked(code, detail))
             val plan = ModInstallPlan(
                 outcome = ModInstallOutcome.APK_PATCH_REQUIRED,
                 packageType = ModPackageType.GENERIC_DATA,
@@ -1963,17 +1997,21 @@ class ModPackageAnalyzer(
                 preconditions = preconditions,
                 patchRequirement = ModPatchRequirement(
                     required = true,
-                    reason = "Generic Gorilla Tag Quest archives cannot be authorized from directory discovery."
+                    reason = "Generic $gameName Quest archives cannot be authorized from directory discovery."
                 ),
                 resolution = resolution(
                     ModResolutionStrategy.UNKNOWN,
                     0,
-                    "Gorilla Tag classification-only profile rejects generic directory routing."
+                    "$gameName classification-only profile rejects generic directory routing."
                 )
             )
             return result(
                 ModPackageType.GENERIC_DATA,
-                "Gorilla Tag Quest generic archives cannot be installed from discovered directories; use an exact QMOD with authenticated QuestLoader evidence.",
+                if (target == PAVLOV_PACKAGE_ID) {
+                    "Pavlov Quest generic archives cannot be installed from discovered directories; UGC is managed by the game's mod.io runtime."
+                } else {
+                    "Gorilla Tag Quest generic archives cannot be installed from discovered directories; use an exact QMOD with authenticated QuestLoader evidence."
+                },
                 plan,
                 archive
             )
@@ -2149,6 +2187,120 @@ class ModPackageAnalyzer(
             plan,
             archive,
             json.toMap()
+        )
+    }
+
+    /**
+     * Pavlov Shack UGC is Unreal mod.io content: a small metadata.json
+     * (EngineVersion + ModType) next to cooked .pak chunk files such as
+     * UGC<modId>pakchunk0-Android_ASTC.pak.  Classification is purely
+     * content-based so renamed archives classify identically; the outer
+     * file name is never evidence.
+     */
+    private fun isPavlovPayload(zipFile: File, archive: ArchiveMetadata): Boolean {
+        val pakEntries = archive.entries.filter { entry ->
+            entry !in archive.directories &&
+                entry.lowercase(Locale.ROOT).endsWith(".pak")
+        }
+        if (pakEntries.isEmpty()) return false
+        val metadataNames = archive.entries.filter { entry ->
+            entry !in archive.directories &&
+                entry.substringAfterLast('/').equals("metadata.json", ignoreCase = true)
+        }
+        return metadataNames.any { name -> readPavlovMetadata(zipFile, name) != null }
+    }
+
+    private fun readPavlovMetadata(zipFile: File, entryName: String): JSONObject? {
+        return runCatching {
+            ZipFile(zipFile).use { zip ->
+                val zipEntry = zip.getEntry(entryName) ?: return@runCatching null
+                if (zipEntry.isDirectory || zipEntry.size > 64L * 1024L) return@runCatching null
+                val out = java.io.ByteArrayOutputStream()
+                zip.getInputStream(zipEntry).use { input ->
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        if (out.size().toLong() + read > 64L * 1024L) return@runCatching null
+                        out.write(buffer, 0, read)
+                    }
+                }
+                val json = JSONObject(
+                    StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(out.toByteArray()))
+                        .toString()
+                )
+                if (isPavlovMetadataDocument(json)) json else null
+            }
+        }.getOrNull()
+    }
+
+    private fun isPavlovMetadataDocument(json: JSONObject): Boolean {
+        val engine = json.opt("EngineVersion")
+        if (engine !is String || engine.isBlank()) return false
+        return when (val modType = json.opt("ModType")) {
+            is Number -> true
+            is String -> modType.isNotBlank()
+            else -> false
+        }
+    }
+
+    private fun pavlovModId(archive: ArchiveMetadata): String? {
+        val pattern = Regex("""UGC(\d+)""", RegexOption.IGNORE_CASE)
+        return archive.entries
+            .filter { it !in archive.directories && it.lowercase(Locale.ROOT).endsWith(".pak") }
+            .firstNotNullOfOrNull { entry ->
+                pattern.find(entry.substringAfterLast('/'))?.groupValues?.getOrNull(1)
+            }
+    }
+
+    /**
+     * Pavlov UGC is mounted by the game's own mod.io runtime from its
+     * subscription directory; Pavlov exposes no sdcard mod folder and no
+     * public local-import contract on Quest.  NFVR therefore recognizes
+     * the format but authorizes no destination: recognition without a
+     * writable root can never become an install plan.
+     */
+    private fun analyzePavlovPayload(
+        zipFile: File,
+        archive: ArchiveMetadata,
+        installedApp: InstalledQuestApp?
+    ): ModPackageAnalysis {
+        val preconditions = mutableListOf<ModInstallPrecondition>()
+        checkTarget(PAVLOV_PACKAGE_ID, installedApp, "Pavlov", preconditions)
+        preconditions += satisfied(
+            "PAVLOV_MOD_IO_MANAGED",
+            "Pavlov UGC content is mounted by the game's own mod.io runtime."
+        )
+        preconditions += blocked(
+            "PAVLOV_IMPORTER_UNVERIFIED",
+            "The archive is recognized as Pavlov mod.io UGC, but NFVR has no confirmed local import contract for Pavlov on Quest."
+        )
+        val plan = ModInstallPlan(
+            outcome = ModInstallOutcome.BUILT_IN_GAME_CONTENT,
+            packageType = ModPackageType.PAVLOV_UGC_CONTENT,
+            strategy = ModInstallStrategy.NONE,
+            targetPackageId = PAVLOV_PACKAGE_ID,
+            archiveIdentity = archive.identity,
+            reviewedApp = installedApp,
+            preconditions = preconditions,
+            resolution = resolution(
+                ModResolutionStrategy.BUILT_IN_CONTENT_TYPE,
+                100,
+                "Manifest identifies content managed by the game's own mod.io UGC system."
+            )
+        )
+        return result(
+            ModPackageType.PAVLOV_UGC_CONTENT,
+            "Recognized Pavlov mod.io UGC content; the game imports its own subscriptions and NFVR has no safe direct Quest copy workflow.",
+            plan,
+            archive,
+            mapOf(
+                "modId" to pavlovModId(archive),
+                "platform" to "Quest mod.io UGC"
+            )
         )
     }
 
@@ -2625,7 +2777,8 @@ class ModPackageAnalyzer(
             ModPackageType.BONELAB_NATIVE_CONTENT,
             ModPackageType.BONELAB_CODE_MOD,
             ModPackageType.KNOWN_GAME_PROFILE -> ModResolutionStrategy.KNOWN_GAME_PROFILE
-            ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> ModResolutionStrategy.BUILT_IN_CONTENT_TYPE
+            ModPackageType.GORILLA_TAG_VIRTUAL_STUMP,
+            ModPackageType.PAVLOV_UGC_CONTENT -> ModResolutionStrategy.BUILT_IN_CONTENT_TYPE
             ModPackageType.GENERIC_DATA -> ModResolutionStrategy.EXISTING_GAME_MOD_DIRECTORY
             ModPackageType.UNKNOWN -> ModResolutionStrategy.UNKNOWN
         }
@@ -3258,6 +3411,23 @@ class ModPackageAnalyzer(
     ) : Exception(message)
 
 }
+
+/**
+ * Archive-bomb guard based on evidence, not arbitrary totals.  Only fires
+ * when expanded output is BOTH large (above the floor, so small archives
+ * are never affected) and disproportionate to the compressed input.
+ * Unknown compressed totals (no evidence) never trigger it.
+ */
+internal fun expansionAbuse(actualTotalBytes: Long, compressedTotalBytes: Long): Boolean {
+    if (actualTotalBytes <= ModPackageAnalyzer.EXPANSION_FLOOR_BYTES) return false
+    if (compressedTotalBytes <= 0L) return false
+    return actualTotalBytes.toDouble() > compressedTotalBytes.toDouble() *
+        ModPackageAnalyzer.MAX_EXPANSION_RATIO
+}
+
+/** A single declared entry size is valid while inside the ZIP format range. */
+internal fun entrySizeAllowed(declaredSize: Long): Boolean =
+    declaredSize >= 0L && declaredSize <= ModPackageAnalyzer.MAX_ENTRY_BYTES
 
 private fun JSONObject.toMap(): Map<String, Any?> =
     keys().asSequence().associateWith { key -> toKotlinValue(get(key)) }

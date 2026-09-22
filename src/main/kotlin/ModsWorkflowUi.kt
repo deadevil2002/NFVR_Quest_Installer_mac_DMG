@@ -2018,6 +2018,7 @@ private fun displayModPackageType(type: ModPackageType): String = when (type) {
     ModPackageType.BONELAB_CODE_MOD -> "BONELAB — مود برمجي"
     ModPackageType.QMOD -> "QMOD"
     ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> "Virtual Stump — محتوى مدمج"
+    ModPackageType.PAVLOV_UGC_CONTENT -> "Pavlov — محتوى mod.io مدمج"
     ModPackageType.NFVR_MANIFEST -> "NFVR manifest"
     ModPackageType.ANDROID_DATA_LAYOUT -> "Android/data"
     ModPackageType.ANDROID_OBB_LAYOUT -> "Android/obb"

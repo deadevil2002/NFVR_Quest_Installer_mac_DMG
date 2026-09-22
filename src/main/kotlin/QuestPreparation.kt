@@ -382,7 +382,9 @@ class DataDrivenQuestModInstallStrategy : QuestModInstallStrategy {
         preparation: QuestPreparationAssessment,
         packageType: ModPackageType
     ): QuestModInstallAssessment {
-        if (packageType == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP) {
+        if (packageType == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ||
+            packageType == ModPackageType.PAVLOV_UGC_CONTENT
+        ) {
             return QuestModInstallAssessment(
                 false,
                 "Built-in game content is informational and does not require APK preparation.",

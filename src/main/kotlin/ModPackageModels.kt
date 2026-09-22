@@ -29,6 +29,7 @@ enum class ModPackageType {
     BONELAB_CODE_MOD,
     QMOD,
     GORILLA_TAG_VIRTUAL_STUMP,
+    PAVLOV_UGC_CONTENT,
     NFVR_MANIFEST,
     ANDROID_DATA_LAYOUT,
     ANDROID_OBB_LAYOUT,
@@ -185,6 +186,10 @@ fun routeModWorkflow(analysis: ModPackageAnalysis): ModWorkflowRouting {
 
 fun customerPreconditionMessage(code: String): String = when {
     code == "APK_PATCH_REQUIRED" -> "تحتاج هذه الحزمة إلى تصحيح آمن لتطبيق اللعبة قبل التثبيت."
+    code == "PAVLOV_IMPORTER_UNVERIFIED" ->
+        "هذا محتوى Pavlov من mod.io تديره اللعبة؛ لا يملك NFVR عقد استيراد محليًا موثقًا وآمنًا."
+    code == "UNSAFE_DESTINATION" ->
+        "يحتوي الأرشيف ملفات بأسماء لا يمكن نقلها بأمان إلى النظارة؛ لم يتم نقل أي ملف."
     code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" ->
         "تدعم بيانات الإصدار الحالية هذه الحزمة ضمن عائلة اللعبة نفسها، لكن مقارنة GameVersion في وقت التشغيل غير موثقة علنًا؛ التثبيت متاح لأن جميع فحوص المحتوى والوجهة والأمان نجحت."
     code.contains("LOADER", ignoreCase = true) -> "يجب تجهيز محمّل المودات المطلوب ثم إعادة التحليل."
@@ -247,6 +252,7 @@ fun customerPackageTypeMessage(type: ModPackageType): String = when (type) {
     ModPackageType.BONELAB_NATIVE_CONTENT -> "محتوى BONELAB"
     ModPackageType.BONELAB_CODE_MOD -> "مود برمجي لـ BONELAB"
     ModPackageType.GORILLA_TAG_VIRTUAL_STUMP -> "محتوى Gorilla Tag تديره اللعبة"
+    ModPackageType.PAVLOV_UGC_CONTENT -> "محتوى Pavlov من mod.io تديره اللعبة"
     ModPackageType.KNOWN_GAME_PROFILE -> "حزمة للعبة معروفة"
     ModPackageType.GENERIC_DATA -> "حزمة بيانات عامة"
     ModPackageType.UNKNOWN -> "صيغة غير معروفة"
@@ -338,7 +344,8 @@ fun classifyModWorkflow(
 ): ModWorkflowKind = when {
     externalWorkflow != null || packageType == ModPackageType.GORILLA_TAG_VIRTUAL_STUMP ->
         ModWorkflowKind.SUPPORTED_EXTERNAL_WORKFLOW
-    packageType == ModPackageType.UNKNOWN -> ModWorkflowKind.UNSUPPORTED
+    packageType == ModPackageType.UNKNOWN ||
+        packageType == ModPackageType.PAVLOV_UGC_CONTENT -> ModWorkflowKind.UNSUPPORTED
     else -> ModWorkflowKind.DIRECT_INSTALL
 }
 

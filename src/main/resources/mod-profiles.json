@@ -21,6 +21,28 @@
     "recognizedArchiveSignatures": ["package.json"]
   },
   {
+    "packageId": "com.vankrupt.pavlov",
+    "displayName": "Pavlov Shack",
+    "engine": "Unreal Engine 5.1 (mod.io UGC)",
+    "destination": "",
+    "writeAuthorized": false,
+    "supportedPackageTypes": ["PAVLOV_UGC_CONTENT"],
+    "modTypes": ["PAVLOV_UGC_CONTENT"],
+    "loaderRequirements": [],
+    "installationStrategies": ["BUILT_IN_CONTENT_TYPE"],
+    "supportedVersionNames": ["1.0.29"],
+    "supportedVersionCodes": [2397],
+    "evidenceLevel": "AUTHORITATIVE",
+    "evidenceSources": [
+      "real device: Quest 3, com.vankrupt.pavlov 1.0.29/2397, no sdcard mod folder",
+      "https://docs.mod.io/unreal/modio-ugc/getting-started",
+      "https://pavlovwiki.com (Shack modkit UE5.1.1, UGC mod.io workflow)",
+      "real corpus: UGC<modId>pakchunk0-Android_ASTC.pak + metadata.json"
+    ],
+    "knownContentDirectories": [],
+    "recognizedArchiveSignatures": ["metadata.json"]
+  },
+  {
     "packageId": "com.StressLevelZero.BONELAB",
     "displayName": "BONELAB",
     "engine": "Marrow",

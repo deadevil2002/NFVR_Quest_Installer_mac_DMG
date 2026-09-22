@@ -288,6 +288,8 @@ internal fun modGameReadinessBadge(app: InstalledQuestApp): String = when (app.p
         "Virtual Stump مكتشف · الإصدار ${app.versionName ?: "؟"}"
     "com.Warpfrog.BladeAndSorcery" ->
         "Nomad · الإصدار ${app.versionName ?: "؟"}"
+    "com.vankrupt.pavlov" ->
+        "محتوى mod.io تديره اللعبة · الإصدار ${app.versionName ?: "؟"}"
     else -> "الإصدار ${app.versionName ?: "؟"}"
 }
 

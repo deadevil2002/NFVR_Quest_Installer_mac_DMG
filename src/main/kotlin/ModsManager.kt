@@ -649,6 +649,28 @@ class ModsManager(
             return ModInstallResult(false, "ملف تعريف اللعبة تصنيفي فقط؛ لا توجد وجهة محمّل موثقة قابلة للكتابة.")
         }
 
+        // Host disk guard: extraction writes the full plan to a temp dir.
+        // Fail before touching anything when free space cannot cover it.
+        val hostFree = hostTempFreeBytes()
+        if (!installDiskSpaceSufficient(hostFree, executionPlan.totalBytes)) {
+            DiagnosticLogger.info(
+                "Mod install blocked: host temp free=$hostFree required=${executionPlan.totalBytes}"
+            )
+            return ModInstallResult(false, "لا توجد مساحة كافية على الكمبيوتر لاستخراج المود.")
+        }
+        // Quest disk guard: fail before extraction when the destination
+        // filesystem cannot cover the plan.  An unreadable df is logged
+        // and treated as unknown (not as proof of insufficiency).
+        val questFree = questFreeBytes(serial, executionPlan.destinationRoot)
+        if (questFree == null) {
+            DiagnosticLogger.info("Mod install: quest free space unreadable; proceeding without disk gate.")
+        }
+        if (!installDiskSpaceSufficient(questFree, executionPlan.totalBytes)) {
+            DiagnosticLogger.info(
+                "Mod install blocked: quest free=$questFree required=${executionPlan.totalBytes}"
+            )
+            return ModInstallResult(false, "لا توجد مساحة كافية على النظارة لتثبيت المود.")
+        }
         val tempRoot = Files.createTempDirectory("NFVR_ModPlan_").toFile()
         var copiedBytes = 0L
         var copiedFiles = 0
@@ -939,6 +961,19 @@ class ModsManager(
         return patterns.firstNotNullOfOrNull { pattern ->
             pattern.find(output)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() && it != "null" }
         }
+    }
+
+    private fun hostTempFreeBytes(): Long? {
+        val dir = File(System.getProperty("java.io.tmpdir") ?: return null)
+        return runCatching { dir.usableSpace }.getOrNull()
+    }
+
+    private fun questFreeBytes(serial: String, destinationRoot: String?): Long? {
+        val target = destinationRoot?.takeIf { AndroidPathValidator.isSafe(it) } ?: "/sdcard"
+        val df = runCatching { adbClient.shell(serial, "df", target) }.getOrNull()
+            ?: return null
+        if (df.exit != 0) return null
+        return parseQuestDfAvailableBytes(df.out)
     }
 
     private fun extractPlannedFiles(
@@ -1293,4 +1328,34 @@ private object ModInstallHistory {
         }
         return analysis.recognized to info
     }
+}
+
+/** Safety margin kept free beyond the plan bytes on both host and Quest. */
+internal const val MOD_INSTALL_DISK_MARGIN_BYTES = 64L * 1024L * 1024L
+
+/**
+ * Overflow-safe disk gate shared by the host-temp and Quest checks.
+ * Unknown free space (null/negative) can never prove insufficiency, so it
+ * proceeds; every other case requires plan bytes plus the safety margin.
+ */
+internal fun installDiskSpaceSufficient(freeBytes: Long?, requiredBytes: Long): Boolean {
+    if (requiredBytes <= 0L) return true
+    if (freeBytes == null || freeBytes < 0L) return true
+    if (freeBytes < requiredBytes) return false
+    return freeBytes - requiredBytes >= MOD_INSTALL_DISK_MARGIN_BYTES
+}
+
+/**
+ * Parses toybox `df` output (`Filesystem 1K-blocks Used Available Use%
+ * Mounted on`) into available bytes.  Returns null when the output is
+ * not a recognizable df table rather than guessing.
+ */
+internal fun parseQuestDfAvailableBytes(dfOutput: String): Long? {
+    val lines = dfOutput.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+    if (lines.size < 2 || !lines.first().startsWith("Filesystem")) return null
+    val parts = lines.last().split(Regex("\\s+"))
+    if (parts.size < 5) return null
+    val availableKb = parts[3].toLongOrNull() ?: return null
+    if (availableKb < 0L) return null
+    return availableKb * 1024L
 }
