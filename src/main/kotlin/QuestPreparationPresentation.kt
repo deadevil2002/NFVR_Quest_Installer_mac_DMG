@@ -133,6 +133,183 @@ internal fun questPreparationActionEnabled(
 internal fun modsInstallActionVisible(analysis: ModPackageAnalysis?): Boolean =
     analysis?.outcome == ModInstallOutcome.DIRECT_INSTALL_READY
 
+/**
+ * The advanced Mods diagnostics area is collapsed by default so the normal
+ * install flow stays short.  A named constant keeps the default covered by
+ * regression tests.
+ */
+internal const val ADVANCED_MODS_SECTION_DEFAULT_EXPANDED = false
+
+/**
+ * Single authoritative state for the Mods install call-to-action.
+ *
+ * The CTA must never depend on a numeric workflow stage: the rail advances
+ * to INSTALL exactly when the plan becomes reviewed, which previously hid
+ * the button at the moment the customer needed it.  READY is derived only
+ * from the real installation conditions.
+ */
+internal enum class ModInstallActionState {
+    HIDDEN,
+    READY,
+    INSTALLING,
+    VERIFYING,
+    SUCCESS,
+    FAILED
+}
+
+internal fun resolveModInstallActionState(
+    analysis: ModPackageAnalysis?,
+    operationBound: Boolean,
+    destinationConfirmed: Boolean,
+    installing: Boolean,
+    executionProgress: ModsManager.ModExecutionProgress?,
+    installSucceeded: Boolean
+): ModInstallActionState {
+    if (installSucceeded && analysis != null) return ModInstallActionState.SUCCESS
+    if (installing && executionProgress?.phase == ModsManager.ModInstallPhase.VERIFYING) {
+        return ModInstallActionState.VERIFYING
+    }
+    if (installing) return ModInstallActionState.INSTALLING
+    if (executionProgress?.phase == ModsManager.ModInstallPhase.FAILED) {
+        return ModInstallActionState.FAILED
+    }
+    if (analysis == null) return ModInstallActionState.HIDDEN
+    val ready = analysis.outcome == ModInstallOutcome.DIRECT_INSTALL_READY &&
+        analysis.installable &&
+        analysis.compatibility.compatible &&
+        operationBound &&
+        !analysis.installPlan.hasBlockingPreconditions &&
+        (!genericDestinationNeedsConfirmation(analysis) || destinationConfirmed)
+    return if (ready) ModInstallActionState.READY else ModInstallActionState.HIDDEN
+}
+
+/**
+ * Customer status line for the install area.  The ready line is only ever
+ * produced together with [ModInstallActionState.READY]; a ready message
+ * without a reachable action is a UI bug.
+ */
+internal fun modInstallCtaStatusLine(
+    state: ModInstallActionState,
+    analysis: ModPackageAnalysis?
+): String? {
+    return when (state) {
+        ModInstallActionState.READY -> if (analysis != null) {
+            "الخطة جاهزة — ${analysis.installPlan.totalFiles} ملف · ${modCompactBytes(analysis.installPlan.totalBytes)}"
+        } else null
+        ModInstallActionState.INSTALLING -> "جارٍ تثبيت المود…"
+        ModInstallActionState.VERIFYING -> "جارٍ التحقق من الملفات على النظارة…"
+        ModInstallActionState.SUCCESS -> "تم تثبيت المود بنجاح"
+        ModInstallActionState.FAILED -> if (analysis == null) {
+            "تعذر تثبيت المود."
+        } else {
+            modInstallUnavailableReason(
+                analysis,
+                operationBound = false,
+                destinationConfirmed = false
+            ) ?: "تعذر تثبيت المود."
+        }
+        ModInstallActionState.HIDDEN -> null
+    }
+}
+
+internal fun modCompactBytes(value: Long): String = when {
+    value >= 1024L * 1024L -> "${value / (1024L * 1024L)} MB"
+    value >= 1024L -> "${value / 1024L} KB"
+    else -> "$value B"
+}
+
+/**
+ * Short customer destination such as "Mods/FXDux.JsonPack/".
+ * Never exposes a blank or heuristic root.
+ */
+internal fun modCompactDestination(analysis: ModPackageAnalysis): String? {
+    val plan = analysis.installPlan
+    val packageId = plan.targetPackageId?.trim().orEmpty()
+    // Prefer the first mapped file: it names the actual mod folder (for
+    // example "Mods/<Name>/"), while the plan root is only the package dir.
+    val anchor = plan.mappings.firstOrNull()?.destinationPath
+        ?: proposedDestination(analysis)
+        ?: return null
+    var tail = anchor.trim().trimEnd('/')
+    if (packageId.isNotBlank()) {
+        val index = tail.indexOf(packageId)
+        if (index >= 0) tail = tail.substring(index + packageId.length).trimStart('/')
+    }
+    // Drop the Android container segment so customers see the mod-relative
+    // tail such as "Mods/<Name>/" instead of "files/Mods/<Name>/".
+    val segments = tail.split('/').filter { it.isNotBlank() }.toMutableList()
+    if (segments.size > 1 && segments.first().equals("files", ignoreCase = true)) {
+        segments.removeAt(0)
+    }
+    // A trailing file name is not a destination level.
+    if (segments.size > 1 && segments.last().contains('.')) {
+        segments.removeAt(segments.lastIndex)
+    }
+    if (segments.isEmpty()) return null
+    return segments.take(2).joinToString("/") + "/"
+}
+
+/**
+ * File mappings collapsed by default: at most the first [limit] entries
+ * unless [expanded] is true.  The full list always remains available to
+ * the expanded diagnostics view.
+ */
+internal fun modFileMappingsPreview(
+    mappings: List<ModFileMapping>,
+    expanded: Boolean,
+    limit: Int = 5
+): List<ModFileMapping> = if (expanded || mappings.size <= limit) mappings else mappings.take(limit)
+
+/**
+ * Supported/profiled games first (registry order), then every other
+ * application alphabetically.  Pure ordering for the customer picker.
+ */
+internal fun orderSupportedAppsFirst(apps: List<InstalledQuestApp>): List<InstalledQuestApp> {
+    val order = GameModProfileRegistry.profiles.map { it.packageId }
+    return apps.sortedWith(
+        compareBy<InstalledQuestApp> {
+            val index = order.indexOf(it.packageName)
+            if (index < 0) Int.MAX_VALUE else index
+        }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.displayName ?: it.packageName }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.packageName }
+    )
+}
+
+/**
+ * Compact readiness badge for the selected-game card.  Customer summary
+ * only; evidence details stay in the advanced section.
+ */
+internal fun modGameReadinessBadge(app: InstalledQuestApp): String = when (app.packageName) {
+    "com.StressLevelZero.BONELAB" ->
+        "جاهز لمودات المحتوى · الإصدار ${app.versionName ?: "؟"}"
+    "com.beatgames.beatsaber" ->
+        "Scotland2 · الإصدار ${app.versionName ?: "؟"}"
+    "com.AnotherAxiom.GorillaTag" ->
+        "Virtual Stump مكتشف · الإصدار ${app.versionName ?: "؟"}"
+    "com.Warpfrog.BladeAndSorcery" ->
+        "Nomad · الإصدار ${app.versionName ?: "؟"}"
+    else -> "الإصدار ${app.versionName ?: "؟"}"
+}
+
+/**
+ * Archive/selection staleness for auto-analysis.  Compares only the stable
+ * selection identity (package + version + archive hash), never volatile
+ * APK evidence that a refresh may attach mid-flow.
+ */
+internal fun modSelectionMatchesAnalysis(
+    selectedApp: InstalledQuestApp?,
+    selectedZipSha256: String?,
+    analysis: ModPackageAnalysis?
+): Boolean {
+    if (selectedApp == null || analysis == null) return false
+    val reviewed = analysis.installPlan.reviewedApp ?: return false
+    return reviewed.packageName == selectedApp.packageName &&
+        reviewed.versionName == selectedApp.versionName &&
+        reviewed.versionCode == selectedApp.versionCode &&
+        (selectedZipSha256.isNullOrBlank() ||
+            analysis.installPlan.archiveIdentity?.sha256 == selectedZipSha256)
+}
+
 internal enum class ModsOverallStage {
     GAME,
     PACKAGE,
