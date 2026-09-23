@@ -28,9 +28,11 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -369,9 +371,12 @@ fun ModsWorkflowUi(
     onAnalyze: () -> Unit,
     analysisStatus: String? = null,
     installing: Boolean,
+    installStarting: Boolean = false,
     executionProgress: ModsManager.ModExecutionProgress?,
     operationBound: Boolean = false,
     installSucceeded: Boolean = false,
+    updateConfirmed: Boolean = false,
+    onConfirmUpdate: () -> Unit = {},
     onInstall: () -> Unit,
      questPreparation: QuestPreparationUiState? = null,
      onQuestPreparationAction: () -> Unit = {},
@@ -429,8 +434,10 @@ fun ModsWorkflowUi(
         destinationConfirmed = genericDestinationConfirmed,
         installing = installing,
         executionProgress = executionProgress,
-        installSucceeded = installSucceeded
+        installSucceeded = installSucceeded,
+        updateConfirmed = updateConfirmed
     )
+    var showUpdateDialog by remember { mutableStateOf(false) }
     // Auto-analysis fires once per distinct (archive, game) selection so a
     // newly picked mod is inspected without a separate manual step.
     var autoAnalyzedKey by remember { mutableStateOf<String?>(null) }
@@ -629,10 +636,13 @@ fun ModsWorkflowUi(
                                 onDestinationConfirmed(it)
                             },
                             allFilesExpanded = allFilesExpanded,
-                            onAllFilesExpandedChange = { allFilesExpanded = it }
+                            onAllFilesExpandedChange = { allFilesExpanded = it },
+                            updateConfirmed = updateConfirmed,
+                            onUpdateClick = { showUpdateDialog = true }
                         )
                     }
                 }
+
                 if (selectedApp != null &&
                     questPreparation != null &&
                     modsPreparationPanelVisible(analysis)
@@ -703,11 +713,26 @@ fun ModsWorkflowUi(
                 }
                 item { Spacer(Modifier.height(20.dp)) }
             }
+            if (showUpdateDialog && analysis?.installedModAssessment?.relation ==
+                InstalledModRelation.NEWER_THAN_INSTALLED
+            ) {
+                ModUpdateConfirmDialog(
+                    assessment = analysis.installedModAssessment,
+                    onConfirm = {
+                        showUpdateDialog = false
+                        onConfirmUpdate()
+                    },
+                    onDismiss = { showUpdateDialog = false }
+                )
+            }
             StickyModInstallBar(
                 state = installActionState,
+                starting = installStarting,
                 analysis = analysis,
                 executionProgress = executionProgress,
                 enabled = editingEnabled,
+                updateConfirmed = updateConfirmed,
+                onUpdateClick = { showUpdateDialog = true },
                 onInstall = {
                     clearFocusBeforeModsTransition(
                         { focusManager.clearFocus(force = true) },
@@ -1362,7 +1387,9 @@ private fun InstallationSuccessCard() {
     destinationConfirmed: Boolean,
     onDestinationConfirmationChanged: (Boolean) -> Unit,
     allFilesExpanded: Boolean,
-    onAllFilesExpandedChange: (Boolean) -> Unit
+    onAllFilesExpandedChange: (Boolean) -> Unit,
+    updateConfirmed: Boolean = false,
+    onUpdateClick: () -> Unit = {}
 ) {
     val outcome = modsUiOutcome(analysis)
     val tone = outcomeColor(outcome.tone)
@@ -1403,6 +1430,51 @@ private fun InstallationSuccessCard() {
                     ?.joinToString(" أو ") { it.displayName }
                     ?.takeIf { it.isNotBlank() } ?: "غير مطلوب"
             )
+            analysis.installedModAssessment
+                ?.takeIf { it.relation != InstalledModRelation.ABSENT }
+                ?.let { assessment ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    val decisionTone = when (assessment.relation) {
+                        InstalledModRelation.NEWER_THAN_INSTALLED ->
+                            MaterialTheme.colorScheme.tertiary
+                        InstalledModRelation.IDENTICAL_CONTENT,
+                        InstalledModRelation.SAME_VERSION ->
+                            MaterialTheme.colorScheme.primary
+                        else -> warningColor()
+                    }
+                    Text(
+                        installedModRelationMessage(assessment.relation),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = decisionTone
+                    )
+                    ReviewRow(
+                        "الإصدار المثبت",
+                        assessment.installedIdentity?.version ?: "غير معروف"
+                    )
+                    ReviewRow(
+                        "الإصدار المحدد",
+                        assessment.archiveIdentity.version ?: "غير معروف"
+                    )
+                    if (assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED &&
+                        !updateConfirmed
+                    ) {
+                        OutlinedButton(
+                            onClick = onUpdateClick,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("تحديث المود")
+                        }
+                    }
+                    if (updateConfirmed &&
+                        assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED
+                    ) {
+                        StatusNote(
+                            "تم تأكيد التحديث؛ راجع الخطة ثم ابدأ التثبيت.",
+                            Icons.Default.CheckCircle,
+                            MaterialTheme.colorScheme.tertiary
+                        )
+                    }
+                }
             if (genericDestinationNeedsConfirmation(analysis) || plan.confirmation != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
@@ -1460,19 +1532,83 @@ private fun InstallationSuccessCard() {
  */
 @Composable private fun StickyModInstallBar(
     state: ModInstallActionState,
+    starting: Boolean = false,
     analysis: ModPackageAnalysis?,
     executionProgress: ModsManager.ModExecutionProgress?,
     enabled: Boolean,
     onInstall: () -> Unit,
-    onChooseAnother: () -> Unit
+    onChooseAnother: () -> Unit,
+    updateConfirmed: Boolean = false,
+    onUpdateClick: () -> Unit = {}
 ) {
     if (state == ModInstallActionState.HIDDEN) return
+    val assessment = analysis?.installedModAssessment
+        ?.takeIf { it.relation != InstalledModRelation.ABSENT }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Column(Modifier.padding(horizontal = 28.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Immediate click feedback: the click was accepted and the
+            // operation is starting.  Real progress takes over below.
+            // The button stays disabled so a second click cannot launch
+            // a duplicate operation.
+            if (starting && state == ModInstallActionState.READY) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("جارٍ بدء التثبيت…", style = MaterialTheme.typography.titleMedium)
+                }
+                Button(
+                    onClick = {},
+                    enabled = false,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary,
+                        contentColor = MaterialTheme.colorScheme.onTertiary
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    CircularProgressIndicator(
+                        Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onTertiary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("جارٍ بدء التثبيت…", style = MaterialTheme.typography.titleMedium)
+                }
+                return@Column
+            }
+            // An existing install owns the destination: the review card
+            // owns the decision, and only a confirmed proven-newer update
+            // falls through to the normal install action below.
+            if (assessment != null &&
+                !(assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED && updateConfirmed)
+            ) {
+                val tone = when (assessment.relation) {
+                    InstalledModRelation.NEWER_THAN_INSTALLED -> MaterialTheme.colorScheme.tertiary
+                    InstalledModRelation.IDENTICAL_CONTENT,
+                    InstalledModRelation.SAME_VERSION -> MaterialTheme.colorScheme.primary
+                    else -> warningColor()
+                }
+                Text(installedModRelationMessage(assessment.relation), style = MaterialTheme.typography.titleMedium, color = tone)
+                if (assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED) {
+                    Button(
+                        onClick = onUpdateClick,
+                        enabled = enabled,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.tertiary,
+                            contentColor = MaterialTheme.colorScheme.onTertiary
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.PlayArrow, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("تحديث المود", style = MaterialTheme.typography.titleMedium)
+                    }
+                }
+                return@Column
+            }
             when (state) {
                 ModInstallActionState.HIDDEN -> Unit
                 ModInstallActionState.READY -> {
@@ -1493,7 +1629,10 @@ private fun InstallationSuccessCard() {
                     ) {
                         Icon(Icons.Default.PlayArrow, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("تثبيت المود", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            if (updateConfirmed) "تثبيت التحديث" else "تثبيت المود",
+                            style = MaterialTheme.typography.titleMedium
+                        )
                     }
                 }
                 ModInstallActionState.INSTALLING, ModInstallActionState.VERIFYING -> {
@@ -1529,6 +1668,40 @@ private fun InstallationSuccessCard() {
             }
         }
     }
+}
+
+@Composable private fun ModUpdateConfirmDialog(
+    assessment: InstalledModAssessment?,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    if (assessment == null) return
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("تحديث المود") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("يوجد إصدار أقدم من هذا المود مثبت.")
+                Text("الإصدار المثبت:")
+                Text(
+                    assessment.installedIdentity?.version ?: "غير معروف",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text("الإصدار المحدد:")
+                Text(
+                    assessment.archiveIdentity.version ?: "غير معروف",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(modUpdateConfirmationText(assessment).substringAfterLast("\n\n"))
+            }
+        },
+        confirmButton = {
+            Button(onClick = onConfirm) { Text("تحديث المود") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("إلغاء") }
+        }
+    )
 }
 
 @Composable private fun ModInstallFailureCard(

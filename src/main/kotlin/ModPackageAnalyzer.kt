@@ -1871,6 +1871,19 @@ class ModPackageAnalyzer(
         if (mappings.isEmpty()) {
             preconditions += blocked("NO_COPY_MAPPINGS", "BONELAB content contains no safe files to install.")
         }
+        // Archive-side pallet identity for the installed-version decision
+        // layer.  Only the single evidenced manifest counts; anything else
+        // leaves identity unproven (never guessed).
+        val bonelabIdentity = contentRoot?.let { root ->
+            contentDocuments(archive)
+                .filter { (path, json) -> isBonelabContentDocument(path, json) }
+                .mapNotNull { (path, json) ->
+                    val relative = relativeEntry(path)
+                    if (relative.substringBefore('/') != root) null
+                    else parseBonelabPalletIdentity(json, modRoot = root, palletSha256 = archive.hashes[path])
+                }
+                .singleOrNull()
+        }
         val plan = plan(
             type,
             BONELAB_PACKAGE_ID,
@@ -1890,7 +1903,8 @@ class ModPackageAnalyzer(
             } else blockingMessage(plan),
             plan,
             archive,
-            metadata = mapOf("platform" to if (codeMod) "Quest loader code" else "Quest native content")
+            metadata = mapOf("platform" to if (codeMod) "Quest loader code" else "Quest native content"),
+            bonelabIdentity = bonelabIdentity
         )
     }
 
@@ -3361,7 +3375,8 @@ class ModPackageAnalyzer(
         plan: ModInstallPlan,
         archive: ArchiveMetadata,
         metadata: Map<String, Any?> = emptyMap(),
-        externalWorkflow: ModExternalWorkflow? = null
+        externalWorkflow: ModExternalWorkflow? = null,
+        bonelabIdentity: BonelabPalletIdentity? = null
     ): ModPackageAnalysis {
         // Every classified result carries the selected app identity.  Keeping
         // this normalization at the result boundary protects less common
@@ -3386,7 +3401,8 @@ class ModPackageAnalyzer(
         entries = archive.entries,
         externalWorkflow = externalWorkflow,
             diagnostics = normalizedPlan.diagnostics.distinct(),
-            archiveTree = archive.normalizedTree
+            archiveTree = archive.normalizedTree,
+            bonelabIdentity = bonelabIdentity
     )
     }
 

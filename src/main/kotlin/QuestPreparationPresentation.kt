@@ -163,7 +163,8 @@ internal fun resolveModInstallActionState(
     destinationConfirmed: Boolean,
     installing: Boolean,
     executionProgress: ModsManager.ModExecutionProgress?,
-    installSucceeded: Boolean
+    installSucceeded: Boolean,
+    updateConfirmed: Boolean = false
 ): ModInstallActionState {
     if (installSucceeded && analysis != null) return ModInstallActionState.SUCCESS
     if (installing && executionProgress?.phase == ModsManager.ModInstallPhase.VERIFYING) {
@@ -180,6 +181,19 @@ internal fun resolveModInstallActionState(
         operationBound &&
         !analysis.installPlan.hasBlockingPreconditions &&
         (!genericDestinationNeedsConfirmation(analysis) || destinationConfirmed)
+    // An existing install owns the destination: the normal install action
+    // stays hidden and the review card owns the decision UX.  Only an
+    // explicitly confirmed proven-newer update re-exposes it.
+    val assessment = analysis.installedModAssessment
+    if (assessment != null && assessment.relation != InstalledModRelation.ABSENT) {
+        return if (assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED &&
+            updateConfirmed && ready
+        ) {
+            ModInstallActionState.READY
+        } else {
+            ModInstallActionState.HIDDEN
+        }
+    }
     return if (ready) ModInstallActionState.READY else ModInstallActionState.HIDDEN
 }
 
@@ -211,6 +225,17 @@ internal fun modInstallCtaStatusLine(
         ModInstallActionState.HIDDEN -> null
     }
 }
+
+/**
+ * Whether the sticky bar shows the immediate STARTING feedback (click
+ * accepted, operation spinning up) instead of the READY button or real
+ * progress.  Never fakes transfer progress.
+ */
+internal fun modInstallStartingVisible(
+    actionState: ModInstallActionState,
+    installing: Boolean,
+    starting: Boolean
+): Boolean = starting && !installing && actionState == ModInstallActionState.READY
 
 internal fun modCompactBytes(value: Long): String = when {
     value >= 1024L * 1024L -> "${value / (1024L * 1024L)} MB"

@@ -1551,10 +1551,18 @@ fun main() {
     val installMutex = remember { Mutex() }
     val modOperationMutex = remember { Mutex() }
     var modOperationGeneration by remember { mutableStateOf(0L) }
+    // Immediate click feedback: true from a valid install click until real
+    // transfer progress takes over or preflight fails.  Never fakes
+    // progress; it only means "accepted, starting".
+    var modInstallStarting by remember { mutableStateOf(false) }
     // Identity of the analysis currently holding modOperationMutex, if any.
     // Lets a duplicate trigger for the SAME selection stay silent instead
     // of emitting a false conflicting-operation error.
     var activeModAnalysisKey by remember { mutableStateOf<String?>(null) }
+    // User-confirmed staged update for a proven-newer installed mod.
+    // Cleared on any selection change; the executor re-validates every
+    // field live, so a stale confirmation can never execute.
+    var confirmedModUpdate by remember { mutableStateOf<ModUpdateAuthorization?>(null) }
     var activityEvents by remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
 
     // ===== LICENSE UI STATE =====
@@ -1616,6 +1624,7 @@ fun main() {
         modOperationBinding = null
         modPlanId = null
         destinationConfirmedPlanId = null
+        confirmedModUpdate = null
         modInstallSucceeded = false
         if (!isInstallingMod) modExecutionProgress = null
     }
@@ -1939,8 +1948,6 @@ fun main() {
             modAnalysisStatus = message
             appendModLog(message)
         }
-        modAnalysisStatus = "جارٍ تحليل الحزمة…"
-        appendModLog("جارٍ تحليل الحزمة…")
         val analysisIdentityKey = modAnalysisIdentityKey(
             connectedDeviceSerial, selectedApp, modZipFile, modZipSha256
         )
@@ -1956,6 +1963,10 @@ fun main() {
             return
         }
         activeModAnalysisKey = analysisIdentityKey
+        // Exactly one customer-facing start line per actual operation: the
+        // duplicate above returns before reaching this point.
+        modAnalysisStatus = "جارٍ تحليل الحزمة…"
+        appendModLog("جارٍ تحليل الحزمة…")
         try {
             val file = modZipFile
             val app = selectedApp
@@ -2633,6 +2644,7 @@ fun main() {
             appendModLog("هناك عملية مود أخرى قيد التنفيذ.")
             return
         }
+        modInstallStarting = true
         var operationGeneration: Long? = null
         try {
             val file = modZipFile
@@ -2702,6 +2714,7 @@ fun main() {
             val generation = ++modOperationGeneration
             operationGeneration = generation
             isInstallingMod = true
+            modInstallStarting = false
             modInstallDeviceLost = false
             modExecutionProgress = ModsManager.ModExecutionProgress(
                 ModsManager.ModInstallPhase.PREPARING,
@@ -2729,17 +2742,19 @@ fun main() {
                 modsManager.executeInstallPlan(
                     serial = serial,
                     zipFile = file,
-                    plan = boundPlan
-                ) { update ->
-                    uiScope.launch {
-                        if (generation == modOperationGeneration &&
-                            connectedDeviceSerial == serial &&
-                            modOperationBinding?.deviceSerial == serial
-                        ) {
-                            modExecutionProgress = update
+                    plan = boundPlan,
+                    onProgress = { update ->
+                        uiScope.launch {
+                            if (generation == modOperationGeneration &&
+                                connectedDeviceSerial == serial &&
+                                modOperationBinding?.deviceSerial == serial
+                            ) {
+                                modExecutionProgress = update
+                            }
                         }
-                    }
-                }
+                    },
+                    update = confirmedModUpdate
+                )
             }
             val currentSerial = getAuthorizedSerialOrNull()
             if (currentSerial != serial ||
@@ -2786,6 +2801,7 @@ fun main() {
             }
         } finally {
             isInstallingMod = false
+            modInstallStarting = false
             modOperationMutex.unlock()
         }
     }
@@ -4248,7 +4264,8 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     onAnalyze = {
                                         uiScope.launch { analyzeSelectedMod() }
                                     },
-                                    installing = isInstallingMod,
+                                    installing = isInstallingMod || modInstallStarting,
+                                    installStarting = modInstallStarting && !isInstallingMod,
                                     executionProgress = modExecutionProgress,
                                      operationBound = modOperationBindingMatches(
                                          modOperationBinding,
@@ -4258,6 +4275,45 @@ Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                          modPlanId
                                      ),
                                      installSucceeded = modInstallSucceeded,
+                                     updateConfirmed = confirmedModUpdate != null,
+                                     onConfirmUpdate = {
+                                         val assessment = modAnalysis?.installedModAssessment
+                                         val serial = connectedDeviceSerial
+                                         val sha = modZipSha256
+                                         val app = selectedApp
+                                         if (assessment == null || serial == null ||
+                                             sha == null || app == null
+                                         ) {
+                                             appendModLog("تعذر تأكيد التحديث؛ أعد تحليل الحزمة.")
+                                         } else if (assessment.relation !=
+                                             InstalledModRelation.NEWER_THAN_INSTALLED
+                                         ) {
+                                             appendModLog("التحديث متاح فقط لإصدار أحدث مثبت.")
+                                         } else {
+                                             val archive = assessment.archiveIdentity
+                                             confirmedModUpdate = ModUpdateAuthorization(
+                                                 confirmationToken = modUpdateConfirmationToken(
+                                                     serial,
+                                                     app.packageName,
+                                                     assessment.modRoot,
+                                                     sha,
+                                                     assessment.installedIdentity?.version,
+                                                     archive.version.orEmpty()
+                                                 ),
+                                                 deviceSerial = serial,
+                                                 packageId = app.packageName,
+                                                 modRoot = assessment.modRoot,
+                                                 archiveSha256 = sha,
+                                                 installedVersion = assessment.installedIdentity?.version,
+                                                 newVersion = archive.version.orEmpty(),
+                                                 installedBarcode = assessment.installedIdentity?.barcode.orEmpty(),
+                                                 archiveBarcode = archive.barcode
+                                             )
+                                             appendModLog(
+                                                 "تم تأكيد تحديث المود إلى الإصدار ${archive.version}؛ ابدأ التثبيت."
+                                             )
+                                         }
+                                     },
                                     onInstall = {
                                         uiScope.launch { installSelectedMod() }
                                     },

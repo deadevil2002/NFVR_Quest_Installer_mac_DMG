@@ -55,6 +55,9 @@ class ModsTransportAndInventoryTest {
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/reticle++-1.bundle")
         )
         assertTrue(
+            AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/color=red.bundle")
+        )
+        assertTrue(
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/sr2m“veresk”.bundle")
         )
         assertFalse(AndroidPathValidator.isSafe("/sdcard/a;b"))
@@ -314,6 +317,12 @@ class ModsTransportAndInventoryTest {
         assertFalse(isNfvrTempDir("/sdcard/other/.nfvr-tmp-x", root))
         assertFalse(isNfvrTempDir("$root/.nfvr-tmp-", root))
         assertFalse(isNfvrTempDir("$root/other", root))
+        // Update staging/backup share the owned namespace.
+        assertTrue(isNfvrOwnedDir("$root/.nfvr-update-abc123", root, NFVR_OWNED_DIR_PREFIXES))
+        assertTrue(isNfvrOwnedDir("$root/.nfvr-backup-abc123", root, NFVR_OWNED_DIR_PREFIXES))
+        assertFalse(isNfvrOwnedDir("$root/.nfvr-update-", root, NFVR_OWNED_DIR_PREFIXES))
+        assertFalse(isNfvrOwnedDir("$root/Mods", root, NFVR_OWNED_DIR_PREFIXES))
+        assertFalse(isNfvrOwnedDir("/sdcard/other/.nfvr-update-x", root, NFVR_OWNED_DIR_PREFIXES))
     }
 
     @Test
@@ -471,13 +480,31 @@ class ModsTransportAndInventoryTest {
         }
     }
 
+    @Test
+    fun transientVerifyFlakeRecoversOnRetry() = runBlocking {
+        val archive = quoteFixture()
+        try {
+            val adb = TempTransportAdb(bonelabApp(), failFirstVerify = true)
+            val manager = managerFor(adb, bonelabApp())
+            val plan = manager.analyzeModPackage(archive, bonelabApp()).installPlan
+                .bindToDevice("SERIAL")
+            val result = manager.executeInstallPlan("SERIAL", archive, plan)
+            assertTrue(result.success, result.message)
+            assertTrue(adb.verifyAttempts >= plan.mappings.size + 1)
+        } finally {
+            archive.delete()
+        }
+    }
+
     private class TempTransportAdb(
         private val app: InstalledQuestApp,
         private val failPush: Boolean = false,
-        private val failFirstPush: Boolean = false
+        private val failFirstPush: Boolean = false,
+        private val failFirstVerify: Boolean = false
     ) : AdbClient(BundledAdb(HostOs.LINUX)) {
         val pushTargets = mutableListOf<String>()
         var pushCalls = 0
+        var verifyAttempts = 0
         val moves = mutableListOf<Pair<String, String>>()
         val verifiedFiles = linkedSetOf<String>()
         var cleaned = false
@@ -499,7 +526,11 @@ class ModsTransportAndInventoryTest {
                     CmdResult(0, "", "")
                 command.firstOrNull() == "test" -> CmdResult(0, "", "")
                 command.firstOrNull() == "stat" -> {
-                    val path = unq(command.lastOrNull().orEmpty())
+                    verifyAttempts++
+                    if (failFirstVerify && verifyAttempts == 1) {
+                        return CmdResult(1, "", "injected daemon death")
+                    }
+                    val path = shellUnquoteRemotePath(command.lastOrNull().orEmpty())
                     val size = files[path] ?: return CmdResult(1, "", "missing")
                     verifiedFiles += path
                     CmdResult(0, "$size\n", "")

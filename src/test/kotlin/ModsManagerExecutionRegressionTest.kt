@@ -66,7 +66,7 @@ class ModsManagerExecutionRegressionTest {
                     "SERIAL",
                     archive,
                     plan,
-                    progress::add
+                    onProgress = progress::add
                 )
 
                 assertTrue(result.success, result.message)
@@ -105,7 +105,7 @@ class ModsManagerExecutionRegressionTest {
                     "SERIAL",
                     archive,
                     plan,
-                    progress::add
+                    onProgress = progress::add
                 )
 
                 assertTrue(result.success, result.message)

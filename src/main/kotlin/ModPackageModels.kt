@@ -704,7 +704,18 @@ data class ModPackageAnalysis(
     val entries: List<String> = emptyList(),
     val externalWorkflow: ModExternalWorkflow? = null,
     val diagnostics: List<String> = emptyList(),
-    val archiveTree: QuestModArchiveTree? = null
+    val archiveTree: QuestModArchiveTree? = null,
+    /**
+     * Archive-side Marrow pallet identity (offline).  Present when the
+     * analyzer evidenced exactly one pallet manifest.
+     */
+    val bonelabIdentity: BonelabPalletIdentity? = null,
+    /**
+     * Device-side version decision against the installed mod, attached
+     * only by device-aware analysis.  Null means "not assessed" (fresh
+     * install path unchanged).
+     */
+    val installedModAssessment: InstalledModAssessment? = null
 ) {
     val installable: Boolean
         get() = installPlan.installable

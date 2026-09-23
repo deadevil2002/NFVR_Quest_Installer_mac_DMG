@@ -328,10 +328,16 @@ class ModsManager(
         // operation binding (for example Gorilla APK patch requirements).
         val deviceAwarePlan = analysis.installPlan.copy(reviewedDeviceSerial = serial)
         val boundPlan = deviceAwarePlan.tryBindToDevice(serial)
+        // Installed-version decision: read-only, never blocks analysis.
+        // A missing/unreadable install simply yields no assessment and the
+        // normal first-install path applies.
+        val assessment = runCatching {
+            assessInstalledMod(serial, analysis)
+        }.getOrNull()
         return@withContext if (boundPlan == null) {
-            analysis.copy(installPlan = deviceAwarePlan)
+            analysis.copy(installPlan = deviceAwarePlan, installedModAssessment = assessment)
         } else {
-            analysis.copy(installPlan = boundPlan)
+            analysis.copy(installPlan = boundPlan, installedModAssessment = assessment)
         }
     }
 
@@ -417,6 +423,119 @@ class ModsManager(
         return runCatching {
             adbClient.shell(serial, "run-as", installedApp.packageName, "ls").exit == 0
         }.getOrDefault(false)
+    }
+
+    /**
+     * Compares an analyzed BONELAB archive against the installed mod
+     * folder, if any.  Null when inapplicable (other games, no evidenced
+     * pallet identity, unreadable state).  Every device read is bounded
+     * and read-only; the installed pallet is pulled byte-exact so its
+     * hash is comparable.
+     */
+    suspend fun assessInstalledMod(
+        serial: String,
+        analysis: ModPackageAnalysis
+    ): InstalledModAssessment? {
+        if (analysis.packageType != ModPackageType.BONELAB_NATIVE_CONTENT) return null
+        val archiveIdentity = analysis.bonelabIdentity ?: return null
+        val root = archiveIdentity.modRoot?.trim()?.takeIf { it.isNotBlank() && !it.contains('/') }
+            ?: return null
+        val profile = GameModProfileRegistry.findByPackageId(ModPackageAnalyzer.BONELAB_PACKAGE_ID)
+            ?: return null
+        val base = profile.destination.trimEnd('/').takeIf {
+            it.isNotBlank() && AndroidPathValidator.isSafe(it)
+        } ?: return null
+        return assessInstalledModWithIdentity(serial, archiveIdentity, base, root)
+    }
+
+    private suspend fun assessInstalledModWithIdentity(
+        serial: String,
+        archiveIdentity: BonelabPalletIdentity,
+        base: String,
+        modRoot: String
+    ): InstalledModAssessment? {
+        val modDir = "$base/$modRoot"
+        if (adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(modDir)).exit != 0) {
+            return InstalledModAssessment(
+                relation = InstalledModRelation.ABSENT,
+                modRoot = modRoot,
+                archiveIdentity = archiveIdentity,
+                installedIdentity = null
+            )
+        }
+        val installedIdentity = readInstalledPalletIdentity(serial, base, modRoot)
+        val fileCount = runCatching {
+            val count = adbClient.shell(
+                serial, "find", shellQuoteRemotePath(modDir), "-type", "f", "|", "wc", "-l"
+            )
+            if (count.exit != 0) null
+            else count.out.trim().toLongOrNull()?.takeIf { it >= 0L }?.toInt()
+        }.getOrNull()
+        return InstalledModAssessment(
+            relation = decideInstalledModRelation(archiveIdentity, installedIdentity),
+            modRoot = modRoot,
+            archiveIdentity = archiveIdentity,
+            installedIdentity = installedIdentity,
+            installedFileCount = fileCount
+        )
+    }
+
+    private suspend fun readInstalledPalletIdentity(
+        serial: String,
+        base: String,
+        modRoot: String
+    ): BonelabPalletIdentity? {
+        val modDir = "$base/$modRoot"
+        val conventional = "$modDir/$modRoot.pallet.json"
+        val palletPath = if (
+            adbClient.shell(serial, "test", "-f", shellQuoteRemotePath(conventional)).exit == 0
+        ) {
+            conventional
+        } else {
+            val found = adbClient.shell(
+                serial, "find", shellQuoteRemotePath(modDir),
+                "-maxdepth", "1", "-name", "'*.pallet.json'"
+            )
+            if (found.exit != 0) return null
+            found.out.lineSequence().map { it.trim() }.firstOrNull { it.isNotBlank() }
+                ?.takeIf { AndroidPathValidator.isSafe(it) && it.startsWith("$modDir/") }
+                ?: return null
+        }
+        return readInstalledPalletIdentityFrom(serial, palletPath, modRoot)
+    }
+
+    /**
+     * Pulls one remote pallet file byte-exact (bounded to 1MB) and parses
+     * its authoritative identity.  Shared by assessment and staged-update
+     * verification so both reason about identical evidence.
+     */
+    private suspend fun readInstalledPalletIdentityFrom(
+        serial: String,
+        palletPath: String,
+        modRoot: String
+    ): BonelabPalletIdentity? {
+        if (!AndroidPathValidator.isSafe(palletPath)) return null
+        val size = adbClient.shell(serial, "stat", "-c", "%s", shellQuoteRemotePath(palletPath))
+        if (size.exit != 0) return null
+        val bytes = size.out.trim().toLongOrNull() ?: return null
+        if (bytes <= 0L || bytes > 1024L * 1024L) return null
+        val local = runCatching {
+            File.createTempFile("nfvr-installed-pallet-", ".json").also { it.deleteOnExit() }
+        }.getOrNull() ?: return null
+        try {
+            val pulled = adbClient.pullReadOnly(serial, palletPath, local)
+            if (pulled.exit != 0 || !local.isFile || local.length() != bytes) return null
+            val json = runCatching {
+                JSONObject(local.readText(Charsets.UTF_8))
+            }.getOrNull() ?: return null
+            return parseBonelabPalletIdentity(
+                json,
+                modRoot = modRoot,
+                palletSha256 = sha256(local)
+            )
+        } finally {
+            runCatching { local.delete() }
+        }
     }
 
     /**
@@ -523,6 +642,7 @@ class ModsManager(
         serial: String,
         zipFile: File,
         plan: ModInstallPlan,
+        update: ModUpdateAuthorization? = null,
         onProgress: (ModExecutionProgress) -> Unit = {}
     ): ModInstallResult {
         if (!plan.installable || plan.hasBlockingPreconditions || plan.mappings.isEmpty()) {
@@ -771,6 +891,26 @@ class ModsManager(
                         "تعذر التحقق من محمّل المود المطلوب قبل النقل؛ أعد تحليل الحزمة."
                     )
                 }
+            }
+
+            // A user-confirmed proven-newer update takes the staged path:
+            // transfer aside, verify staged metadata, rename-swap with
+            // backup, verify final, rollback on any failure.  Null keeps
+            // the exact proven first-install behavior below (which refuses
+            // existing destinations outright).
+            if (update != null) {
+                return executeStagedUpdate(
+                    serial = serial,
+                    extracted = extracted,
+                    executionPlan = executionPlan,
+                    archiveIdentity = freshAnalysis.bonelabIdentity,
+                    profile = profile,
+                    reviewedApp = reviewedApp,
+                    reviewedIdentity = reviewedIdentity,
+                    operationBinding = operationBinding,
+                    update = update,
+                    onProgress = onProgress
+                )
             }
 
             // Refuse collisions before the first mkdir/push. A direct install
@@ -1060,6 +1200,287 @@ class ModsManager(
         }
     }
 
+    /**
+     * Staged mod update: transfer the complete new version aside, verify
+     * every staged file plus staged metadata, then rename-swap with the
+     * installed version kept as a backup until final verification passes.
+     * Never merges old and new files: the final directory is always born
+     * from exactly one complete verified tree.  Any failure before the
+     * swap leaves the installed mod untouched; any failure during/after
+     * restores it from backup.
+     */
+    private suspend fun executeStagedUpdate(
+        serial: String,
+        extracted: Map<String, File>,
+        executionPlan: ModInstallPlan,
+        archiveIdentity: BonelabPalletIdentity?,
+        profile: GameModProfile,
+        reviewedApp: InstalledQuestApp,
+        reviewedIdentity: ModArchiveIdentity,
+        operationBinding: ModOperationBinding,
+        update: ModUpdateAuthorization,
+        onProgress: (ModExecutionProgress) -> Unit
+    ): ModInstallResult {
+        fun refuse(reason: String): ModInstallResult {
+            val site = Throwable().stackTrace
+                .firstOrNull { it.fileName == "ModsManager.kt" && !it.methodName.endsWith("refuse") }?.lineNumber
+            DiagnosticLogger.info("Mod update refused [line=$site]: $reason")
+            return ModInstallResult(false, reason)
+        }
+        // 1. Authorization must match this exact live operation.
+        if (update.deviceSerial != serial ||
+            update.packageId != reviewedApp.packageName ||
+            update.archiveSha256 != reviewedIdentity.sha256
+        ) {
+            return refuse("تغير ربط الجهاز أو الخطة؛ أعد تحليل الحزمة قبل التحديث.")
+        }
+        if (executionPlan.packageType != ModPackageType.BONELAB_NATIVE_CONTENT ||
+            executionPlan.mappings.isEmpty() ||
+            archiveIdentity == null
+        ) {
+            return refuse("خطة التحديث غير صالحة لهذا النوع من المودات.")
+        }
+        if (!archiveIdentity.barcode.equals(update.archiveBarcode, ignoreCase = true) ||
+            archiveIdentity.version != update.newVersion
+        ) {
+            return refuse("تغيرت الحزمة منذ تأكيد التحديث؛ أعد التحليل.")
+        }
+        val base = profile.destination.trimEnd('/').takeIf {
+            it.isNotBlank() && AndroidPathValidator.isSafe(it)
+        } ?: return refuse("لم يتم إثبات جذر محتوى معتمد قبل النقل.")
+        val modRoot = update.modRoot.trim().takeIf {
+            it.isNotBlank() && !it.contains('/')
+        } ?: return refuse("اسم مجلد المود غير صالح للتحديث.")
+        val finalRoot = "$base/$modRoot"
+        if (!AndroidPathValidator.isSafe(finalRoot)) {
+            return refuse("وجهة التحديث خارج مجلد المودات المعتمد.")
+        }
+        // 2. Live re-assessment: still the same mod, still proven newer.
+        val live = assessInstalledModWithIdentity(serial, archiveIdentity, base, modRoot)
+            ?: return refuse("تعذر إعادة فحص المود المثبت؛ أعد التحليل.")
+        if (live.relation != InstalledModRelation.NEWER_THAN_INSTALLED) {
+            return refuse("لم يعد التحديث صالحًا؛ أعد تحليل الحزمة.")
+        }
+        if (!live.installedIdentity?.version.equals(update.installedVersion, ignoreCase = false) &&
+            !(live.installedIdentity?.version == null && update.installedVersion == null)
+        ) {
+            return refuse("تغير الإصدار المثبت منذ التأكيد؛ أعد التحليل.")
+        }
+        val expectedToken = modUpdateConfirmationToken(
+            serial, reviewedApp.packageName, modRoot,
+            reviewedIdentity.sha256, live.installedIdentity?.version, archiveIdentity.version.orEmpty()
+        )
+        if (expectedToken != update.confirmationToken) {
+            return refuse("تغيرت بيانات التأكيد؛ أعد تحليل الحزمة وأكد التحديث مجددًا.")
+        }
+        if (adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(finalRoot)).exit != 0) {
+            return refuse("مجلد المود المثبت غير موجود؛ ثبّت المود كجديد أولًا.")
+        }
+        // 3. Staging + backup roots (owned namespace, cleared first).
+        val nonce = operationBinding.analysisPlanId.filter { it.isLetterOrDigit() }.take(12)
+        if (nonce.isBlank()) return refuse("معرف الخطة غير صالح للتحديث.")
+        val stagingRoot = "$base/.nfvr-update-$nonce"
+        val stagingMod = "$stagingRoot/$modRoot"
+        val backupRoot = "$base/.nfvr-backup-$nonce"
+        for (dir in listOf(stagingRoot, backupRoot)) {
+            if (!isNfvrOwnedDir(dir, base, NFVR_OWNED_DIR_PREFIXES)) {
+                return refuse("مسار مؤقت غير معتمد.")
+            }
+            runCatching { adbClient.shell(serial, "rm", "-rf", shellQuoteRemotePath(dir)) }
+        }
+        val mkStaging = createModPath(serial, stagingMod, approvedBase = base)
+        if (mkStaging.exit != 0) {
+            return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION))
+        }
+        // 4. Rewrite mappings onto the staging tree (same relative shape).
+        val stagedMappings = executionPlan.mappings.map { mapping ->
+            val relative = mapping.destinationPath.removePrefix("$finalRoot/")
+            if (relative == mapping.destinationPath || relative.isBlank() ||
+                relative.split('/').any { it == ".." }
+            ) {
+                return refuse("تم رفض وجهة غير معتمدة: ${mapping.destinationPath}")
+            }
+            val staged = "$stagingMod/$relative"
+            if (!AndroidPathValidator.isSafe(staged) ||
+                !isApprovedDestination(staged, profile, executionPlan)
+            ) {
+                return refuse("تم رفض وجهة غير معتمدة: ${mapping.destinationPath}")
+            }
+            mapping.copy(destinationPath = staged)
+        }
+        // Staging is fresh: every target must be absent (no silent merge).
+        for (mapping in stagedMappings) {
+            val collision = adbClient.shell(serial, "test", "!", "-e", shellQuoteRemotePath(mapping.destinationPath))
+            if (collision.exit != 0) {
+                cleanupRemoteTempDir(serial, stagingRoot, base)
+                return refuse("تعارضت ملفات التحديث المؤقتة مع ملفات موجودة؛ تم إيقاف التحديث.")
+            }
+        }
+        val tmpSubIndices = stagedMappings.mapIndexedNotNull { index, mapping ->
+            index.takeIf {
+                requiresSafeTempName(mapping.destinationPath.substringAfterLast('/'))
+            }
+        }.toSet()
+        var remoteTmp: String? = null
+        if (tmpSubIndices.isNotEmpty()) {
+            val tmp = remoteTempDir(stagingRoot, operationBinding.analysisPlanId)
+            if (tmp == null || !isNfvrTempDir(tmp, base)) {
+                cleanupRemoteTempDir(serial, stagingRoot, base)
+                return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION))
+            }
+            runCatching { adbClient.shell(serial, "rm", "-rf", shellQuoteRemotePath(tmp)) }
+            if (createModPath(serial, tmp, approvedBase = base).exit != 0) {
+                cleanupRemoteTempDir(serial, stagingRoot, base)
+                return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION))
+            }
+            remoteTmp = tmp
+        }
+        fun cleanStaging() {
+            cleanupRemoteTempDir(serial, remoteTmp, base)
+            cleanupRemoteTempDir(serial, stagingRoot, base)
+        }
+        // 5. Transfer the complete new tree aside.
+        var copiedBytes = 0L
+        var copiedFiles = 0
+        onProgress(ModExecutionProgress(ModInstallPhase.EXTRACTING, null, "تجهيز ملفات التحديث"))
+        for ((index, mapping) in stagedMappings.withIndex()) {
+            val parent = mapping.destinationPath.substringBeforeLast('/', stagingMod)
+            if (createModPath(serial, parent, approvedBase = base).exit != 0) {
+                cleanStaging()
+                return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.PREPARE_DESTINATION))
+            }
+            val source = extracted[mapping.sourcePath]
+                ?: run {
+                    cleanStaging()
+                    return refuse("ملف التحديث ${mapping.sourcePath} غير موجود بعد الاستخراج.")
+                }
+            val useTmp = index in tmpSubIndices && remoteTmp != null
+            val pushTarget = if (useTmp) "$remoteTmp/part-%04d".format(index) else mapping.destinationPath
+            val pushed = pushModFileWithRetry(
+                serial, source, pushTarget, maxAttempts = 2
+            ) { current, _ ->
+                onProgress(
+                    ModExecutionProgress(
+                        ModInstallPhase.TRANSFERRING,
+                        executionPlan.progress(copiedBytes + current, copiedFiles).fraction.coerceAtMost(0.94),
+                        transferProgressMessage(
+                            source, copiedFiles, executionPlan,
+                            currentBytes = current,
+                            displayName = mapping.destinationPath.substringAfterLast('/')
+                        )
+                    )
+                )
+            }
+            if (pushed.exit != 0) {
+                cleanStaging()
+                return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.TRANSFER))
+            }
+            if (useTmp) {
+                val moved = adbClient.shell(
+                    serial, "mv",
+                    shellQuoteRemotePath(pushTarget),
+                    shellQuoteRemotePath(mapping.destinationPath)
+                )
+                if (moved.exit != 0) {
+                    cleanStaging()
+                    return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.TRANSFER))
+                }
+            }
+            copiedBytes += mapping.sizeBytes
+            copiedFiles++
+        }
+        // 6. Verify every staged file, then staged metadata/version.
+        onProgress(ModExecutionProgress(ModInstallPhase.VERIFYING, 0.95, "التحقق من ملفات التحديث المؤقتة"))
+        for ((index, mapping) in stagedMappings.withIndex()) {
+            onProgress(
+                ModExecutionProgress(
+                    ModInstallPhase.VERIFYING,
+                    (0.95 + 0.02 * (index + 1).toDouble() / stagedMappings.size).coerceAtMost(0.97),
+                    "التحقق من ${mapping.destinationPath.substringAfterLast('/')} (${index + 1}/${stagedMappings.size})"
+                )
+            )
+            if (verifyRemoteFile(serial, mapping) != null) {
+                cleanStaging()
+                return refuse(customerModExecutionFailureMessage(ModExecutionFailureKind.VERIFY))
+            }
+        }
+        val stagedPallet = stagedMappings.firstOrNull {
+            it.destinationPath.substringAfterLast('/').endsWith(".pallet.json", ignoreCase = true)
+        } ?: run {
+            cleanStaging()
+            return refuse("تعذر التحقق من بيانات التحديث المؤقتة.")
+        }
+        val stagedIdentity = readInstalledPalletIdentityFrom(serial, stagedPallet.destinationPath, modRoot)
+            ?: run {
+                cleanStaging()
+                return refuse("تعذر التحقق من بيانات التحديث المؤقتة.")
+            }
+        if (!stagedIdentity.barcode.equals(archiveIdentity.barcode, ignoreCase = true) ||
+            stagedIdentity.version != archiveIdentity.version
+        ) {
+            cleanStaging()
+            return refuse("بيانات التحديث المؤقتة لا تطابق الحزمة المراجعة.")
+        }
+        // 7. Swap: installed -> backup, staged -> final.
+        val toBackup = adbClient.shell(
+            serial, "mv", shellQuoteRemotePath(finalRoot), shellQuoteRemotePath(backupRoot)
+        )
+        if (toBackup.exit != 0) {
+            cleanStaging()
+            return refuse("تعذر بدء الاستبدال؛ بقي الإصدار المثبت دون تغيير.")
+        }
+        val toFinal = adbClient.shell(
+            serial, "mv", shellQuoteRemotePath(stagingMod), shellQuoteRemotePath(finalRoot)
+        )
+        if (toFinal.exit != 0) {
+            val restored = adbClient.shell(
+                serial, "mv", shellQuoteRemotePath(backupRoot), shellQuoteRemotePath(finalRoot)
+            )
+            cleanStaging()
+            return if (restored.exit == 0) {
+                refuse("فشل التحديث؛ تمت استعادة الإصدار السابق.")
+            } else {
+                ModInstallResult(
+                    false,
+                    "فشل التحديث وتعذر الاستعادة التلقائية؛ النسخة السابقة محفوظة في $backupRoot."
+                )
+            }
+        }
+        // 8. Verify final, then drop the backup.  Rollback on failure.
+        val finalErrors = executionPlan.mappings.mapIndexedNotNull { index, mapping ->
+            onProgress(
+                ModExecutionProgress(
+                    ModInstallPhase.VERIFYING,
+                    (0.97 + 0.02 * (index + 1).toDouble() / executionPlan.mappings.size).coerceAtMost(0.99),
+                    "التحقق من ${mapping.destinationPath.substringAfterLast('/')} (${index + 1}/${executionPlan.mappings.size})"
+                )
+            )
+            verifyRemoteFile(serial, mapping)
+        }
+        if (finalErrors.isNotEmpty()) {
+            val restored = adbClient.shell(
+                serial, "mv", shellQuoteRemotePath(backupRoot), shellQuoteRemotePath(finalRoot)
+            )
+            cleanStaging()
+            return if (restored.exit == 0) {
+                refuse("فشل التحقق النهائي؛ تمت استعادة الإصدار السابق.")
+            } else {
+                ModInstallResult(
+                    false,
+                    "فشل التحقق النهائي وتعذر الاستعادة التلقائية؛ النسخة السابقة محفوظة في $backupRoot."
+                )
+            }
+        }
+        runCatching { adbClient.shell(serial, "rm", "-rf", shellQuoteRemotePath(backupRoot)) }
+        cleanStaging()
+        onProgress(ModExecutionProgress(ModInstallPhase.COMPLETED, 1.0, "اكتمل التحديث والتحقق"))
+        ModInstallHistory.record(executionPlan, true, "verified-update")
+        return ModInstallResult(
+            true,
+            "تم تحديث المود إلى الإصدار ${archiveIdentity.version} والتحقق من الملفات بنجاح."
+        )
+    }
+
     private fun parsePackageListLine(line: String): Pair<String, String?>? {
         val value = line.trim().removePrefix("package:")
         if (value.isBlank()) return null
@@ -1298,7 +1719,7 @@ class ModsManager(
      */
     private fun cleanupRemoteTempDir(serial: String, tmpDir: String?, root: String?) {
         if (tmpDir.isNullOrBlank() || root.isNullOrBlank()) return
-        if (!isNfvrTempDir(tmpDir, root)) {
+        if (!isNfvrOwnedDir(tmpDir, root, NFVR_OWNED_DIR_PREFIXES)) {
             DiagnosticLogger.info("Refusing to clean non-NFVR temp dir: $tmpDir")
             return
         }
@@ -1342,7 +1763,32 @@ class ModsManager(
         return last
     }
 
+    /**
+     * Remote per-file verification with one bounded retry.  Sustained
+     * installs can outlive the ADB daemon (proven on hardware: daemon
+     * restarts mid-verification); a single re-check after a server
+     * restart distinguishes transport flakes from genuinely missing or
+     * corrupt files.  Read-only: retrying never writes.
+     */
     private suspend fun verifyRemoteFile(serial: String, mapping: ModFileMapping): String? {
+        repeat(2) { attempt ->
+            if (attempt > 0) {
+                DiagnosticLogger.info("Retrying remote verification of ${mapping.destinationPath}")
+                runCatching { adbClient.killServer() }
+                runCatching { adbClient.startServer() }
+            }
+            val attemptError = verifyRemoteFileOnce(serial, mapping)
+            if (attemptError == null) return null
+            if (attempt == 0) {
+                DiagnosticLogger.info("Remote verification attempt 1 failed: $attemptError")
+            } else {
+                return attemptError
+            }
+        }
+        return "فشل التحقق: ${mapping.destinationPath}"
+    }
+
+    private suspend fun verifyRemoteFileOnce(serial: String, mapping: ModFileMapping): String? {
         val exists = adbClient.shell(serial, "test", "-f", shellQuoteRemotePath(mapping.destinationPath))
         if (exists.exit != 0) return "فشل التحقق: الملف غير موجود في ${mapping.destinationPath}"
         val size = adbClient.shell(serial, "stat", "-c", "%s", shellQuoteRemotePath(mapping.destinationPath))
@@ -1594,12 +2040,27 @@ internal fun remoteTempDir(root: String, planId: String): String? {
     return "$clean/.nfvr-tmp-$suffix"
 }
 
-/** True only for NFVR staging dirs strictly inside the approved root. */
-internal fun isNfvrTempDir(path: String, root: String): Boolean {
+/**
+ * NFVR-owned staging namespaces, strictly inside the approved root:
+ * transfer temp dirs, update staging dirs, and update backup dirs.
+ * Anything else is never created, moved, or deleted by install flows.
+ */
+internal val NFVR_OWNED_DIR_PREFIXES = setOf(".nfvr-tmp-", ".nfvr-update-", ".nfvr-backup-")
+
+/** True only for NFVR-owned dirs strictly inside the approved root. */
+internal fun isNfvrOwnedDir(
+    path: String,
+    root: String,
+    prefixes: Set<String> = setOf(".nfvr-tmp-")
+): Boolean {
     val cleanRoot = root.trim().trimEnd('/')
     if (cleanRoot.isBlank()) return false
-    val name = path.trim().trimEnd('/').substringAfterLast('/')
-    return path.trim().trimEnd('/').startsWith("$cleanRoot/") &&
-        name.startsWith(".nfvr-tmp-") &&
-        name.length > ".nfvr-tmp-".length
+    val cleanPath = path.trim().trimEnd('/')
+    val name = cleanPath.substringAfterLast('/')
+    return cleanPath.startsWith("$cleanRoot/") &&
+        prefixes.any { prefix -> name.startsWith(prefix) && name.length > prefix.length }
 }
+
+/** Backward-compatible transfer-temp check. */
+internal fun isNfvrTempDir(path: String, root: String): Boolean =
+    isNfvrOwnedDir(path, root)
