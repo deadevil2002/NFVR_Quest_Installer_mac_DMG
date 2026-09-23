@@ -130,6 +130,32 @@ class ModAnalysisSingleFlightTest {
     }
 
     @Test
+    fun blockedPlanSummaryNeverReadsAsTransferOrder() {
+        val ready = ModInstallPlan(
+            installable = true,
+            outcome = ModInstallOutcome.DIRECT_INSTALL_READY,
+            mappings = listOf(ModFileMapping("a", "/sdcard/Android/data/x/files/Mods/M/a", sizeBytes = 10L))
+        )
+        val readyAnalysis = ModPackageAnalysis(
+            packageType = ModPackageType.BONELAB_NATIVE_CONTENT,
+            recognized = true,
+            message = "ok",
+            compatibility = ModCompatibility(true),
+            installPlan = ready
+        )
+        val readyLine = modTransferPlanLogLine(readyAnalysis)
+        assertTrue(readyLine.startsWith("خطة النقل:"), readyLine)
+        val blocked = ready.copy(
+            installable = false,
+            outcome = ModInstallOutcome.UNSUPPORTED,
+            preconditions = listOf(ModInstallPrecondition("X", "y", false))
+        )
+        val blockedLine = modTransferPlanLogLine(readyAnalysis.copy(installPlan = blocked))
+        assertFalse(blockedLine.contains("خطة النقل"), blockedLine)
+        assertTrue(blockedLine.contains("متوقف حتى يتم التحقق"), blockedLine)
+    }
+
+    @Test
     fun verifiedInstallEmitsExactlyOneSuccessMessage() {
         val lines = modInstallSuccessLogLines("تم تثبيت المود والتحقق من الملفات بنجاح.")
         assertEquals(3, lines.size)

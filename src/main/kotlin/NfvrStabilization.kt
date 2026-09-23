@@ -363,6 +363,22 @@ internal fun modInstallSuccessLogLines(message: String): List<String> = listOf(
 )
 
 /**
+ * Customer-facing transfer-plan summary.  A blocked plan must never read
+ * like a ready install order: its mappings are provisional until the
+ * archive structure is proven.
+ */
+internal fun modTransferPlanLogLine(analysis: ModPackageAnalysis): String {
+    val plan = analysis.installPlan
+    return if (plan.installable && !plan.hasBlockingPreconditions) {
+        "خطة النقل: ${plan.totalFiles} ملف، " +
+            "${plan.totalBytes} بايت" +
+            (plan.destinationRoot?.let { " → $it" } ?: "")
+    } else {
+        "تم التعرف على ${plan.totalFiles} ملفًا، لكن التثبيت متوقف حتى يتم التحقق من بنية المود."
+    }
+}
+
+/**
  * OS file locking is per-user/session by virtue of living under user.home.
  * The channel remains open for the lifetime of the returned guard.
  */

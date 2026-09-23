@@ -58,6 +58,11 @@ class ModsTransportAndInventoryTest {
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/color=red.bundle")
         )
         assertTrue(
+            AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/a&b~c.bundle")
+        )
+        assertFalse(AndroidPathValidator.isSafe("/sdcard/a;b"))
+        assertFalse(AndroidPathValidator.isSafe("/sdcard/a`b"))
+        assertTrue(
             AndroidPathValidator.isSafe("/sdcard/Android/data/x/files/Mods/M/sr2m“veresk”.bundle")
         )
         assertFalse(AndroidPathValidator.isSafe("/sdcard/a;b"))

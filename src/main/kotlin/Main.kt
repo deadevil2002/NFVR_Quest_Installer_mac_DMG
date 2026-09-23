@@ -2065,11 +2065,7 @@ fun main() {
                 "تحليل الحزمة: ${customerPackageTypeMessage(analysis.packageType)} — " +
                     modCustomerFailureReason(analysis)
             )
-            appendModLog(
-                "خطة النقل: ${analysis.installPlan.totalFiles} ملف، " +
-                    "${analysis.installPlan.totalBytes} بايت" +
-                    (analysis.installPlan.destinationRoot?.let { " → $it" } ?: "")
-            )
+            appendModLog(modTransferPlanLogLine(analysis))
             modAnalysisStatus = "اكتمل تحليل الحزمة."
         } catch (e: Exception) {
             modAnalysis = null

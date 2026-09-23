@@ -256,6 +256,49 @@ class ModContentProfilesTest {
         traversal.delete()
     }
 
+    @Test
+    fun marrowDedupNamesWithTildeInstallAsNativeContent() {
+        // Structural pattern of real Marrow pallets whose dedup asset
+        // names contain `~` (and `&`): single evidenced root, root-scoped
+        // pallet#0 manifest, catalog, bundle payload.  No filename or
+        // barcode is special-cased; only the structure authorizes.
+        val pallet = """{"version":2,"root":{"ref":"1","type":"pallet#0"},"objects":{"1":{"barcode":"Synth.TildePack","title":"T","author":"A","version":"1.0.0","sdkVersion":"1.2.0","crates":[]}}}"""
+        val archive = zipOf(
+            "Synth.TildePack/Synth.TildePack.pallet.json" to pallet,
+            "Synth.TildePack/catalog_Synth.TildePack.json" to """{"crates":[]}""",
+            "Synth.TildePack/deduped_assets_texture2d/a&b~c.bundle" to "bundle",
+            "Synth.TildePack/deduped_assets_texture2d/normal.bundle" to "bundle"
+        )
+        val result = analyzer.analyze(archive, bonelab)
+        assertEquals(ModPackageType.BONELAB_NATIVE_CONTENT, result.packageType)
+        assertEquals(ModInstallOutcome.DIRECT_INSTALL_READY, result.outcome)
+        assertTrue(result.installable, result.message)
+        assertFalse(result.plan.preconditions.any { it.code == "UNSAFE_DESTINATION" })
+        assertEquals(4, result.plan.mappings.size)
+        assertTrue(result.plan.mappings.any {
+            it.destinationPath ==
+                "/sdcard/Android/data/com.StressLevelZero.BONELAB/files/Mods/Synth.TildePack/deduped_assets_texture2d/a&b~c.bundle"
+        })
+        assertTrue(result.bonelabIdentity != null)
+        assertEquals("Synth.TildePack", result.bonelabIdentity?.barcode)
+        archive.delete()
+    }
+
+    @Test
+    fun bonelabMultiplePalletRootsStayBlocked() {
+        val pallet = """{"version":2,"root":{"ref":"1","type":"pallet#0"},"objects":{"1":{"barcode":"X","title":"T","author":"A","version":"1.0.0","sdkVersion":"1.2.0","crates":[]}}}"""
+        val archive = zipOf(
+            "PackA/PackA.pallet.json" to pallet,
+            "PackA/a.bundle" to "bundle",
+            "PackB/PackB.pallet.json" to pallet,
+            "PackB/b.bundle" to "bundle"
+        )
+        val result = analyzer.analyze(archive, bonelab)
+        assertFalse(result.installable)
+        assertTrue(result.plan.preconditions.any { it.code == "MOD_FOLDER_REQUIRED" })
+        archive.delete()
+    }
+
     private fun zipOf(vararg entries: Pair<String, String>): File {
         val file = File.createTempFile("nfvr-content-profile-", ".zip")
         ZipOutputStream(file.outputStream()).use { output ->
