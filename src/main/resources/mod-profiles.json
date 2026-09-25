@@ -104,6 +104,9 @@
     ],
     "supportedVersionNames": ["1.0.7", "1.3.1"],
     "supportedVersionCodes": [682, 260730005],
+    "versionRules": {
+      "thunderRoadGeneration": "1.0"
+    },
     "apkSha256": "48e49e3d88590ae572df1885f67f4a5f2d9d8397dae16475c25b4d471e6e2324",
     "evidenceLevel": "AUTHORITATIVE",
     "evidenceSources": [

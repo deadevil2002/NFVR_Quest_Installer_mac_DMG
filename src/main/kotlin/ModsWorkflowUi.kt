@@ -1475,6 +1475,32 @@ private fun InstallationSuccessCard() {
                         )
                     }
                 }
+            analysis.nomadAssessment
+                ?.takeIf { it.relation != InstalledModRelation.ABSENT }
+                ?.let { nomad ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    val nomadTone = when (nomad.relation) {
+                        InstalledModRelation.NEWER_THAN_INSTALLED ->
+                            MaterialTheme.colorScheme.tertiary
+                        InstalledModRelation.SAME_VERSION,
+                        InstalledModRelation.IDENTICAL_CONTENT ->
+                            MaterialTheme.colorScheme.primary
+                        else -> warningColor()
+                    }
+                    Text(
+                        nomadInstalledMessage(nomad.relation),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = nomadTone
+                    )
+                    ReviewRow(
+                        "الإصدار المثبت",
+                        nomad.installedIdentity?.modVersion ?: "غير معروف"
+                    )
+                    ReviewRow(
+                        "الإصدار المحدد",
+                        nomad.archiveIdentity.modVersion ?: "غير معروف"
+                    )
+                }
             if (genericDestinationNeedsConfirmation(analysis) || plan.confirmation != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(

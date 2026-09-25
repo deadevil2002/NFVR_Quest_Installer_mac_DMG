@@ -711,6 +711,16 @@ data class ModPackageAnalysis(
      */
     val bonelabIdentity: BonelabPalletIdentity? = null,
     /**
+     * Archive-side ThunderRoad manifest identity (offline).  Present when
+     * the analyzer evidenced exactly one Nomad manifest.
+     */
+    val nomadIdentity: NomadModIdentity? = null,
+    /**
+     * Device-side Nomad version decision, attached only by device-aware
+     * analysis.  Null means "not assessed".
+     */
+    val nomadAssessment: NomadInstalledAssessment? = null,
+    /**
      * Device-side version decision against the installed mod, attached
      * only by device-aware analysis.  Null means "not assessed" (fresh
      * install path unchanged).

@@ -72,11 +72,14 @@ class QuestModArchiveNormalizerTest {
 
     @Test
     fun frameworkPackManagedAssemblyIsNomadContentNotAssumedExternalLoader() {
-        val archive = zipOf(
+        val archive = zipOfBytes(
             "Framework Pack/manifest.json" to
-                """{"GameVersion":"1.0.0.0","GameName":"Blade & Sorcery: Nomad"}""",
-            "Framework Pack/Framework Pack.dll" to "sanitized-managed-assembly",
-            "Framework Pack/Framework Pack.pdb" to "sanitized-symbols"
+                """{"GameVersion":"1.0.0.0","GameName":"Blade & Sorcery: Nomad"}"""
+                    .toByteArray(Charsets.UTF_8),
+            // A validated managed PE/CLI header: spoofed native payloads
+            // stay blocked by INVALID_MANAGED_CODE instead.
+            "Framework Pack/Framework Pack.dll" to managedPeCliBytes(),
+            "Framework Pack/Framework Pack.pdb" to "sanitized-symbols".toByteArray(Charsets.UTF_8)
         )
 
         val analysis = analyzeAfterRename(archive, nomad, verifiedDiscovery(nomad))
@@ -353,6 +356,41 @@ class QuestModArchiveNormalizerTest {
         } catch (_: QuestModArchiveNormalizer.UnsafeArchiveException) {
             // expected
         }
+    }
+
+    private fun managedPeCliBytes(): ByteArray {
+        val bytes = ByteArray(512)
+        bytes[0] = 'M'.code.toByte()
+        bytes[1] = 'Z'.code.toByte()
+        fun le32(offset: Int, value: Int) {
+            for (shift in 0 until 4) bytes[offset + shift] = ((value ushr (shift * 8)) and 0xff).toByte()
+        }
+        fun le16(offset: Int, value: Int) {
+            bytes[offset] = (value and 0xff).toByte()
+            bytes[offset + 1] = ((value ushr 8) and 0xff).toByte()
+        }
+        le32(0x3c, 64)
+        bytes[64] = 'P'.code.toByte()
+        bytes[65] = 'E'.code.toByte()
+        bytes[66] = 0
+        bytes[67] = 0
+        le16(64 + 24, 0x10b)
+        val cli = 64 + 24 + 96 + 14 * 8
+        le32(cli, 0x2000)
+        le32(cli + 4, 72)
+        return bytes
+    }
+
+    private fun zipOfBytes(vararg entries: Pair<String, ByteArray>): File {
+        val file = File.createTempFile("nfvr-real-structure-", ".zip")
+        ZipOutputStream(file.outputStream()).use { output ->
+            entries.forEach { (name, content) ->
+                output.putNextEntry(ZipEntry(name))
+                output.write(content)
+                output.closeEntry()
+            }
+        }
+        return file
     }
 
     private fun zipOf(vararg entries: Pair<String, String>): File {

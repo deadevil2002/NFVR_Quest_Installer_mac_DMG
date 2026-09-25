@@ -334,10 +334,21 @@ class ModsManager(
         val assessment = runCatching {
             assessInstalledMod(serial, analysis)
         }.getOrNull()
+        val nomadAssessment = runCatching {
+            assessInstalledNomadMod(serial, analysis)
+        }.getOrNull()
         return@withContext if (boundPlan == null) {
-            analysis.copy(installPlan = deviceAwarePlan, installedModAssessment = assessment)
+            analysis.copy(
+                installPlan = deviceAwarePlan,
+                installedModAssessment = assessment,
+                nomadAssessment = nomadAssessment
+            )
         } else {
-            analysis.copy(installPlan = boundPlan, installedModAssessment = assessment)
+            analysis.copy(
+                installPlan = boundPlan,
+                installedModAssessment = assessment,
+                nomadAssessment = nomadAssessment
+            )
         }
     }
 
@@ -478,6 +489,115 @@ class ModsManager(
             installedIdentity = installedIdentity,
             installedFileCount = fileCount
         )
+    }
+
+    /**
+     * Compares an analyzed Nomad archive against installed mod folders.
+     * Null when inapplicable (other games, no evidenced manifest
+     * identity).  Identity is proven by manifest Name (+Author when both
+     * sides declare one); the folder is located by scanning installed
+     * manifests, never by trusting the archive's folder name.  Every
+     * device read is bounded and read-only.
+     */
+    suspend fun assessInstalledNomadMod(
+        serial: String,
+        analysis: ModPackageAnalysis
+    ): NomadInstalledAssessment? {
+        if (analysis.installPlan.reviewedApp?.packageName != ModPackageAnalyzer.NOMAD_PACKAGE_ID &&
+            analysis.installPlan.targetPackageId != ModPackageAnalyzer.NOMAD_PACKAGE_ID
+        ) {
+            return null
+        }
+        val archiveIdentity = analysis.nomadIdentity ?: return null
+        val profile = GameModProfileRegistry.findByPackageId(ModPackageAnalyzer.NOMAD_PACKAGE_ID)
+            ?: return null
+        val base = profile.destination.trimEnd('/').takeIf {
+            it.isNotBlank() && AndroidPathValidator.isSafe(it)
+        } ?: return null
+        if (adbClient.shell(serial, "test", "-d", shellQuoteRemotePath(base)).exit != 0) {
+            return null
+        }
+        val folders = runCatching {
+            val listed = adbClient.shell(serial, "ls", shellQuoteRemotePath(base))
+            if (listed.exit != 0) return null
+            listed.out.lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() && !it.contains('/') && !it.startsWith(".") }
+                .toList()
+        }.getOrNull() ?: return null
+        for (folder in folders) {
+            val manifestPath = "$base/$folder/manifest.json"
+            if (adbClient.shell(serial, "test", "-f", shellQuoteRemotePath(manifestPath)).exit != 0) {
+                continue
+            }
+            val installed = readInstalledNomadIdentity(serial, manifestPath, folder) ?: continue
+            if (!installed.name.equals(archiveIdentity.name, ignoreCase = false)) continue
+            val archiveAuthor = archiveIdentity.author?.trim()?.ifBlank { null }
+            val installedAuthor = installed.author?.trim()?.ifBlank { null }
+            if (archiveAuthor != null && installedAuthor != null &&
+                !archiveAuthor.equals(installedAuthor, ignoreCase = true)
+            ) {
+                return NomadInstalledAssessment(
+                    relation = InstalledModRelation.IDENTITY_MISMATCH,
+                    modRoot = folder,
+                    archiveIdentity = archiveIdentity,
+                    installedIdentity = installed
+                )
+            }
+            val fileCount = runCatching {
+                val count = adbClient.shell(
+                    serial, "find", shellQuoteRemotePath("$base/$folder"),
+                    "-type", "f", "|", "wc", "-l"
+                )
+                if (count.exit != 0) null
+                else count.out.trim().toLongOrNull()?.takeIf { it >= 0L }?.toInt()
+            }.getOrNull()
+            return NomadInstalledAssessment(
+                relation = decideNomadInstalledRelation(archiveIdentity, installed),
+                modRoot = folder,
+                archiveIdentity = archiveIdentity,
+                installedIdentity = installed,
+                installedFileCount = fileCount
+            )
+        }
+        return NomadInstalledAssessment(
+            relation = InstalledModRelation.ABSENT,
+            modRoot = archiveIdentity.modRoot.orEmpty(),
+            archiveIdentity = archiveIdentity,
+            installedIdentity = null
+        )
+    }
+
+    private suspend fun readInstalledNomadIdentity(
+        serial: String,
+        manifestPath: String,
+        modFolder: String
+    ): NomadModIdentity? {
+        if (!AndroidPathValidator.isSafe(manifestPath)) return null
+        val size = adbClient.shell(serial, "stat", "-c", "%s", shellQuoteRemotePath(manifestPath))
+        if (size.exit != 0) return null
+        val bytes = size.out.trim().toLongOrNull() ?: return null
+        if (bytes <= 0L || bytes > 64L * 1024L) return null
+        val local = runCatching {
+            File.createTempFile("nfvr-installed-nomad-", ".json").also { it.deleteOnExit() }
+        }.getOrNull() ?: return null
+        try {
+            val pulled = adbClient.pullReadOnly(serial, manifestPath, local)
+            if (pulled.exit != 0 || !local.isFile || local.length() != bytes) return null
+            val json = runCatching {
+                JSONObject(local.readText(Charsets.UTF_8))
+            }.getOrNull() ?: return null
+            val name = json.optString("Name", "").trim().ifBlank { null } ?: return null
+            return NomadModIdentity(
+                name = name,
+                author = json.optString("Author", "").trim().ifBlank { null },
+                modVersion = json.optString("ModVersion", "").trim().ifBlank { null },
+                gameVersion = json.optString("GameVersion", "").trim().ifBlank { null },
+                modRoot = modFolder
+            )
+        } finally {
+            runCatching { local.delete() }
+        }
     }
 
     private suspend fun readInstalledPalletIdentity(

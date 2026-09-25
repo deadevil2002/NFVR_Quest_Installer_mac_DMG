@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.nearfuturevr"
-version = "2.5.1"
+version = "2.5.2"
 
 kotlin {
     jvmToolchain(17)

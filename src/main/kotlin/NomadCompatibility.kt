@@ -27,7 +27,41 @@ data class NomadCompatibility(
             state == NomadCompatibilityState.COMPATIBLE_FAMILY
 }
 
-object NomadCompatibilityEvaluator {
+    object NomadCompatibilityEvaluator {
+    /**
+     * Generation-anchored evaluation for Nomad Quest.  The manifest
+     * GameVersion tracks the ThunderRoad content generation, NOT the Meta
+     * store version: U11-era mods declare 0.11.0.0 while current U12+ era
+     * mods declare 1.0.0.0 (store 1.x line).  Comparing the manifest
+     * against the store version is apples-to-oranges; the manifest major
+     * and minor must equal the evidenced generation instead.
+     */
+    fun evaluateForGeneration(manifestVersion: String?, major: Int, minor: Int): NomadCompatibility {
+        val manifest = parse(manifestVersion)
+        if (manifest == null) {
+            return NomadCompatibility(
+                NomadCompatibilityState.WARNING,
+                manifestVersion?.trim()?.ifBlank { null },
+                "$major.$minor",
+                "Nomad manifest GameVersion is missing or malformed; manual compatibility review is required."
+            )
+        }
+        if (manifest[0] == major && manifest[1] == minor) {
+            return NomadCompatibility(
+                NomadCompatibilityState.COMPATIBLE_FAMILY,
+                manifestVersion?.trim(),
+                "$major.$minor",
+                "Nomad manifest targets ThunderRoad generation $major.$minor, matching the installed U12+ era game; the runtime's opaque GameVersion semantics are not publicly specified."
+            )
+        }
+        return NomadCompatibility(
+            NomadCompatibilityState.INCOMPATIBLE,
+            manifestVersion?.trim(),
+            "$major.$minor",
+            "Nomad manifest targets ThunderRoad generation ${manifest[0]}.${manifest[1]}, not the installed $major.$minor era."
+        )
+    }
+
     fun evaluate(manifestVersion: String?, installedVersion: String?): NomadCompatibility {
         val manifest = parse(manifestVersion)
         val installed = parse(installedVersion)

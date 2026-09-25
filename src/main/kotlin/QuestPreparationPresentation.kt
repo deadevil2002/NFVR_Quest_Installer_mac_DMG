@@ -184,6 +184,11 @@ internal fun resolveModInstallActionState(
     // An existing install owns the destination: the normal install action
     // stays hidden and the review card owns the decision UX.  Only an
     // explicitly confirmed proven-newer update re-exposes it.
+    // Nomad has no staged-update execution yet, so any existing Nomad
+    // install keeps the action hidden with an explanatory decision.
+    val nomadDecision = analysis.nomadAssessment
+        ?.takeIf { it.relation != InstalledModRelation.ABSENT }
+    if (nomadDecision != null) return ModInstallActionState.HIDDEN
     val assessment = analysis.installedModAssessment
     if (assessment != null && assessment.relation != InstalledModRelation.ABSENT) {
         return if (assessment.relation == InstalledModRelation.NEWER_THAN_INSTALLED &&

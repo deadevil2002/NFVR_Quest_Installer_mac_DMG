@@ -156,6 +156,66 @@ internal fun modUpdateConfirmationText(assessment: InstalledModAssessment): Stri
         "هل تريد تحديث المود؟"
 
 /**
+ * Authoritative ThunderRoad manifest identity.  `Name` is the mod's
+ * stable identity (folder equality alone never proves it); ModVersion
+ * and GameVersion drive the relation decision.
+ */
+data class NomadModIdentity(
+    val name: String,
+    val author: String?,
+    val modVersion: String?,
+    val gameVersion: String?,
+    /** Evidenced mod folder, e.g. MarvelWeaponsNOMAD. */
+    val modRoot: String? = null
+)
+
+data class NomadInstalledAssessment(
+    val relation: InstalledModRelation,
+    val modRoot: String,
+    val archiveIdentity: NomadModIdentity,
+    val installedIdentity: NomadModIdentity?,
+    val installedFileCount: Int? = null
+)
+
+/**
+ * Pure Nomad version decision.  Identity must already be proven by
+ * Name (+Author when both sides declare one) before calling.
+ */
+fun decideNomadInstalledRelation(
+    archive: NomadModIdentity,
+    installed: NomadModIdentity?
+): InstalledModRelation {
+    if (installed == null) return InstalledModRelation.ABSENT
+    if (!installed.name.equals(archive.name, ignoreCase = false)) {
+        return InstalledModRelation.IDENTITY_MISMATCH
+    }
+    val archiveAuthor = archive.author?.trim()?.ifBlank { null }
+    val installedAuthor = installed.author?.trim()?.ifBlank { null }
+    if (archiveAuthor != null && installedAuthor != null &&
+        !archiveAuthor.equals(installedAuthor, ignoreCase = true)
+    ) {
+        return InstalledModRelation.IDENTITY_MISMATCH
+    }
+    val comparison = compareModVersions(archive.modVersion, installed.modVersion)
+        ?: return InstalledModRelation.UNKNOWN_VERSION_RELATION
+    return when {
+        comparison > 0 -> InstalledModRelation.NEWER_THAN_INSTALLED
+        comparison < 0 -> InstalledModRelation.OLDER_THAN_INSTALLED
+        else -> InstalledModRelation.SAME_VERSION
+    }
+}
+
+internal fun nomadInstalledMessage(relation: InstalledModRelation): String = when (relation) {
+    InstalledModRelation.ABSENT -> "غير مثبت."
+    InstalledModRelation.SAME_VERSION,
+    InstalledModRelation.IDENTICAL_CONTENT -> "المود مثبت بالفعل."
+    InstalledModRelation.NEWER_THAN_INSTALLED -> "إصدار أحدث متوفر."
+    InstalledModRelation.OLDER_THAN_INSTALLED -> "الإصدار المحدد أقدم من المثبت."
+    InstalledModRelation.UNKNOWN_VERSION_RELATION -> "تعذر إثبات بنية مود Nomad آمنة."
+    InstalledModRelation.IDENTITY_MISMATCH -> "مجلد موجود باسم مختلف المحتوى؛ لن يتم المساس به."
+}
+
+/**
  * Binds a user-confirmed update to its exact evidence.  The executor
  * re-validates every field live; any drift refuses the operation.
  */

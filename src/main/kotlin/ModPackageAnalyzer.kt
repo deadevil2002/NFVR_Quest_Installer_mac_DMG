@@ -1356,6 +1356,34 @@ class ModPackageAnalyzer(
         return hasManagedAssembly && !hasNativeOrDesktopExecutable
     }
 
+    private fun dllsAreInvalidManagedAssemblies(
+        archive: ArchiveMetadata,
+        entries: List<String>
+    ): Boolean = entries.any { !isManagedPeCli(archive, it) }
+
+    /**
+     * GameVersion resolution with profile evidence first.  The vetted
+     * profile's thunderRoadGeneration rule (U12+ era "1.0") replaces the
+     * apples-to-oranges store-version comparison; without the rule the
+     * legacy comparison applies unchanged.
+     */
+    private fun nomadGameCompatibility(
+        profile: GameModProfile?,
+        declaredVersion: String?,
+        installedVersion: String?
+    ): NomadCompatibility {
+        val generation = profile?.versionRules?.get("thunderRoadGeneration")
+            ?.split('.')
+            ?.map { it.trim().toIntOrNull() }
+            ?.takeIf { parts -> parts.size == 2 && parts.all { it != null && it >= 0 } }
+        if (generation != null) {
+            return NomadCompatibilityEvaluator.evaluateForGeneration(
+                declaredVersion, generation[0]!!, generation[1]!!
+            )
+        }
+        return NomadCompatibilityEvaluator.evaluate(declaredVersion, installedVersion)
+    }
+
     private fun isNomadPayload(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?
@@ -1466,17 +1494,43 @@ class ModPackageAnalyzer(
             isNomadManagedAssemblyEvidence(archive, path)
         }
         addDangerousPayloadPrecondition(archive, preconditions)
-        if (!managedAssemblyPayload) {
+        if (managedAssemblyPayload) {
+            // Native libraries never belong in a Nomad mod, even beside a
+            // managed assembly: Quest has no loader contract for them here.
+            val nativeEntries = archive.entries.filter { entry ->
+                entry !in archive.directories &&
+                    entry.lowercase(Locale.ROOT).endsWith(".so")
+            }
+            if (nativeEntries.isNotEmpty()) {
+                preconditions += blocked(
+                    "NOMAD_NATIVE_PAYLOAD",
+                    "Nomad mods must not contain native libraries: ${nativeEntries.take(3).joinToString()}."
+                )
+            }
+            val dllEntries = archive.entries.filter { entry ->
+                entry !in archive.directories &&
+                    entry.lowercase(Locale.ROOT).endsWith(".dll")
+            }
+            if (dllsAreInvalidManagedAssemblies(archive, dllEntries)) {
+                preconditions += blocked(
+                    "INVALID_MANAGED_CODE",
+                    "Nomad script mods must be validated managed assemblies."
+                )
+            }
+            // Validated managed assemblies in the current generation are
+            // ThunderRoad's native script-mod mechanism (no external
+            // loader exists or is required); gameplay confirmation stays
+            // with the user.  Anything unproven about a given DLL stays
+            // blocked by the PE, generation, and payload gates above.
+        } else {
             addDefaultDeniedNativePayloadPrecondition(archive, preconditions)
         }
+        // The manifest GameVersion tracks the ThunderRoad content
+        // generation (1.0.x for the U12+ era), never the Meta store
+        // version (1.3.1).  The vetted profile carries the evidenced
+        // generation; without it the legacy store comparison applies.
         if (managedAssemblyPayload) {
-            // The current Nomad runtime's GameVersion comparison is not
-            // publicly specified. Do not turn an opaque 1.0.0.0 manifest
-            // value into a false exact-match failure against app version 1.0.7.
-            val compatibility = NomadCompatibilityEvaluator.evaluate(
-                declaredVersion,
-                installedApp?.versionName
-            )
+            val compatibility = nomadGameCompatibility(profile, declaredVersion, installedApp?.versionName)
             when (compatibility.state) {
                 NomadCompatibilityState.INCOMPATIBLE -> preconditions += blocked(
                     "NOMAD_GAME_VERSION_INCOMPATIBLE",
@@ -1492,15 +1546,11 @@ class ModPackageAnalyzer(
                 )
                 NomadCompatibilityState.COMPATIBLE_FAMILY -> preconditions += satisfied(
                     "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING",
-                    "Release evidence places this Nomad mod in the installed major/minor family, " +
-                        "but the current runtime's GameVersion semantics are not publicly specified."
+                    compatibility.reason
                 )
             }
         } else if (declaredVersion != null) {
-            val compatibility = NomadCompatibilityEvaluator.evaluate(
-                declaredVersion,
-                installedApp?.versionName
-            )
+            val compatibility = nomadGameCompatibility(profile, declaredVersion, installedApp?.versionName)
             when (compatibility.state) {
                 NomadCompatibilityState.INCOMPATIBLE -> preconditions += blocked(
                     "GAME_VERSION_UNSUPPORTED",
@@ -1508,8 +1558,7 @@ class ModPackageAnalyzer(
                 )
                 NomadCompatibilityState.COMPATIBLE_FAMILY -> preconditions += satisfied(
                     "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING",
-                    "Release evidence places this Nomad mod in the installed major/minor family, " +
-                        "but the current runtime's GameVersion semantics are not publicly specified."
+                    compatibility.reason
                 )
                 else -> Unit
             }
@@ -1586,6 +1635,34 @@ class ModPackageAnalyzer(
         if (mappings.isEmpty()) {
             preconditions += blocked("NO_COPY_MAPPINGS", "Nomad content contains no safe files to install.")
         }
+        // Archive-side ThunderRoad identity for the installed-version
+        // decision layer.  Only the singular evidenced manifest counts;
+        // anything else leaves identity unproven (never guessed).
+        val nomadIdentity = manifestRoots.singleOrNull()?.let { root ->
+            meaningfulDocuments
+                .filter { (path, _) ->
+                    val normalized = if (path.startsWith("Mods/", true) ||
+                        path.startsWith("mods/", true)
+                    ) path.substringAfter('/') else path
+                    normalized.substringBefore('/').takeIf(String::isNotBlank) == root
+                }
+                .mapNotNull { (path, json) ->
+                    if (!path.substringAfterLast('/').equals("manifest.json", ignoreCase = true)) {
+                        null
+                    } else {
+                        val name = json.optString("Name", "").trim().ifBlank { null }
+                            ?: return@mapNotNull null
+                        NomadModIdentity(
+                            name = name,
+                            author = json.optString("Author", "").trim().ifBlank { null },
+                            modVersion = json.optString("ModVersion", "").trim().ifBlank { null },
+                            gameVersion = json.optString("GameVersion", "").trim().ifBlank { null },
+                            modRoot = root
+                        )
+                    }
+                }
+                .singleOrNull()
+        }
         val plan = plan(
             ModPackageType.KNOWN_GAME_PROFILE,
             BLADE_AND_SORCERY_PACKAGE_ID,
@@ -1609,7 +1686,8 @@ class ModPackageAnalyzer(
             } else blockingMessage(plan),
             plan,
             archive,
-            metadata = mapOf("platform" to "Quest content", "profile" to profile.packageId)
+            metadata = mapOf("platform" to "Quest content", "profile" to profile.packageId),
+            nomadIdentity = nomadIdentity
         )
     }
 
@@ -3376,7 +3454,8 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         metadata: Map<String, Any?> = emptyMap(),
         externalWorkflow: ModExternalWorkflow? = null,
-        bonelabIdentity: BonelabPalletIdentity? = null
+        bonelabIdentity: BonelabPalletIdentity? = null,
+        nomadIdentity: NomadModIdentity? = null
     ): ModPackageAnalysis {
         // Every classified result carries the selected app identity.  Keeping
         // this normalization at the result boundary protects less common
@@ -3402,7 +3481,8 @@ class ModPackageAnalyzer(
         externalWorkflow = externalWorkflow,
             diagnostics = normalizedPlan.diagnostics.distinct(),
             archiveTree = archive.normalizedTree,
-            bonelabIdentity = bonelabIdentity
+            bonelabIdentity = bonelabIdentity,
+            nomadIdentity = nomadIdentity
     )
     }
 
