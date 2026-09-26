@@ -188,6 +188,8 @@ fun customerPreconditionMessage(code: String): String = when {
     code == "APK_PATCH_REQUIRED" -> "تحتاج هذه الحزمة إلى تصحيح آمن لتطبيق اللعبة قبل التثبيت."
     code == "PAVLOV_IMPORTER_UNVERIFIED" ->
         "هذا محتوى Pavlov من mod.io تديره اللعبة؛ لا يملك NFVR عقد استيراد محليًا موثقًا وآمنًا."
+    code == "NOMAD_MISSING_DEPENDENCY" ->
+        "هذا المود يحتاج إلى إضافة خارجية غير موجودة على النظارة."
     code == "UNSAFE_DESTINATION" ->
         "يحتوي الأرشيف ملفات بأسماء لا يمكن نقلها بأمان إلى النظارة؛ لم يتم نقل أي ملف."
     code == "NOMAD_GAME_VERSION_COMPATIBILITY_WARNING" ->
@@ -440,12 +442,19 @@ data class ModDirectoryDiscovery(
      */
     val beatSaberInventory: BeatSaberModInventory? = null,
     /**
-     * Pavlov only: whether `run-as <package>` legitimately functions for
-     * reads on this device (debuggable build).  Diagnostic evidence only:
-     * Pavlov authorizes no install plan either way, and shell writes were
-     * proven denied even where run-as reads work.
+     * Pavlov only: whether `run-as` functions for the installed package
+     * (debuggable build).  Diagnostic evidence only: Pavlov authorizes
+     * no install plan either way, and shell writes were proven denied on
+     * device even where run-as reads work.
      */
-    val pavlovRunAsFunctional: Boolean? = null
+    val pavlovRunAsFunctional: Boolean? = null,
+    /**
+     * Nomad only: read-only index of installed mods (manifest names plus
+     * DLL basenames) used to resolve `$type` assembly references.  Null
+     * when unavailable; analysis without an index keeps references as
+     * unverified rather than guessing.
+     */
+    val nomadDependencyIndex: NomadDependencyIndex? = null
 ) {
     val existingCandidates: List<ModDirectoryCandidate>
         get() = candidates.filter { it.exists }
@@ -526,7 +535,13 @@ data class ModInstallPlan(
     val patchRequirement: ModPatchRequirement? = null,
     val confirmation: ModInstallConfirmation? = null,
     val analysisPlanId: String? = null,
-    val operationBinding: ModOperationBinding? = null
+    val operationBinding: ModOperationBinding? = null,
+    /**
+     * Nomad `$type` assembly reports (populated by the Nomad analyzer
+     * only).  Base-game references are omitted; everything else is
+     * shown with its resolution status.  Never downloaded or executed.
+     */
+    val nomadDependencies: List<NomadAssemblyReport> = emptyList()
 ) {
     val fileMappings: List<ModFileMapping>
         get() = mappings

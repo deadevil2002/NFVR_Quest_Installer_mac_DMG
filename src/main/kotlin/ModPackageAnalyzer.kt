@@ -45,6 +45,12 @@ class ModPackageAnalyzer(
          */
         const val EXPANSION_FLOOR_BYTES = 512L * 1024L * 1024L
         const val MAX_EXPANSION_RATIO = 64.0
+        /** JSON files scanned at most for Nomad `$type` references. */
+        const val MAX_NOMAD_DEPENDENCY_JSON_FILES = 300
+        /** Per-file text cap for dependency scanning (bounded). */
+        const val MAX_NOMAD_DEPENDENCY_JSON_BYTES = 256L * 1024L
+        /** Cap on collected references per archive. */
+        const val MAX_NOMAD_DEPENDENCY_REFERENCES = 1000
         private val ROOT_METADATA_NAMES = setOf("mod.json", "nfvr-mod.json", "qmod.json", "package.json")
         private val ROOT_MANIFEST_NAMES = ROOT_METADATA_NAMES
         private val CONTENT_METADATA_BASENAMES = setOf(
@@ -137,7 +143,14 @@ class ModPackageAnalyzer(
                 isAndroidObbLayout(archive) ->
                     analyzeAndroidLayout(archive, installedApp, obb = true)
                 isNomadPayload(archive, installedApp) ->
-                    analyzeNomadPayload(archive, installedApp, loaderDetection, directoryDiscovery)
+                    analyzeNomadPayload(
+                        archive,
+                        installedApp,
+                        loaderDetection,
+                        directoryDiscovery,
+                        zipFile,
+                        directoryDiscovery?.nomadDependencyIndex
+                    )
                 isBonelabPayload(archive, installedApp) ->
                     analyzeBonelabPayload(archive, installedApp, loaderDetection, directoryDiscovery)
                 isPavlovPayload(zipFile, archive) ->
@@ -1384,6 +1397,93 @@ class ModPackageAnalyzer(
         return NomadCompatibilityEvaluator.evaluate(declaredVersion, installedVersion)
     }
 
+    /**
+     * Scans bounded JSON texts for `$type` assembly references and
+     * resolves them.  Without a device index, non-base non-archive
+     * references stay UNKNOWN (warning only); with an index they resolve
+     * to INSTALLED_MOD or MISSING.  Never reads unbounded content and
+     * never treats prose commas as dependencies (field-scoped).
+     */
+    private fun resolveNomadArchiveDependencies(
+        zipFile: File?,
+        archive: ArchiveMetadata,
+        modRoot: String?,
+        dependencyIndex: NomadDependencyIndex?
+    ): Pair<List<NomadAssemblyReport>, Boolean> {
+        if (zipFile == null) return emptyList<NomadAssemblyReport>() to false
+        val candidates = archive.entries.filter { entry ->
+            entry !in archive.directories &&
+                entry.lowercase(Locale.ROOT).endsWith(".json") &&
+                (modRoot == null || modScopedEntry(entry, modRoot))
+        }.take(MAX_NOMAD_DEPENDENCY_JSON_FILES)
+        if (candidates.isEmpty()) return emptyList<NomadAssemblyReport>() to false
+        val archiveDlls = archive.entries
+            .filter { it !in archive.directories && it.lowercase(Locale.ROOT).endsWith(".dll") }
+            .map { it.substringAfterLast('/') }
+        val found = linkedMapOf<String, NomadTypeReference>()
+        var malformed = false
+        ZipFile(zipFile).use { zip ->
+            for (entryName in candidates) {
+                if (found.size >= MAX_NOMAD_DEPENDENCY_REFERENCES) break
+                val entry = findArchiveEntry(zip, entryName) ?: continue
+                if (entry.size < 0L || entry.size > MAX_NOMAD_DEPENDENCY_JSON_BYTES) continue
+                val text = readBoundedZipText(zip, entry, MAX_NOMAD_DEPENDENCY_JSON_BYTES) ?: continue
+                val (refs, bad) = extractNomadTypeReferences(
+                    text, entryName, MAX_NOMAD_DEPENDENCY_REFERENCES - found.size
+                )
+                refs.forEach { found.putIfAbsent(it.type + "|" + it.assembly, it) }
+                if (bad) malformed = true
+            }
+        }
+        // Unparseable $type values surface only as a satisfied warning
+        // precondition at the call site; no named dependency is invented.
+        return resolveNomadAssemblyStatuses(
+            found.values.toList(), archiveDlls, dependencyIndex
+        ) to malformed
+    }
+
+    private fun findArchiveEntry(zip: ZipFile, normalizedName: String): java.util.zip.ZipEntry? {
+        val iterator = zip.entries()
+        while (iterator.hasMoreElements()) {
+            val entry = iterator.nextElement()
+            if (!entry.isDirectory &&
+                runCatching { validateEntryName(entry.name) }.getOrNull() == normalizedName
+            ) {
+                return entry
+            }
+        }
+        return null
+    }
+
+    private fun modScopedEntry(entry: String, modRoot: String): Boolean {
+        val normalized = if (entry.startsWith("Mods/", ignoreCase = true) ||
+            entry.startsWith("mods/", ignoreCase = true)
+        ) {
+            entry.substringAfter('/')
+        } else entry
+        return normalized == modRoot || normalized.startsWith("$modRoot/")
+    }
+
+    private fun readBoundedZipText(zip: ZipFile, entry: java.util.zip.ZipEntry, cap: Long): String? {
+        return runCatching {
+            val out = java.io.ByteArrayOutputStream()
+            zip.getInputStream(entry).use { input ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (out.size().toLong() + read > cap) return@runCatching null
+                    out.write(buffer, 0, read)
+                }
+            }
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(out.toByteArray()))
+                .toString()
+        }.getOrNull()
+    }
+
     private fun isNomadPayload(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?
@@ -1435,7 +1535,9 @@ class ModPackageAnalyzer(
         archive: ArchiveMetadata,
         installedApp: InstalledQuestApp?,
         loaderDetection: ModLoaderDetection?,
-        directoryDiscovery: ModDirectoryDiscovery?
+        directoryDiscovery: ModDirectoryDiscovery?,
+        zipFile: File? = null,
+        dependencyIndex: NomadDependencyIndex? = null
     ): ModPackageAnalysis {
         val profile = profileRegistry.findByPackageId(BLADE_AND_SORCERY_PACKAGE_ID)
             ?: GameModProfile(
@@ -1663,6 +1765,36 @@ class ModPackageAnalyzer(
                 }
                 .singleOrNull()
         }
+        // External scripted-type references ($type) are real dependency
+        // signals: a JSON-only mod is not independent when it names types
+        // from another assembly.  Missing assemblies block with exact
+        // names; unparseable references warn without blocking.
+        val (nomadTypeReports, nomadRefsMalformed) = resolveNomadArchiveDependencies(
+            zipFile = zipFile,
+            archive = archive,
+            modRoot = manifestRoots.singleOrNull(),
+            dependencyIndex = dependencyIndex
+        )
+        val missingNomadAssemblies = nomadTypeReports.filter {
+            it.status == NomadAssemblyStatus.MISSING
+        }
+        if (missingNomadAssemblies.isNotEmpty()) {
+            preconditions += blocked(
+                "NOMAD_MISSING_DEPENDENCY",
+                missingNomadAssemblies.joinToString(" ") { report ->
+                    "هذا المود يحتاج إلى إضافة أخرى ليعمل: ${report.assembly}. " +
+                        "لم يتم العثور عليها على النظارة."
+                }
+            )
+        }
+        if (nomadRefsMalformed ||
+            nomadTypeReports.any { it.status == NomadAssemblyStatus.UNKNOWN }
+        ) {
+            preconditions += satisfied(
+                "NOMAD_UNVERIFIED_REFERENCE",
+                "بعض مراجع الأنواع تعذر التحقق منها دون أدلة الجهاز؛ راجع التفاصيل التقنية."
+            )
+        }
         val plan = plan(
             ModPackageType.KNOWN_GAME_PROFILE,
             BLADE_AND_SORCERY_PACKAGE_ID,
@@ -1678,13 +1810,22 @@ class ModPackageAnalyzer(
                 100,
                 "Verified Nomad manifest/module/catalog content profile."
             )
+        ).copy(
+            nomadDependencies = nomadTypeReports.filter {
+                it.status != NomadAssemblyStatus.BASE_GAME
+            }
+        )
+        val executablePlan = plan.copy(
+            nomadDependencies = nomadTypeReports.filter {
+                it.status != NomadAssemblyStatus.BASE_GAME
+            }
         )
         return result(
             ModPackageType.KNOWN_GAME_PROFILE,
-            if (plan.installable) {
+            if (executablePlan.installable) {
                 "Recognized Blade & Sorcery: Nomad content mod."
-            } else blockingMessage(plan),
-            plan,
+            } else blockingMessage(executablePlan),
+            executablePlan,
             archive,
             metadata = mapOf("platform" to "Quest content", "profile" to profile.packageId),
             nomadIdentity = nomadIdentity

@@ -148,6 +148,8 @@ internal fun modCustomerFailureReason(analysis: ModPackageAnalysis): String {
         code == "UNKNOWN_FORMAT" || code == "UNSUPPORTED_FORMAT" ||
             analysis.packageType == ModPackageType.UNKNOWN || !analysis.recognized ->
             "لم يتعرف NFVR على بنية الحزمة الآمنة؛ راجع نوع الملفات والبنية الداخلية."
+        blocked?.code == "NOMAD_MISSING_DEPENDENCY" ->
+            blocked.message
         blocked != null ->
             "تعذر تجهيز الحزمة: ${customerPreconditionMessage(blocked.code)}"
         analysis.installable ->
@@ -1894,6 +1896,20 @@ private fun InstallationSuccessCard() {
                         "أرشيف متداخل لم يُفك تلقائيًا: $path",
                         Icons.Default.Warning,
                         warningColor()
+                    )
+                }
+            }
+            if (analysis.installPlan.nomadDependencies.isNotEmpty()) {
+                Text("اعتماديات Nomad المكتشفة", style = MaterialTheme.typography.titleMedium)
+                analysis.installPlan.nomadDependencies.forEach { report ->
+                    StatusNote(
+                        "تجميع برمجي: ${report.assembly}" +
+                            (report.foundVersion?.let { " — الإصدار $it" } ?: "") +
+                            " — ${customerNomadAssemblyStatusMessage(report.status)}",
+                        if (report.status == NomadAssemblyStatus.MISSING) Icons.Default.Warning
+                        else Icons.Default.Info,
+                        if (report.status == NomadAssemblyStatus.MISSING) warningColor()
+                        else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }

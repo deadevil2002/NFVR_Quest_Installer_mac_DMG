@@ -419,8 +419,62 @@ class ModsManager(
                 "candidateCount=${candidates.size}"
             ),
             beatSaberInventory = collectBeatSaberInventory(serial, installedApp),
-            pavlovRunAsFunctional = probePavlovRunAs(serial, installedApp)
+            pavlovRunAsFunctional = probePavlovRunAs(serial, installedApp),
+            nomadDependencyIndex = collectNomadDependencyIndex(serial, installedApp)
         )
+    }
+
+    /**
+     * Nomad only.  Lists installed mod folders with their manifest names
+     * and DLL basenames, read-only (`ls` plus one bounded manifest read
+     * per folder, at most 200 folders).  Any failure yields an empty
+     * index, never a block: unresolved references stay unverified.
+     */
+    private fun collectNomadDependencyIndex(
+        serial: String,
+        installedApp: InstalledQuestApp
+    ): NomadDependencyIndex? {
+        if (installedApp.packageName != ModPackageAnalyzer.NOMAD_PACKAGE_ID) return null
+        return runCatching {
+            val base = "/sdcard/Android/data/${installedApp.packageName}/files/Mods"
+            fun lsNames(path: String): List<String> {
+                val result = adbClient.shell(serial, "ls", shellQuoteRemotePath(path))
+                if (result.exit != 0) return emptyList()
+                return result.out.lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() && !it.contains('/') && !it.startsWith(".") }
+                    .toList()
+            }
+            val folders = lsNames(base).take(200)
+            val mods = folders.mapNotNull { folder ->
+                val entries = lsNames("$base/$folder")
+                if (!entries.any { it.equals("manifest.json", ignoreCase = true) }) return@mapNotNull null
+                val manifest = readSmallRemoteJson(serial, "$base/$folder/manifest.json") ?: return@mapNotNull null
+                NomadInstalledModRef(
+                    folder = folder,
+                    manifestName = manifest.optString("Name", "").trim().ifBlank { null },
+                    dllNames = entries.filter { it.endsWith(".dll", ignoreCase = true) }
+                )
+            }
+            NomadDependencyIndex(serial, installedApp.packageName, mods)
+        }.getOrNull()
+    }
+
+    private fun readSmallRemoteJson(serial: String, remotePath: String, maxBytes: Long = 64L * 1024L): JSONObject? {
+        val size = adbClient.shell(serial, "stat", "-c", "%s", shellQuoteRemotePath(remotePath))
+        if (size.exit != 0) return null
+        val bytes = size.out.trim().toLongOrNull() ?: return null
+        if (bytes <= 0L || bytes > maxBytes) return null
+        val local = runCatching {
+            File.createTempFile("nfvr-remote-json-", ".json").also { it.deleteOnExit() }
+        }.getOrNull() ?: return null
+        try {
+            val pulled = adbClient.pullReadOnly(serial, remotePath, local)
+            if (pulled.exit != 0 || !local.isFile || local.length() != bytes) return null
+            return runCatching { JSONObject(local.readText(Charsets.UTF_8)) }.getOrNull()
+        } finally {
+            runCatching { local.delete() }
+        }
     }
 
     /**
